@@ -1,14 +1,14 @@
-//! OneZip 引擎：所有前端（CLI、后台进程、GUI、右键菜单）共用的唯一入口。
+//! OneZip 引擎：所有前端（命令行、图形界面、右键菜单）共用的唯一入口。
 //!
-//! 按来源分流到两个上游引擎：
-//! - 本地文件 → [`hatchzip_core`]：边解压边截断/打洞释放原档空间，
+//! - 解压本地压缩包 → [`hatchzip_core`]：边解压边截断/打洞释放原包空间，
 //!   日志落盘后可在断电、被杀后恢复。
-//! - HTTP(S) 地址 → [`peel`]：并行分段下载，边下边解，用过的数据打洞释放，
+//! - 解压 HTTP(S) 地址 → [`peel`]：并行分段下载，边下边解，用过的数据打洞释放，
 //!   可断点续传。
+//! - 压缩 → [`compress`]：zip / 7z / tar.zst / tar.xz / tar.gz。
 //!
-//! 前端只和这里的 [`ExtractRequest`]、[`Event`]、[`Outcome`] 打交道，不直接接触上游类型，
-//! 以后接入 7z.dll 或换引擎不影响前端。
+//! 前端只和这里的类型打交道，不直接接触上游类型，以后换引擎或加格式不影响前端。
 
+pub mod compress;
 mod local;
 mod remote;
 mod source;
@@ -19,19 +19,42 @@ use std::sync::atomic::AtomicBool;
 
 use anyhow::Result;
 
+pub use compress::{Cancelled, CompressRequest, Format, compress};
+pub use local::{Entry, list, test};
 pub use source::Source;
+
+/// 这个错误是不是"需要密码 / 密码不对"：前端据此弹出密码框，而不是报失败。
+pub fn needs_password(e: &anyhow::Error) -> bool {
+    use hatchzip_core::archive::{PasswordNeeded, WrongPassword};
+    e.chain()
+        .any(|c| c.is::<PasswordNeeded>() || c.is::<WrongPassword>())
+}
 
 /// 字节数的可读形式，如 `1.5 GB`。
 pub fn human(bytes: u64) -> String {
     hatchzip_core::human(bytes)
 }
 
+/// 解压到哪里。给了 [`ExtractRequest::output`] 时以它为准。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Placement {
+    /// 压缩包里只有一个顶层文件或文件夹时直接放在压缩包旁边，
+    /// 否则新建一个以压缩包命名的文件夹。
+    #[default]
+    Smart,
+    /// 直接解到压缩包所在的文件夹。
+    Here,
+    /// 总是新建一个以压缩包命名的文件夹。
+    NewFolder,
+}
+
 /// 一次解压请求。
 #[derive(Debug, Clone, Default)]
 pub struct ExtractRequest {
     pub source: Source,
-    /// 输出目录；`None` 时按"智能解压"规则在源旁边决定。
+    /// 输出目录；`None` 时按 [`placement`](Self::placement) 决定。
     pub output: Option<PathBuf>,
+    pub placement: Placement,
     /// 保留原压缩包（不边解边删）。只对本地文件有意义。
     pub keep_source: bool,
     pub password: Option<String>,
@@ -41,18 +64,20 @@ pub struct ExtractRequest {
     pub keep_free: u64,
     /// 目标位置已有同名文件时替换它们（默认拒绝）。
     pub replace: bool,
+    /// 解出来只有一个压缩包时继续把它解开（中间那个包随后删除）。
+    pub nested: bool,
 }
 
 /// 进度与提示，发给前端显示。
 #[derive(Debug, Clone)]
 pub enum Event {
-    /// 开始（或恢复）。`total` 为本地任务的待写出字节数，远程任务为源文件大小。
+    /// 开始（或恢复）。`total` 为待处理的字节数；远程解压时为源文件大小。
     Started { total: u64, resuming: bool },
-    /// 本地任务：又写出了这么多字节（增量）。
-    Extracted(u64),
-    /// 本地任务：原压缩包当前还占着的长度。
+    /// 又处理了这么多字节（增量）：解压时是写出的，压缩时是读入的。
+    Progressed(u64),
+    /// 本地解压：原压缩包当前还占着的长度。
     ArchiveLeft(u64),
-    /// 远程任务：累计已下载 / 已解出的字节数。
+    /// 远程解压：累计已下载 / 已解出的字节数。
     Remote {
         downloaded: u64,
         extracted: u64,

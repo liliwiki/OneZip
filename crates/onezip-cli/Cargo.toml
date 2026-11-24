@@ -1,13 +1,13 @@
 [package]
 name = "onezip-cli"
-description = "onezip.exe: the OneZip command line."
+description = "onezipc.exe: the OneZip command line."
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 
 [[bin]]
-name = "onezip"
+name = "onezipc"
 path = "src/main.rs"
 
 [dependencies]

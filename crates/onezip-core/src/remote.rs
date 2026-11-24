@@ -10,6 +10,7 @@ use std::thread;
 use std::time::Duration;
 
 use anyhow::{Context, Result, anyhow, bail};
+use peel::coordinator::local::{LocalRunArgs, run as run_local};
 use peel::coordinator::{
     CoordinatorConfig, CoordinatorError, OutputTarget, ProgressEvent, RunArgs, run,
 };
@@ -17,7 +18,141 @@ use peel::decode::{DecoderRegistry, FormatShape};
 use peel::http::Client;
 use peel::progress::ProgressState;
 
-use crate::{Event, ExtractRequest, Observer, Outcome};
+use crate::{Confirm, Event, ExtractRequest, Observer, Outcome, Placement};
+
+/// 本地文件里交给 Peel 的格式：hatchzip-core 0.1.10 不支持的那些。
+pub(crate) fn handles_local(path: &Path) -> bool {
+    let name = path
+        .file_name()
+        .map(|n| n.to_string_lossy().to_ascii_lowercase())
+        .unwrap_or_default();
+    [".zst", ".tzst", ".lz4", ".rar"]
+        .iter()
+        .any(|ext| name.ends_with(ext))
+}
+
+/// 用 Peel 解本地文件。`keep_source` 为假时边解边打洞，完成后删除原文件。
+/// 进度检查点在原文件旁边，同样的请求再调一次即从断点继续。
+pub(crate) fn extract_file(
+    archive: &Path,
+    req: &ExtractRequest,
+    observer: Observer,
+    stop: &Arc<AtomicBool>,
+    confirm: &mut dyn FnMut(&Confirm) -> bool,
+) -> Result<Outcome> {
+    if req.password.is_some() {
+        bail!("这种格式的加密压缩包暂不支持");
+    }
+    let archive = std::path::absolute(archive)?;
+    let registry = DecoderRegistry::with_defaults();
+    let name = archive
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    let parent = archive.parent().map(Path::to_path_buf).unwrap_or_default();
+    let shape = registry.shape_for_name(&name);
+    let stem = strip_archive_extensions(&name).to_string();
+    let output = match (&req.output, shape) {
+        (Some(p), Some(FormatShape::Stream)) => OutputTarget::File(std::path::absolute(p)?),
+        (Some(p), _) => OutputTarget::Dir(std::path::absolute(p)?),
+        (None, Some(FormatShape::Stream)) => OutputTarget::File(parent.join(&stem)),
+        (None, _) if req.placement == Placement::Here => OutputTarget::Dir(parent.clone()),
+        (None, _) => OutputTarget::Dir(parent.join(if stem.is_empty() || stem == name {
+            format!("{name}-extracted")
+        } else {
+            stem
+        })),
+    };
+    let out_path = match &output {
+        OutputTarget::File(p) | OutputTarget::Dir(p) => p.clone(),
+    };
+    let resuming = peel_checkpoint_exists(&archive);
+    if !req.keep_source
+        && !resuming
+        && !confirm(&Confirm {
+            archive: &name,
+            output: &out_path,
+        })
+    {
+        bail!("已取消，压缩包没有任何改动");
+    }
+
+    let size = std::fs::metadata(&archive)?.len();
+    observer(Event::Started {
+        total: size,
+        resuming,
+    });
+    let state = ProgressState::new();
+    let (done, sampler) = sample(&state, observer.clone(), size);
+
+    let mut args = LocalRunArgs::new(archive.clone(), output);
+    args.destructive = !req.keep_source;
+    args.registry = registry;
+    args.progress_state = Some(state.clone());
+    args.kill_switch = Some(stop.clone());
+    let result = run_local(args);
+    done.store(true, Ordering::Relaxed);
+    let _ = sampler.join();
+
+    match result {
+        Ok(_) => Ok(Outcome::Finished {
+            output: out_path,
+            warning: None,
+        }),
+        Err(CoordinatorError::Aborted { .. }) => Ok(Outcome::Paused),
+        Err(e) => Err(anyhow!(e)).with_context(|| format!("解压 {name} 失败")),
+    }
+}
+
+fn peel_checkpoint_exists(archive: &Path) -> bool {
+    let Some(dir) = archive.parent() else {
+        return false;
+    };
+    let name = archive
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    std::fs::read_dir(dir).is_ok_and(|entries| {
+        entries.flatten().any(|e| {
+            let n = e.file_name().to_string_lossy().into_owned();
+            n.starts_with(&name) && n.contains(".peel.")
+        })
+    })
+}
+
+/// Peel 的进度是一组原子计数器；单开一个线程定期取样转成 Event。
+/// 本地解压时用"已解码的源字节数"当进度。
+fn sample(
+    state: &Arc<ProgressState>,
+    observer: Observer,
+    local_total: u64,
+) -> (Arc<AtomicBool>, thread::JoinHandle<()>) {
+    let done = Arc::new(AtomicBool::new(false));
+    let handle = {
+        let (state, done) = (state.clone(), done.clone());
+        thread::spawn(move || {
+            let mut last = 0;
+            while !done.load(Ordering::Relaxed) {
+                let s = state.snapshot();
+                if local_total > 0 {
+                    let now = s.bytes_decoded_input.min(local_total);
+                    if now > last {
+                        observer(Event::Progressed(now - last));
+                        last = now;
+                    }
+                } else {
+                    observer(Event::Remote {
+                        downloaded: s.bytes_downloaded,
+                        extracted: s.bytes_extracted,
+                        total: s.total_size.unwrap_or(0),
+                    });
+                }
+                thread::sleep(Duration::from_millis(200));
+            }
+        })
+    };
+    (done, handle)
+}
 
 pub(crate) fn extract(
     url: &str,
@@ -37,22 +172,7 @@ pub(crate) fn extract(
     let client = Client::new().map_err(|e| anyhow!(e)).context("创建 HTTP 客户端失败")?;
     let state = ProgressState::new();
 
-    // Peel 的进度是一组原子计数器；单开一个线程定期取样转成 Event。
-    let done = Arc::new(AtomicBool::new(false));
-    let sampler = {
-        let (state, done, observer) = (state.clone(), done.clone(), observer.clone());
-        thread::spawn(move || {
-            while !done.load(Ordering::Relaxed) {
-                let s = state.snapshot();
-                observer(Event::Remote {
-                    downloaded: s.bytes_downloaded,
-                    extracted: s.bytes_extracted,
-                    total: s.total_size.unwrap_or(0),
-                });
-                thread::sleep(Duration::from_millis(200));
-            }
-        })
-    };
+    let (done, sampler) = sample(&state, observer.clone(), 0);
 
     let started = observer.clone();
     let args = RunArgs {

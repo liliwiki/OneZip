@@ -1,0 +1,28 @@
+[package]
+name = "onezip-app"
+description = "OneZip.exe: the OneZip window and the target of the right-click menu."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+build = "build.rs"
+
+[[bin]]
+name = "OneZip"
+path = "src/main.rs"
+
+[dependencies]
+anyhow.workspace = true
+onezip-core.workspace = true
+slint = "1.18"
+rfd = "0.15"
+interprocess = "2.2"
+
+[build-dependencies]
+slint-build = "1.18"
+
+[target."cfg(windows)".dependencies]
+winreg = "0.56"
+
+[target."cfg(windows)".build-dependencies]
+winresource = "0.1"

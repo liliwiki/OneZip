@@ -1,6 +1,6 @@
 [package]
 name = "onezip-core"
-description = "OneZip engine: one entry point over HatchZip (in-place extraction) and Peel (extract while downloading)."
+description = "OneZip engine: one entry point over HatchZip (in-place extraction), Peel (extract while downloading) and archive writers."
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -11,8 +11,13 @@ anyhow.workspace = true
 hatchzip-core.workspace = true
 peel-rs.workspace = true
 
+# 压缩用的编码器。都已经在 hatchzip-core / peel 的依赖树里，这里直接点名用到的功能。
+zip = { version = "9.8", default-features = false, features = ["deflate", "aes-crypto"] }
+sevenz-rust2 = { version = "0.24.2", default-features = false, features = ["compress", "aes256"] }
+lzma-rust2 = { version = "0.24", default-features = false, features = ["std", "encoder", "optimization", "xz"] }
+zstd = { version = "0.13", features = ["zstdmt"] }
+flate2 = "1.1"
+tar = "0.4.46"
+
 [dev-dependencies]
 tempfile = "3.27.0"
-zip = { version = "9", default-features = false, features = ["deflate"] }
-tar = "0.4.46"
-zstd = "0.13"
