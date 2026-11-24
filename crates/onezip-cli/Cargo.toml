@@ -1,0 +1,18 @@
+[package]
+name = "onezip-cli"
+description = "onezip.exe: the OneZip command line."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "onezip"
+path = "src/main.rs"
+
+[dependencies]
+anyhow.workspace = true
+onezip-core.workspace = true
+clap = { version = "4.6", features = ["derive"] }
+ctrlc = "3.5.2"
+indicatif = "0.18.6"

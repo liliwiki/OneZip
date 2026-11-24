@@ -1,0 +1,33 @@
+[workspace]
+resolver = "3"
+members = ["crates/onezip-core", "crates/onezip-cli"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+# hatchzip-core needs 1.93.
+rust-version = "1.93"
+license = "MIT OR Apache-2.0"
+
+[workspace.dependencies]
+onezip-core = { path = "crates/onezip-core" }
+anyhow = "1.0.100"
+
+# 本地"边解压边释放"：HatchZip 的引擎（MIT OR Apache-2.0）。
+# 默认不开 `rar` 特性：它会编译 UnRAR 的 C++ 源码（另有许可，见 LICENSE-UNRAR），
+# 等 MSVC 就绪、发布构建时再打开。
+hatchzip-core = { version = "=0.1.10" }
+
+# 边下载边解压：Peel 的引擎（MIT OR Apache-2.0）。尚未发布到 crates.io，
+# 固定到 agouin/peel 的 v0.8.0 提交。
+peel-rs = { git = "https://github.com/agouin/peel", rev = "77d2e34b6138cc6279a5e0d1a64271b07faa0219" }
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+strip = true
+
+# 解码在未优化构建里慢到拖垮测试，依赖一律优化。
+[profile.dev.package."*"]
+opt-level = 2
+debug = false

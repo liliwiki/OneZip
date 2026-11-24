@@ -1,0 +1,17 @@
+OneZip
+Copyright (c) 2026 OneZip contributors
+Licensed under either of Apache License 2.0 (LICENSE-APACHE) or MIT (LICENSE-MIT), at your option.
+
+OneZip builds on the following open-source projects, used as Cargo dependencies:
+
+- HatchZip (hatchzip-core) — https://github.com/xevrion/hatchzip
+  Licensed under MIT OR Apache-2.0.
+  The optional `rar` feature compiles UnRAR source code, which is under its own
+  license (see LICENSE-UNRAR in the HatchZip repository). It is not enabled by default.
+
+- Peel (peel-rs) — https://github.com/agouin/peel
+  Copyright (c) 2026 Andrew Gouin. Licensed under MIT OR Apache-2.0.
+  Its RAR5 decoder references libarchive (BSD 2-Clause); see Peel's NOTICE.
+
+Planned: NanaZip / 7-Zip (7z.dll), loaded dynamically — MIT (NanaZip) and
+LGPL-2.1 with the unRAR restriction (7-Zip). See docs/设计方案.md §10.
