@@ -6,7 +6,9 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and
 
 ## [Unreleased]
 
-First version, not yet released.
+## [0.1.0] - 2026-11-25
+
+First release.
 
 ### Added
 
@@ -24,3 +26,6 @@ First version, not yet released.
 
 - Modified copy of hatchzip-core: on Windows, extracted files are flushed to disk in parallel per batch. Extracting 30,000 small files went from about 150 s to 26 s.
 - Modified copy of lzma-rust2 0.23: the multi-threaded encoders report progress and honour cancellation.
+
+[Unreleased]: https://github.com/liliwiki/OneZip/compare/v0.1.0...HEAD
+[0.1.0]: https://github.com/liliwiki/OneZip/releases/tag/v0.1.0

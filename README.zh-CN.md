@@ -22,8 +22,6 @@ powershell -ExecutionPolicy Bypass -File install.ps1
 
 需要 Windows 10 或 11（x64）。运行前请核对 Release 页面公布的 SHA-256。
 
-目前还没有发布版本，在那之前请按[开发](#开发)一节从源码构建。
-
 ## 功能
 
 | 功能 | 说明 | 引擎 |

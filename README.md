@@ -22,8 +22,6 @@ It installs to `%LOCALAPPDATA%\Programs\OneZip` for the current user. On Windows
 
 Requires Windows 10 or 11 (x64). Verify the SHA-256 published on the Release page before running it.
 
-No release has been published yet. Until then, build from source as described under [Development](#development).
-
 ## Features
 
 | Feature | Details | Engine |
