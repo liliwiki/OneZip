@@ -2,8 +2,10 @@
 //!
 //! 发布的 `OneZip-<版本>-Setup.exe` 是这个程序后面接上一个 zip（发布目录里的全部文件），
 //! 最后 16 字节是尾标：zip 的长度（u64 小端）+ `MAGIC`。安装时把 zip 解到临时目录，
-//! 再运行其中的 `install.ps1`（复制到 `%LOCALAPPDATA%\Programs\OneZip`、注册右键菜单、
-//! 开始菜单快捷方式、"应用和功能"里的卸载项）。
+//! 再运行其中的 `install.ps1`（复制到选定的位置、注册右键菜单、开始菜单快捷方式、
+//! "应用和功能"里的卸载项）。
+//!
+//! 安装位置默认是已安装的位置，没装过就是 `%LOCALAPPDATA%\Programs\OneZip`。
 
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
@@ -11,6 +13,7 @@ use std::fs::File;
 use std::io::{self, Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::rc::Rc;
 
 use anyhow::{Context, Result, bail};
 
@@ -21,19 +24,61 @@ const MAGIC: &[u8; 8] = b"OZSETUP1";
 fn main() -> Result<()> {
     let w = SetupWindow::new()?;
     w.set_version(env!("CARGO_PKG_VERSION").into());
-    let dest = install_dir();
-    w.set_location(dest.display().to_string().into());
-    w.set_upgrade(dest.join("OneZip.exe").exists());
+    let old = Rc::new(installed_location());
+    let start = old.as_ref().clone().unwrap_or_else(default_dir);
+    w.set_location(start.display().to_string().into());
+    w.set_upgrade(old.is_some());
     w.set_win11(is_win11());
-
-    w.on_install({
-        let weak = w.as_weak();
+    let refresh = {
+        let (weak, old) = (w.as_weak(), old.clone());
         move || {
             let Some(w) = weak.upgrade() else { return };
+            match resolve(w.get_location().as_str(), old.as_deref()) {
+                Ok(t) => {
+                    w.set_target(t.display().to_string().into());
+                    w.set_problem("".into());
+                }
+                Err(e) => {
+                    w.set_target("".into());
+                    w.set_problem(format!("{e:#}").into());
+                }
+            }
+        }
+    };
+    refresh();
+    w.on_location_edited({
+        let refresh = refresh.clone();
+        move |_| refresh()
+    });
+    w.on_browse({
+        let (weak, refresh) = (w.as_weak(), refresh.clone());
+        move || {
+            let Some(w) = weak.upgrade() else { return };
+            let current = PathBuf::from(w.get_location().as_str());
+            let mut d = rfd::FileDialog::new().set_title("选择安装位置");
+            if let Some(dir) = current.ancestors().find(|p| p.is_dir()) {
+                d = d.set_directory(dir);
+            }
+            if let Some(dir) = d.pick_folder() {
+                w.set_location(dir.display().to_string().into());
+                refresh();
+            }
+        }
+    });
+
+    w.on_install({
+        let (weak, old) = (w.as_weak(), old.clone());
+        move || {
+            let Some(w) = weak.upgrade() else { return };
+            let dest = match resolve(w.get_location().as_str(), old.as_deref()) {
+                Ok(d) => d,
+                Err(_) => return,
+            };
+            w.set_target(dest.display().to_string().into());
             w.set_stage("installing".into());
             let weak = weak.clone();
             std::thread::spawn(move || {
-                let r = install();
+                let r = install(&dest);
                 let _ = weak.upgrade_in_event_loop(move |w| match r {
                     Ok(()) => w.set_stage("done".into()),
                     Err(e) => {
@@ -49,8 +94,8 @@ fn main() -> Result<()> {
         move || {
             let Some(w) = weak.upgrade() else { return };
             if w.get_launch() {
-                let exe = install_dir().join("OneZip.exe");
-                let _ = Command::new(&exe).current_dir(install_dir()).spawn();
+                let dir = PathBuf::from(w.get_target().as_str());
+                let _ = Command::new(dir.join("OneZip.exe")).current_dir(&dir).spawn();
             }
             let _ = w.hide();
         }
@@ -75,9 +120,59 @@ fn main() -> Result<()> {
     Ok(())
 }
 
-fn install_dir() -> PathBuf {
+fn default_dir() -> PathBuf {
     let base = std::env::var_os("LOCALAPPDATA").map_or_else(|| PathBuf::from("."), PathBuf::from);
     base.join("Programs").join("OneZip")
+}
+
+/// 已安装的位置（"应用和功能"卸载项里的 InstallLocation）。
+fn installed_location() -> Option<PathBuf> {
+    #[cfg(windows)]
+    {
+        let key = winreg::RegKey::predef(winreg::enums::HKEY_CURRENT_USER)
+            .open_subkey(r"Software\Microsoft\Windows\CurrentVersion\Uninstall\OneZip")
+            .ok()?;
+        let loc: String = key.get_value("InstallLocation").ok()?;
+        let p = PathBuf::from(loc);
+        p.join("OneZip.exe").exists().then_some(p)
+    }
+    #[cfg(not(windows))]
+    None
+}
+
+fn same_dir(a: &Path, b: &Path) -> bool {
+    let norm = |p: &Path| p.to_string_lossy().trim_end_matches('\\').to_lowercase();
+    norm(a) == norm(b)
+}
+
+/// 实际装进哪个文件夹（规则与 install.ps1 相同）：选定的文件夹本来就装着 OneZip，或者叫
+/// OneZip 且是空的/还不存在，就装进它本身；否则装进它下面的 OneZip 子文件夹，那里也有
+/// 别的文件就不装。这样卸载按文件名删除时不会碰到别人的同名文件。
+fn resolve(chosen: &str, old: Option<&Path>) -> Result<PathBuf> {
+    let chosen = chosen.trim().trim_matches('"');
+    if chosen.is_empty() {
+        bail!("请选择安装位置");
+    }
+    let p = PathBuf::from(chosen);
+    if !p.is_absolute() || !p.has_root() {
+        bail!("请填写完整的路径，例如 D:\\Programs\\OneZip");
+    }
+    if chosen.contains(['*', '?', '<', '>', '|', '"']) {
+        bail!("路径里有不能用的字符");
+    }
+    let p = PathBuf::from(chosen.trim_end_matches('\\'));
+    let p = if p.as_os_str().len() <= 2 { PathBuf::from(format!("{}\\", p.display())) } else { p };
+    let is_install = |d: &Path| d.join("installed-files.txt").exists() || old.is_some_and(|o| same_dir(o, d));
+    let is_empty = |d: &Path| !d.exists() || std::fs::read_dir(d).is_ok_and(|mut r| r.next().is_none());
+    let named = p.file_name().is_some_and(|n| n.eq_ignore_ascii_case("OneZip"));
+    if is_install(&p) || (named && is_empty(&p)) {
+        return Ok(p);
+    }
+    let sub = p.join("OneZip");
+    if is_install(&sub) || is_empty(&sub) {
+        return Ok(sub);
+    }
+    bail!("{} 已经存在并且有别的文件，请换一个位置", sub.display());
 }
 
 fn is_win11() -> bool {
@@ -175,23 +270,25 @@ fn unpack(to: &Path) -> Result<()> {
     Ok(())
 }
 
-fn install() -> Result<()> {
+fn install(dest: &Path) -> Result<()> {
     let tmp = std::env::temp_dir().join(format!("OneZip-Setup-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&tmp);
     std::fs::create_dir_all(&tmp)?;
-    let r = unpack(&tmp).and_then(|()| run_script(&tmp.join("install.ps1")));
+    let r = unpack(&tmp).and_then(|()| run_script(&tmp.join("install.ps1"), dest));
     let _ = std::fs::remove_dir_all(&tmp);
     r
 }
 
-fn run_script(script: &Path) -> Result<()> {
+fn run_script(script: &Path, dest: &Path) -> Result<()> {
     if !script.exists() {
         bail!("安装文件里缺少 install.ps1");
     }
     // 输出用 UTF-8，出错时能把 PowerShell 的中文提示原样显示出来。
+    let quote = |p: &Path| p.display().to_string().replace('\'', "''");
     let cmd = format!(
-        "[Console]::OutputEncoding = [Text.Encoding]::UTF8; $ErrorActionPreference = 'Stop'; & '{}'",
-        script.display().to_string().replace('\'', "''")
+        "[Console]::OutputEncoding = [Text.Encoding]::UTF8; $ErrorActionPreference = 'Stop'; & '{}' -Dest '{}'",
+        quote(script),
+        quote(dest)
     );
     let mut c = Command::new("powershell.exe");
     c.args(["-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-Command", &cmd]);
@@ -249,6 +346,44 @@ mod tests {
         zip.extract(&out).unwrap();
         assert_eq!(std::fs::read(out.join("install.ps1")).unwrap(), b"Write-Host hi");
         std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn picks_a_safe_install_folder() {
+        let root = tempfile_dir("resolve");
+        let s = |p: &Path| p.display().to_string();
+        // 不叫 OneZip 的文件夹：装进它下面的 OneZip
+        assert_eq!(resolve(&s(&root), None).unwrap(), root.join("OneZip"));
+        // 叫 OneZip、还不存在或是空的：装进它本身
+        let named = root.join("x").join("OneZip");
+        assert_eq!(resolve(&s(&named), None).unwrap(), named);
+        std::fs::create_dir_all(&named).unwrap();
+        assert_eq!(resolve(&s(&named), None).unwrap(), named);
+        // 叫 OneZip 但有别的文件（比如源码目录）：装进子文件夹
+        std::fs::write(named.join("README.md"), "x").unwrap();
+        assert_eq!(resolve(&s(&named), None).unwrap(), named.join("OneZip"));
+        // 子文件夹也被占了：拒绝
+        std::fs::create_dir_all(named.join("OneZip")).unwrap();
+        std::fs::write(named.join("OneZip").join("a.txt"), "x").unwrap();
+        assert!(resolve(&s(&named), None).is_err());
+        // 已经装在这里（旧位置）：原地升级
+        assert_eq!(resolve(&s(&named), Some(&named)).unwrap(), named);
+        // 有安装清单的也算
+        let inst = root.join("inst");
+        std::fs::create_dir_all(&inst).unwrap();
+        std::fs::write(inst.join("installed-files.txt"), "OneZip.exe").unwrap();
+        assert_eq!(resolve(&s(&inst), None).unwrap(), inst);
+        // 相对路径、空路径不行
+        assert!(resolve("relative\\dir", None).is_err());
+        assert!(resolve("  ", None).is_err());
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    fn tempfile_dir(tag: &str) -> PathBuf {
+        let d = std::env::temp_dir().join(format!("onezip-setup-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(&d).unwrap();
+        d
     }
 
     #[test]

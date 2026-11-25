@@ -14,7 +14,11 @@ path = "src/main.rs"
 [dependencies]
 anyhow.workspace = true
 slint = "1.18"
+rfd = "0.15"
 zip = { version = "9.8", default-features = false, features = ["deflate"] }
+
+[target."cfg(windows)".dependencies]
+winreg = "0.56"
 
 [build-dependencies]
 slint-build = "1.18"

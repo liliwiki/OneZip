@@ -3892,8 +3892,10 @@ name = "onezip-setup"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "rfd",
  "slint",
  "slint-build",
+ "winreg",
  "winresource",
  "zip",
 ]

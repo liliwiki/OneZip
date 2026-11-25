@@ -14,7 +14,7 @@ An all-in-one archive tool for Windows: compress, extract smartly, extract in pl
 
 Download `OneZip-<version>-Setup.exe` from the [Releases](https://github.com/liliwiki/OneZip/releases) page and run it.
 
-It installs to `%LOCALAPPDATA%\Programs\OneZip` for the current user and needs no administrator rights, with one exception: on Windows 11 the context menu is registered through a sparse package signed with a self-signed certificate, so the first installation asks once for administrator approval to add that certificate to "Trusted People". On Windows 10 the classic per-user context menu is used. The installer is unsigned, so SmartScreen may warn about it; choose "More info" → "Run anyway". To uninstall, use "Installed apps" in Windows Settings.
+It installs for the current user, by default to `%LOCALAPPDATA%\Programs\OneZip`; you can choose another folder in the installer. No administrator rights are needed, except to install into a protected folder such as `C:\Program Files` (one approval) and in one more case: on Windows 11 the context menu is registered through a sparse package signed with a self-signed certificate, so the first installation asks once for administrator approval to add that certificate to "Trusted People". On Windows 10 the classic per-user context menu is used. The installer is unsigned, so SmartScreen may warn about it; choose "More info" → "Run anyway". To uninstall, use "Installed apps" in Windows Settings.
 
 Requires Windows 10 or 11 (x64). Verify the SHA-256 published on the Release page before running it.
 

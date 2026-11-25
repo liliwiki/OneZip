@@ -23,7 +23,7 @@ First release.
 - Progress windows for context menu operations, in the style of 7-Zip; they close when the work is done.
 - Windows 11 first-level context menu through a sparse package and `IExplorerCommand`, with the classic menu on Windows 10.
 - `onezipc.exe` command line.
-- `OneZip-<version>-Setup.exe` installer (per user, no administrator rights except trusting the sparse package certificate once on Windows 11), and a packaging script that builds and signs the sparse package.
+- `OneZip-<version>-Setup.exe` installer (per user, choice of install folder, no administrator rights except for protected folders and for trusting the sparse package certificate once on Windows 11; uninstall removes only the files it installed), and a packaging script that builds and signs the sparse package.
 - Context menu regression tests driven by UI Automation.
 
 ### Changed

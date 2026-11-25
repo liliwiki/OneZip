@@ -1,10 +1,11 @@
 ﻿# 右键菜单回归测试：在 D:\OZT 造测试文件，逐项点 OneZip 子菜单，检查结果。
-# 需要已安装的 OneZip（%LOCALAPPDATA%\Programs\OneZip），会操作鼠标键盘，运行时别动电脑。
+# 需要已安装的 OneZip（位置从"应用和功能"的卸载项里读），会操作鼠标键盘，运行时别动电脑。
 # 用法：powershell -ExecutionPolicy Bypass -File regress.ps1
 param([string]$Dir = 'D:\OZT')
 [Console]::OutputEncoding = [Text.Encoding]::UTF8
 $here = $PSScriptRoot
-$cli = "$env:LOCALAPPDATA\Programs\OneZip\onezipc.exe"
+$installed = (Get-ItemProperty 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Uninstall\OneZip').InstallLocation
+$cli = "$installed\onezipc.exe"
 function MN { & powershell -NoProfile -ExecutionPolicy Bypass -File "$here\menu.ps1" @args | Out-Null }
 function UI { & powershell -NoProfile -ExecutionPolicy Bypass -File "$here\ui.ps1" @args }
 function T($p) { & powershell -NoProfile -ExecutionPolicy Bypass -File "$here\tree.ps1" -Path $p }
@@ -114,7 +115,7 @@ Remove-Item "$Dir\资料" -Recurse -Force -EA SilentlyContinue
 
 # ---- 先开对话框再点“右键菜单…”（以前会卡死）----
 # 从右键菜单来的操作不再弹主窗口，这里先单独打开主窗口。
-Start-Process "$env:LOCALAPPDATA\Programs\OneZip\OneZip.exe"
+Start-Process "$installed\OneZip.exe"
 WaitFor { (UI -Do windows | Select-String '^OneZip \|') } 10 | Out-Null
 MN -Folder $Dir -Items '笔记.txt' -Command '添加到压缩包…'
 WaitFor { (UI -Do windows | Select-String 'foreground: 添加到压缩包') } 10 | Out-Null
