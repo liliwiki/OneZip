@@ -14,12 +14,12 @@ mod imp {
     use std::ffi::c_void;
 
     use raw_window_handle::{HasWindowHandle, RawWindowHandle};
-    use windows::Win32::Foundation::HWND;
+    use windows::Win32::Foundation::{HWND, RECT};
     use windows::Win32::System::Threading::{AttachThreadInput, GetCurrentThreadId};
     use windows::Win32::UI::WindowsAndMessaging::{
         ASFW_ANY, AllowSetForegroundWindow, BringWindowToTop, GWLP_HWNDPARENT,
-        GetForegroundWindow, GetWindowThreadProcessId, HWND_NOTOPMOST, HWND_TOPMOST, IsIconic,
-        SW_RESTORE, SWP_NOMOVE, SWP_NOSIZE, SWP_SHOWWINDOW, SetForegroundWindow,
+        GetForegroundWindow, GetWindowRect, GetWindowThreadProcessId, HWND_NOTOPMOST, HWND_TOPMOST, IsIconic,
+        SW_RESTORE, SWP_NOMOVE, SWP_NOSIZE, SWP_NOZORDER, SWP_SHOWWINDOW, SetForegroundWindow,
         SetWindowLongPtrW, SetWindowPos, ShowWindow,
     };
 
@@ -68,6 +68,24 @@ mod imp {
         }
     }
 
+    /// 把 `child` 放到 `owner` 正中（不改大小）。
+    pub fn center_on(child: &slint::Window, owner: &slint::Window) {
+        let (Some(c), Some(o)) = (hwnd(child), hwnd(owner)) else {
+            return;
+        };
+        let mut cr = RECT::default();
+        let mut or = RECT::default();
+        unsafe {
+            if GetWindowRect(c, &mut cr).is_err() || GetWindowRect(o, &mut or).is_err() {
+                return;
+            }
+            let (cw, ch) = (cr.right - cr.left, cr.bottom - cr.top);
+            let x = or.left + ((or.right - or.left) - cw) / 2;
+            let y = or.top + ((or.bottom - or.top) - ch) / 2;
+            let _ = SetWindowPos(c, None, x, y.max(0), 0, 0, SWP_NOSIZE | SWP_NOZORDER);
+        }
+    }
+
     pub fn allow_any_foreground() {
         unsafe {
             let _ = AllowSetForegroundWindow(ASFW_ANY);
@@ -79,10 +97,11 @@ mod imp {
 mod imp {
     pub fn bring_to_front(_window: &slint::Window) {}
     pub fn set_owner(_child: &slint::Window, _owner: &slint::Window) {}
+    pub fn center_on(_child: &slint::Window, _owner: &slint::Window) {}
     pub fn allow_any_foreground() {}
 }
 
-pub use imp::{allow_any_foreground, bring_to_front, set_owner};
+pub use imp::{allow_any_foreground, bring_to_front, center_on, set_owner};
 
 /// 显示并提到最前。窗口可能要等事件循环跑一轮才真正创建，所以稍后再提一次。
 pub fn present<C: ComponentHandle + 'static>(component: &C) {
@@ -103,12 +122,14 @@ pub fn present_owned<C: ComponentHandle + 'static, O: ComponentHandle + 'static>
 ) {
     let _ = dialog.show();
     set_owner(dialog.window(), owner.window());
+    center_on(dialog.window(), owner.window());
     bring_to_front(dialog.window());
     let d = dialog.as_weak();
     let o = owner.as_weak();
     slint::Timer::single_shot(Duration::from_millis(60), move || {
         if let (Some(d), Some(o)) = (d.upgrade(), o.upgrade()) {
             set_owner(d.window(), o.window());
+            center_on(d.window(), o.window());
             bring_to_front(d.window());
         }
     });

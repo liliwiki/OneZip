@@ -16,7 +16,14 @@ use windows::Win32::System::Com::{
 };
 use windows::Win32::System::LibraryLoader::GetModuleFileNameW;
 use windows::Win32::System::SystemServices::DLL_PROCESS_ATTACH;
-use windows::Win32::UI::WindowsAndMessaging::{ASFW_ANY, AllowSetForegroundWindow};
+use windows::Win32::System::Com::{CLSCTX_LOCAL_SERVER, CoCreateInstance, IDispatch, IServiceProvider};
+use windows::Win32::System::Variant::VARIANT;
+use windows::Win32::UI::Shell::{
+    CSIDL_DESKTOP, IShellBrowser, IShellDispatch2, IShellFolderViewDual, IShellWindows,
+    SID_STopLevelBrowser, SVGIO_BACKGROUND, SWC_DESKTOP, SWFO_NEEDDISPATCH, ShellWindows,
+};
+use windows::Win32::UI::WindowsAndMessaging::{ASFW_ANY, AllowSetForegroundWindow, SW_SHOWNORMAL};
+use windows_core::BSTR;
 use windows::Win32::UI::Shell::{
     ECF_DEFAULT, ECF_HASSUBCOMMANDS, ECF_ISSEPARATOR, ECS_ENABLED, ECS_HIDDEN, IEnumExplorerCommand,
     IEnumExplorerCommand_Impl, IExplorerCommand, IExplorerCommand_Impl, IShellItemArray,
@@ -164,10 +171,16 @@ impl IExplorerCommand_Impl for Sub_Impl {
         let Some(exe) = exe_path() else {
             return Err(E_POINTER.into());
         };
-        // 资源管理器把前台权限交给了我们；转交给 OneZip.exe，它的窗口才能出现在最前面，
+        // 资源管理器把前台权限交给了我们；转交出去，OneZip 的窗口才能出现在最前面，
         // 而不是被压在资源管理器后面。
         unsafe {
             let _ = AllowSetForegroundWindow(ASFW_ANY);
+        }
+        let args = command_line(command.args(), &paths);
+        // 首选让资源管理器替我们启动：这样 OneZip.exe 不带稀疏包的应用身份，
+        // 任务栏显示 exe 自己的图标（带包身份时只会显示一块灰色方块）。
+        if args.len() < 30_000 && launch_via_shell(&exe, &args).is_ok() {
+            return Ok(());
         }
         std::process::Command::new(exe)
             .args(command.args())
@@ -192,6 +205,47 @@ impl IExplorerCommand_Impl for Sub_Impl {
     fn EnumSubCommands(&self) -> Result<IEnumExplorerCommand> {
         Err(E_NOTIMPL.into())
     }
+}
+
+/// 拼命令行参数：每个路径加引号（路径里不会有引号）。
+fn command_line(flags: &[&str], paths: &[String]) -> String {
+    let mut out = flags.join(" ");
+    for p in paths {
+        // 以反斜杠结尾的路径（如 D:\）在引号前要再补一个反斜杠，否则会转义掉引号。
+        let p = if p.ends_with('\\') { format!("{p}\\") } else { p.clone() };
+        out.push_str(&format!(" \"{p}\""));
+    }
+    out
+}
+
+/// 通过资源管理器（桌面那个 shell 视图）的 IShellDispatch2::ShellExecute 启动程序，
+/// 等同于用户在资源管理器里双击：进程归资源管理器所有，不继承本 DLL 宿主的包身份。
+fn launch_via_shell(exe: &std::path::Path, args: &str) -> Result<()> {
+    unsafe {
+        let windows: IShellWindows = CoCreateInstance(&ShellWindows, None, CLSCTX_LOCAL_SERVER)?;
+        let loc = VARIANT::from(CSIDL_DESKTOP as i32);
+        let root = VARIANT::default();
+        let mut hwnd = 0i32;
+        let disp = windows.FindWindowSW(&loc, &root, SWC_DESKTOP, &mut hwnd, SWFO_NEEDDISPATCH)?;
+        let sp: IServiceProvider = disp.cast()?;
+        let browser: IShellBrowser = sp.QueryService(&SID_STopLevelBrowser)?;
+        let view = browser.QueryActiveShellView()?;
+        let bg: IDispatch = view.GetItemObject(SVGIO_BACKGROUND)?;
+        let folder_view: IShellFolderViewDual = bg.cast()?;
+        let shell: IShellDispatch2 = folder_view.Application()?.cast()?;
+        let dir = exe
+            .parent()
+            .map(|d| d.display().to_string())
+            .unwrap_or_default();
+        shell.ShellExecute(
+            &BSTR::from(exe.display().to_string()),
+            &VARIANT::from(BSTR::from(args)),
+            &VARIANT::from(BSTR::from(dir)),
+            &VARIANT::from(BSTR::from("open")),
+            &VARIANT::from(SW_SHOWNORMAL.0),
+        )?;
+    }
+    Ok(())
 }
 
 #[implement(IEnumExplorerCommand)]

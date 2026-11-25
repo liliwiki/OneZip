@@ -2,7 +2,7 @@
 # 用法：ui.ps1 -Do click -Name '右键菜单…' [-Window OneZip]
 #       ui.ps1 -Do dump [-Window OneZip]
 #       ui.ps1 -Do shot -Out x.png
-param([string]$Do = 'dump', [string]$Name = '', [string]$Window = '', [string]$Out = '', [int]$Wait = 1)
+param([string]$Do = 'dump', [string]$Name = '', [string]$Window = '', [string]$Out = '', [int]$Wait = 1, [string]$Text = '', [string]$Type = '')
 Add-Type -AssemblyName System.Windows.Forms, System.Drawing, UIAutomationClient, UIAutomationTypes
 Add-Type @"
 using System; using System.Runtime.InteropServices;
@@ -29,6 +29,11 @@ $scope = $root
 if ($Window) {
   $c = New-Object System.Windows.Automation.PropertyCondition ($A::NameProperty), $Window
   $scope = $root.FindFirst([System.Windows.Automation.TreeScope]::Children, $c)
+  if (-not $scope) {
+    # 归属于别的窗口的对话框挂在主窗口下面
+    $cw = New-Object System.Windows.Automation.PropertyCondition ($A::ControlTypeProperty), ([System.Windows.Automation.ControlType]::Window)
+    $scope = $root.FindFirst([System.Windows.Automation.TreeScope]::Descendants, (New-Object System.Windows.Automation.AndCondition $c, $cw))
+  }
   if (-not $scope) { "window '$Window' not found"; exit 2 }
 }
 switch ($Do) {
@@ -55,6 +60,65 @@ switch ($Do) {
     [U]::keybd_event(0x12,0,0,[UIntPtr]::Zero); [U]::keybd_event(0x12,0,2,[UIntPtr]::Zero)
     [U]::ShowWindow($h, 9) | Out-Null; [U]::SetForegroundWindow($h) | Out-Null
     "front $Window"
+  }
+  'max' {
+    $h = [IntPtr]$scope.Current.NativeWindowHandle
+    [U]::ShowWindow($h, 3) | Out-Null; [U]::SetForegroundWindow($h) | Out-Null
+    "max $Window"
+  }
+  'restore' {
+    $h = [IntPtr]$scope.Current.NativeWindowHandle
+    [U]::ShowWindow($h, 9) | Out-Null
+    "restore $Window"
+  }
+  'clicktype' {
+    # 点窗口里第 N 个（从 0 开始，-Name 给序号）某类控件，例如 Edit
+    $ct = [System.Windows.Automation.ControlType]::$Type
+    $cc = New-Object System.Windows.Automation.PropertyCondition ($A::ControlTypeProperty), $ct
+    $all = $scope.FindAll([System.Windows.Automation.TreeScope]::Descendants, $cc)
+    $e = $all[[int]$Name]
+    if (-not $e) { "no $Type #$Name (found $($all.Count))"; exit 3 }
+    $r = $e.Current.BoundingRectangle
+    [U]::SetCursorPos([int]($r.X + $r.Width/2), [int]($r.Y + $r.Height/2)) | Out-Null
+    Start-Sleep -Milliseconds 200
+    [U]::mouse_event(2,0,0,0,[UIntPtr]::Zero); [U]::mouse_event(4,0,0,0,[UIntPtr]::Zero)
+    "clicked $Type #$Name at $r"
+  }
+  'type' {
+    [System.Windows.Forms.SendKeys]::SendWait($Text); "typed"
+  }
+  'setvalue' {
+    # 给第 N 个（-Name 序号）Edit 直接赋值，不经过键盘（避开输入法和自动补全）
+    $cc = New-Object System.Windows.Automation.PropertyCondition ($A::ControlTypeProperty), ([System.Windows.Automation.ControlType]::Edit)
+    if ($Name -match '^\d+$') { $e = $scope.FindAll([System.Windows.Automation.TreeScope]::Descendants, $cc)[[int]$Name] }
+    else {
+      # 按名字找（可能是组合框），再取它里面的编辑框
+      $cn = New-Object System.Windows.Automation.PropertyCondition ($A::NameProperty), $Name
+      $e = $scope.FindFirst([System.Windows.Automation.TreeScope]::Descendants, $cn)
+      if ($e -and $e.Current.ControlType -ne [System.Windows.Automation.ControlType]::Edit) {
+        $inner = $e.FindFirst([System.Windows.Automation.TreeScope]::Descendants, $cc)
+        if ($inner) { $e = $inner }
+      }
+    }
+    if (-not $e) { "no edit #$Name"; exit 3 }
+    $e.GetCurrentPattern([System.Windows.Automation.ValuePattern]::Pattern).SetValue($Text)
+    "set edit #$Name"
+  }
+  'invoke' {
+    $c1 = New-Object System.Windows.Automation.PropertyCondition ($A::NameProperty), $Name
+    $c2 = New-Object System.Windows.Automation.PropertyCondition ($A::ControlTypeProperty), ([System.Windows.Automation.ControlType]::Button)
+    $e = $scope.FindFirst([System.Windows.Automation.TreeScope]::Descendants, (New-Object System.Windows.Automation.AndCondition $c1, $c2))
+    if (-not $e) { "button '$Name' not found"; exit 3 }
+    $e.GetCurrentPattern([System.Windows.Automation.InvokePattern]::Pattern).Invoke()
+    "invoked '$Name'"
+  }
+  'wheel' {
+    # 在窗口中部向下滚动
+    $r = $scope.Current.BoundingRectangle
+    [U]::SetCursorPos([int]($r.X + $r.Width/2), [int]($r.Y + $r.Height*0.7)) | Out-Null
+    Start-Sleep -Milliseconds 200
+    1..10 | % { [U]::mouse_event(0x800,0,0,[uint32]4294967176,[UIntPtr]::Zero); Start-Sleep -Milliseconds 50 }
+    "wheel"
   }
   'hung' {
     Get-Process OneZip -ErrorAction SilentlyContinue | % { "pid {0} responding={1} title='{2}'" -f $_.Id, $_.Responding, $_.MainWindowTitle }

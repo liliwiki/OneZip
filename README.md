@@ -59,6 +59,14 @@ cargo build --release
 cargo test --workspace
 ```
 
+装好之后可以跑右键菜单的界面回归测试（会操作鼠标键盘，运行时别动电脑；测试文件放在 `D:\OZT`）：
+
+```
+powershell -ExecutionPolicy Bypass -File tools\uitest\regress.ps1
+```
+
+改了 `assets/onezip-256.png` 后，用 `python tools/make-assets.py` 重新生成稀疏包的各尺寸图标。
+
 ## 许可
 
 MIT OR Apache-2.0。依赖的上游项目及其许可见 [NOTICE](NOTICE)。

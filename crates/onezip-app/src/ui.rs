@@ -1,6 +1,7 @@
 //! 主窗口、压缩对话框、密码对话框和任务队列之间的胶水。
 
 use std::cell::RefCell;
+use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
 use std::sync::Arc;
@@ -21,6 +22,8 @@ struct App {
     /// 打开中的对话框，防止被提前释放。
     compress: RefCell<Option<CompressDialog>>,
     password: RefCell<Option<PasswordDialog>>,
+    /// 已经自动弹过密码框的任务（输入后又报密码错误时会移出，再弹一次）。
+    prompted: RefCell<HashSet<u64>>,
 }
 
 pub fn run(first: Request, incoming: Receiver<Request>) -> anyhow::Result<()> {
@@ -30,6 +33,7 @@ pub fn run(first: Request, incoming: Receiver<Request>) -> anyhow::Result<()> {
         tasks: Manager::new(),
         compress: RefCell::new(None),
         password: RefCell::new(None),
+        prompted: RefCell::new(HashSet::new()),
     });
     wire(&app);
     app.window.set_status(status_text().into());
@@ -79,10 +83,25 @@ fn status_text() -> String {
     }
 }
 
-fn refresh(app: &App) {
-    let rows: Vec<TaskRow> = app
-        .tasks
-        .snapshot()
+fn refresh(app: &Rc<App>) {
+    let snapshot = app.tasks.snapshot();
+    // 像 7-Zip 一样：发现需要密码就直接弹出密码框，不用再去任务列表里找按钮。
+    let waiting = snapshot
+        .iter()
+        .find(|t| matches!(t.status, Status::NeedsPassword { .. }) && !app.prompted.borrow().contains(&t.id))
+        .map(|t| t.id);
+    app.prompted.borrow_mut().retain(|id| {
+        snapshot
+            .iter()
+            .any(|t| t.id == *id && matches!(t.status, Status::NeedsPassword { .. }))
+    });
+    if let Some(id) = waiting
+        && app.password.borrow().is_none()
+    {
+        app.prompted.borrow_mut().insert(id);
+        ask_password(app, id);
+    }
+    let rows: Vec<TaskRow> = snapshot
         .iter()
         .map(|t| TaskRow {
             id: t.id as i32,

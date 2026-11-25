@@ -25,7 +25,10 @@ Set-Location $root
 if (-not $Version) {
     $Version = (Select-String -Path Cargo.toml -Pattern '^version = "(.+)"').Matches[0].Groups[1].Value
 }
-$pkgVersion = "$Version.0"
+# 包版本第四段每次打包递增（自 2026 年起的小时数），升级时资源管理器和任务栏会
+# 重新读取图标等资源，而不是沿用同版本的缓存。
+$build = [int][math]::Floor(((Get-Date) - [datetime]'2026-01-01').TotalHours) % 65535
+$pkgVersion = "$Version.$build"
 
 # ---- 编译 ----
 $env:RUSTUP_HOME = 'D:\Tools\Rust\rustup'
@@ -43,6 +46,7 @@ $sdkBin = Get-ChildItem $kits -Directory | Where-Object { $_.Name -match '^10\.'
 if (-not $sdkBin) { throw "找不到 Windows SDK 的 makeappx.exe" }
 $makeappx = Join-Path $sdkBin 'makeappx.exe'
 $signtool = Join-Path $sdkBin 'signtool.exe'
+$makepri = Join-Path $sdkBin 'makepri.exe'
 
 # ---- 整理发布目录 ----
 $name = "OneZip-$Version-x64"
@@ -62,6 +66,18 @@ Copy-Item "$PSScriptRoot\sparse\Assets\*" "$stage\Assets"
 (Get-Content "$PSScriptRoot\sparse\AppxManifest.xml" -Raw -Encoding UTF8).
     Replace('__PUBLISHER__', $Publisher).Replace('__VERSION__', $pkgVersion) |
     Set-Content "$stage\AppxManifest.xml" -Encoding UTF8
+# 资源索引：让任务栏按 targetsize / altform-unplated 挑选图标（tools/make-assets.py 生成）。
+# 没有它，任务栏只能拿到带底板的小图，显示成一块灰色方块。
+$priconfig = Join-Path $root 'target\priconfig.xml'
+& $makepri createconfig /cf $priconfig /dq zh-CN /pv 10.0.0 /o | Out-Host
+if ($LASTEXITCODE -ne 0) { throw "makepri createconfig 失败" }
+# 默认配置会按缩放比例拆出多个资源包（给 bundle 用）；单个包要全部放进 resources.pri。
+[xml]$cfg = Get-Content $priconfig -Raw
+$cfg.resources.SelectNodes('packaging') | ForEach-Object { [void]$_.ParentNode.RemoveChild($_) }
+$cfg.Save($priconfig)
+Get-ChildItem $stage -Filter 'resources*.pri' | Remove-Item
+& $makepri new /pr $stage /cf $priconfig /mn "$stage\AppxManifest.xml" /of "$stage\resources.pri" /o | Out-Host
+if ($LASTEXITCODE -ne 0) { throw "makepri new 失败" }
 $msix = Join-Path $dist 'OneZip-Shell.msix'
 & $makeappx pack /d $stage /p $msix /nv /o | Out-Host
 if ($LASTEXITCODE -ne 0) { throw "makeappx 失败" }
