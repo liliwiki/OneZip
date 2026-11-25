@@ -12,9 +12,19 @@ public static class M {
   [DllImport("user32.dll")] public static extern bool ShowWindow(IntPtr h, int n);
   [DllImport("user32.dll")] public static extern IntPtr GetForegroundWindow();
   [DllImport("user32.dll")] public static extern uint GetWindowThreadProcessId(IntPtr h, IntPtr p);
+  [DllImport("user32.dll", EntryPoint="GetWindowThreadProcessId")] public static extern uint GetWindowThreadProcessId2(IntPtr h, out int p);
   [DllImport("kernel32.dll")] public static extern uint GetCurrentThreadId();
   [DllImport("user32.dll")] public static extern bool AttachThreadInput(uint a, uint b, bool f);
   [DllImport("user32.dll")] public static extern bool SetCursorPos(int x,int y);
+  [StructLayout(LayoutKind.Sequential)] public struct PT { public int X; public int Y; }
+  [DllImport("user32.dll")] public static extern IntPtr WindowFromPoint(PT p);
+  [DllImport("user32.dll")] public static extern IntPtr GetAncestor(IntPtr h, uint f);
+  [DllImport("user32.dll", EntryPoint="GetWindowThreadProcessId")] public static extern uint PidOf(IntPtr h, out int p);
+  public static string ProcAt(int x, int y) {
+    var pt = new PT(); pt.X = x; pt.Y = y;
+    int pid; PidOf(GetAncestor(WindowFromPoint(pt), 2), out pid);
+    try { return System.Diagnostics.Process.GetProcessById(pid).ProcessName; } catch { return ""; }
+  }
   [DllImport("user32.dll")] public static extern void mouse_event(uint f,int x,int y,uint d,UIntPtr e);
   public static void Front(IntPtr h) {
     ShowWindow(h, 9);
@@ -34,7 +44,7 @@ function Find($name) {
 }
 function Click($e) {
   $r = $e.Current.BoundingRectangle
-  [M]::SetCursorPos([int]($r.X + $r.Width/2), [int]($r.Y + $r.Height/2)) | Out-Null
+  if ([M]::ProcAt([int]($r.X + $r.Width/2), [int]($r.Y + $r.Height/2)) -eq 'Cage') { "refuse click: Cage is under the target"; exit 7 }; [M]::SetCursorPos([int]($r.X + $r.Width/2), [int]($r.Y + $r.Height/2)) | Out-Null
   Start-Sleep -Milliseconds 250
   [M]::mouse_event(2,0,0,0,[UIntPtr]::Zero); [M]::mouse_event(4,0,0,0,[UIntPtr]::Zero)
 }
@@ -43,9 +53,42 @@ function FindItem($name) {
   $c2 = New-Object System.Windows.Automation.PropertyCondition ($A::ControlTypeProperty), ([System.Windows.Automation.ControlType]::MenuItem)
   $root.FindFirst([System.Windows.Automation.TreeScope]::Descendants, (New-Object System.Windows.Automation.AndCondition $c1, $c2))
 }
+# 菜单项可能要过一会儿才加载出来（会先显示“正在加载…”）：轮询最多 $sec 秒。
+function WaitItem($name, $sec = 10) {
+  for ($i = 0; $i -lt $sec * 4; $i++) {
+    if ($name.Contains('*') -and -not $name.StartsWith('*')) {
+      $mi = New-Object System.Windows.Automation.PropertyCondition ($A::ControlTypeProperty), ([System.Windows.Automation.ControlType]::MenuItem)
+      $e = $root.FindAll([System.Windows.Automation.TreeScope]::Descendants, $mi) | ? { $_.Current.Name -like $name } | Select -First 1
+    } else { $e = FindItem $name }
+    if ($e) { return $e }
+    Start-Sleep -Milliseconds 250
+  }
+  $null
+}
 function MenuItems {
   $mi = New-Object System.Windows.Automation.PropertyCondition ($A::ControlTypeProperty), ([System.Windows.Automation.ControlType]::MenuItem)
   $root.FindAll([System.Windows.Automation.TreeScope]::Descendants, $mi) | % { $_.Current.Name }
+}
+
+# 按键前确认最前面的不是 Claude 应用（Cage）：在那里按 Esc 会停掉当前会话。
+function ForegroundProc {
+  $h = [M]::GetForegroundWindow()
+  $procId = 0
+  [void][M]::GetWindowThreadProcessId2($h, [ref]$procId)
+  try { (Get-Process -Id $procId).ProcessName } catch { '' }
+}
+function SafeKeys($keys) {
+  $fp = ForegroundProc
+  if ($fp -eq 'Cage') { "skip keys $keys (Cage is foreground)"; return }
+  [System.Windows.Forms.SendKeys]::SendWait($keys)
+}
+function Shot($tag) {
+  if (-not $Out) { return }
+  $path = $Out -replace '\.png$', "-$tag.png"
+  $b = [System.Windows.Forms.Screen]::PrimaryScreen.Bounds
+  $bmp = New-Object System.Drawing.Bitmap $b.Width, $b.Height
+  [System.Drawing.Graphics]::FromImage($bmp).CopyFromScreen($b.Location, [System.Drawing.Point]::Empty, $b.Size)
+  $bmp.Save($path); "saved $path"
 }
 
 $sh = New-Object -ComObject Shell.Application
@@ -58,8 +101,8 @@ if (-not $win) {
 }
 if (-not $win) { "no explorer window for $want"; exit 2 }
 $win.Refresh(); Start-Sleep 1
-[System.Windows.Forms.SendKeys]::SendWait('{ESC}')
 [M]::Front([IntPtr]$win.HWND); Start-Sleep -Milliseconds 600
+if ((ForegroundProc) -ne 'explorer') { "explorer not foreground (" + (ForegroundProc) + ")"; Shot 'nofront'; exit 6 }
 for ($try = 0; $try -lt 5; $try++) {
   $first = $true
   foreach ($name in $Items) {
@@ -78,14 +121,14 @@ $c2 = New-Object System.Windows.Automation.PropertyCondition ($A::ControlTypePro
 $li = $ew.FindFirst([System.Windows.Automation.TreeScope]::Descendants, (New-Object System.Windows.Automation.AndCondition $c1, $c2))
 if ($li) {
   $r = $li.Current.BoundingRectangle
-  [M]::SetCursorPos([int]($r.X + 60), [int]($r.Y + $r.Height/2)) | Out-Null
+  if ([M]::ProcAt([int]($r.X + 60), [int]($r.Y + $r.Height/2)) -eq 'Cage') { "refuse click: Cage is under the target"; exit 7 }; [M]::SetCursorPos([int]($r.X + 60), [int]($r.Y + $r.Height/2)) | Out-Null
   Start-Sleep -Milliseconds 250
   [M]::mouse_event(8,0,0,0,[UIntPtr]::Zero); [M]::mouse_event(16,0,0,0,[UIntPtr]::Zero)
 } else {
-  [System.Windows.Forms.SendKeys]::SendWait('+{F10}')
+  SafeKeys '+{F10}'
 }
 Start-Sleep -Seconds 2
-$oz = FindItem $Sub
+$oz = WaitItem $Sub
 if (-not $oz) {
   "$Sub not in menu"; MenuItems
   if ($Out) {
@@ -106,15 +149,22 @@ if (-not $Command) {
     [System.Drawing.Graphics]::FromImage($bmp).CopyFromScreen($b.Location, [System.Drawing.Point]::Empty, $b.Size)
     $bmp.Save($Out); "saved $Out"
   }
-  [System.Windows.Forms.SendKeys]::SendWait('{ESC}{ESC}')
+  SafeKeys '{ESC}{ESC}'
   exit 0
 }
-$e = $null
-if ($Command.Contains('*')) {
-  $mi = New-Object System.Windows.Automation.PropertyCondition ($A::ControlTypeProperty), ([System.Windows.Automation.ControlType]::MenuItem)
-  $e = $root.FindAll([System.Windows.Automation.TreeScope]::Descendants, $mi) | ? { $_.Current.Name -like $Command } | Select -First 1
-  if ($e) { $Command = $e.Current.Name }
-} else { $e = FindItem $Command }
-if (-not $e) { "command '$Command' not found; menu:"; $all | % { "  $_" }; [System.Windows.Forms.SendKeys]::SendWait('{ESC}{ESC}'); exit 5 }
+# 多级：'CRC SHA>SHA-256' 先点开 CRC SHA，再点 SHA-256。
+$steps = $Command -split '>'
+foreach ($step in $steps[0..($steps.Count - 2)]) {
+  if ($steps.Count -lt 2) { break }
+  $mid = WaitItem $step
+  if (-not $mid) { "submenu '$step' not found"; MenuItems; Shot 'fail'; exit 5 }
+  Click $mid; Start-Sleep -Seconds 2
+  Shot ('step-' + ($step -replace '[^\w]', ''))
+}
+$Command = $steps[-1]
+$e = WaitItem $Command
+if ($e) { $Command = $e.Current.Name }
+if (-not $e) { "command '$Command' not found; menu:"; $all | % { "  $_" }; SafeKeys '{ESC}{ESC}'; exit 5 }
 Click $e
 "invoked '$Command'"
+if ($Out) { Start-Sleep -Seconds 3; Shot 'after' }

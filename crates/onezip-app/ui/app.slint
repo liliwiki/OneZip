@@ -1,5 +1,5 @@
 import {
-    Button, CheckBox, ComboBox, LineEdit, ListView, ProgressIndicator, Slider,
+    Button, CheckBox, ComboBox, LineEdit, ListView, ProgressIndicator, Slider, TextEdit,
     VerticalBox, HorizontalBox, GroupBox, Palette,
 } from "std-widgets.slint";
 
@@ -15,6 +15,8 @@ export struct TaskRow {
     can-cancel: bool,
     can-remove: bool,
     can-open: bool,
+    // “打开”按钮的文字：解压/压缩是“打开”，校验值是“查看”。
+    open-label: string,
     needs-password: bool,
 }
 
@@ -86,7 +88,7 @@ component TaskItem inherits Rectangle {
                     clicked => { root.cancel(task.id); }
                 }
                 if task.can-open: Button {
-                    text: "打开";
+                    text: task.open-label;
                     clicked => { root.open(task.id); }
                 }
                 if task.can-remove: Button {
@@ -339,4 +341,49 @@ export component PasswordDialog inherits Window {
         }
     }
     init => { pw.focus(); }
+}
+
+/// 校验值结果（右键菜单 "CRC SHA"）。
+export component HashDialog inherits Window {
+    title: "校验值";
+    icon: @image-url("../../../assets/onezip-256.png");
+    preferred-width: 720px;
+    preferred-height: 420px;
+    min-width: 420px;
+    min-height: 220px;
+
+    in property <string> text;
+    in-out property <string> copied: "";
+
+    callback copy();
+    callback dismiss();
+
+    VerticalBox {
+        TextEdit {
+            text: root.text;
+            read-only: true;
+            wrap: no-wrap;
+            font-family: "Consolas";
+            font-size: 13px;
+            vertical-stretch: 1;
+        }
+        HorizontalLayout {
+            spacing: 8px;
+            Text {
+                text: root.copied;
+                opacity: 0.7;
+                vertical-alignment: center;
+                horizontal-stretch: 1;
+            }
+            Button {
+                text: "复制";
+                clicked => { root.copy(); }
+            }
+            Button {
+                text: "关闭";
+                primary: true;
+                clicked => { root.dismiss(); }
+            }
+        }
+    }
 }

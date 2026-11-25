@@ -9,7 +9,7 @@ use std::time::Duration;
 
 use anyhow::{Result, bail};
 use interprocess::local_socket::{GenericNamespaced, ListenerOptions, Stream, prelude::*};
-use onezip_core::{Format, Placement};
+use onezip_core::{Format, HashKind, Placement};
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum Action {
@@ -26,6 +26,8 @@ pub enum Action {
     /// `None`：弹出压缩对话框；`Some`：直接压成该格式。
     Compress(Option<Format>),
     Url(String),
+    /// 计算校验值（右键菜单 "CRC SHA"）。
+    Hash(Vec<HashKind>),
     RegisterMenu,
     UnregisterMenu,
 }
@@ -57,6 +59,10 @@ impl Request {
                 "--url" => match args.next() {
                     Some(u) => action = Some(Action::Url(u)),
                     None => bail!("--url 后面要跟一个链接"),
+                },
+                "--hash" => match args.next().and_then(|a| HashKind::parse_list(&a)) {
+                    Some(kinds) => action = Some(Action::Hash(kinds)),
+                    None => bail!("--hash 后面要跟算法，如 crc32,sha256 或 *"),
                 },
                 "--register-menu" => action = Some(Action::RegisterMenu),
                 "--unregister-menu" => action = Some(Action::UnregisterMenu),
@@ -103,6 +109,10 @@ impl Request {
             Action::Test => "test".into(),
             Action::Compress(f) => format!("compress {}", f.map_or("ask", |f| f.extension())),
             Action::Url(u) => format!("url {u}"),
+            Action::Hash(kinds) => format!(
+                "hash {}",
+                kinds.iter().map(|k| k.id()).collect::<Vec<_>>().join(",")
+            ),
             Action::RegisterMenu => "register".into(),
             Action::UnregisterMenu => "unregister".into(),
         };
@@ -137,6 +147,7 @@ impl Request {
             ("compress", Some("ask")) => Action::Compress(None),
             ("compress", Some(f)) => Action::Compress(Some(Format::parse(f)?)),
             ("url", Some(u)) => Action::Url(u.to_string()),
+            ("hash", Some(k)) => Action::Hash(HashKind::parse_list(k)?),
             ("register", _) => Action::RegisterMenu,
             ("unregister", _) => Action::UnregisterMenu,
             _ => return None,
@@ -262,6 +273,10 @@ mod tests {
 
         assert_eq!(args(&[]).action, Action::Show);
         assert_eq!(args(&["x.zip"]).action, extract(Placement::Smart, false));
+        let h = args(&["--hash", "*", r"D:\a b\x.iso"]);
+        assert_eq!(h.action, Action::Hash(HashKind::ALL.to_vec()));
+        let hl: Vec<String> = h.encode().lines().map(str::to_string).collect();
+        assert_eq!(Request::decode(&hl[..hl.len() - 1]), Some(h));
         let c = args(&["--compress-7z", "a"]);
         assert_eq!(c.action, Action::Compress(Some(Format::SevenZ)));
         let lines: Vec<String> = c.encode().lines().map(str::to_string).collect();

@@ -284,3 +284,122 @@ fn tar_zst_extract_and_remove_via_peel() {
     );
     assert!(!archive.exists(), "边解边删完成后原包应已删除");
 }
+
+/// 约 96 MB 不太好压的数据（伪随机字节夹杂文本），多线程编码器要压好一会儿。
+fn bulky_tree(root: &Path) -> std::path::PathBuf {
+    let dir = root.join("大块");
+    fs::create_dir_all(&dir).unwrap();
+    let mut x: u64 = 0x9E37_79B9_7F4A_7C15;
+    for i in 0..3 {
+        let mut buf = Vec::with_capacity(32 << 20);
+        while buf.len() < 32 << 20 {
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            if x.is_multiple_of(4) {
+                buf.extend_from_slice(b"OneZip progress test line. ");
+            } else {
+                buf.extend_from_slice(&x.to_le_bytes());
+            }
+        }
+        fs::write(dir.join(format!("part{i}.bin")), buf).unwrap();
+    }
+    dir
+}
+
+/// 多线程 LZMA2 / XZ：进度要随压缩逐步增加，而不是读完输入就跳到 100%。
+fn progress_is_gradual(format: Format) {
+    use std::sync::Mutex;
+    use std::time::Instant;
+    let dir = tempfile::tempdir().unwrap();
+    let src = bulky_tree(dir.path());
+    let out = dir.path().join(format!("大块.{}", format.extension()));
+    let start = Instant::now();
+    let samples: Arc<Mutex<Vec<(f64, u64)>>> = Arc::default();
+    let total = Arc::new(std::sync::atomic::AtomicU64::new(0));
+    let observer: Observer = {
+        let samples = samples.clone();
+        let total = total.clone();
+        let done = Arc::new(std::sync::atomic::AtomicU64::new(0));
+        Arc::new(move |ev| match ev {
+            Event::Started { total: t, .. } => total.store(t, std::sync::atomic::Ordering::SeqCst),
+            Event::Progressed(n) => {
+                let d = done.fetch_add(n, std::sync::atomic::Ordering::SeqCst) + n;
+                samples.lock().unwrap().push((start.elapsed().as_secs_f64(), d));
+            }
+            _ => {}
+        })
+    };
+    let mut req = CompressRequest::new(vec![src.clone()], out.clone(), format);
+    req.level = 7;
+    onezip_core::compress(&req, observer, &stop()).unwrap();
+    let elapsed = start.elapsed().as_secs_f64();
+    let total = total.load(std::sync::atomic::Ordering::SeqCst);
+    let samples = samples.lock().unwrap();
+    // 不超过总量，最后正好到总量。
+    assert_eq!(samples.last().unwrap().1, total);
+    // 用了一半时间时，进度还远没到头（以前读完输入就是 100%）。
+    let half = samples
+        .iter()
+        .take_while(|(t, _)| *t <= elapsed / 2.0)
+        .last()
+        .map_or(0, |s| s.1);
+    assert!(
+        half < total * 9 / 10,
+        "{format:?}: {half} of {total} after half of {elapsed:.1}s"
+    );
+    assert!(samples.len() > 20, "only {} progress updates", samples.len());
+    let back = dir.path().join("back");
+    extract_keep(&out, &back, None);
+    for i in 0..3 {
+        let name = format!("part{i}.bin");
+        assert_eq!(
+            fs::read(back.join("大块").join(&name)).unwrap(),
+            fs::read(src.join(&name)).unwrap()
+        );
+    }
+}
+
+#[test]
+fn sevenz_progress_is_gradual() {
+    progress_is_gradual(Format::SevenZ);
+}
+
+#[test]
+fn tar_xz_progress_is_gradual() {
+    progress_is_gradual(Format::TarXz);
+}
+
+/// 压缩中途取消：很快返回“已取消”，不留下临时文件或半截压缩包。
+#[test]
+fn sevenz_cancel_is_prompt_and_clean() {
+    use std::sync::atomic::Ordering;
+    use std::time::{Duration, Instant};
+    let dir = tempfile::tempdir().unwrap();
+    let src = bulky_tree(dir.path());
+    let out = dir.path().join("大块.7z");
+    let stop = stop();
+    let observer: Observer = {
+        let stop = stop.clone();
+        let seen = Arc::new(std::sync::atomic::AtomicU64::new(0));
+        Arc::new(move |ev| {
+            if let Event::Progressed(n) = ev
+                && seen.fetch_add(n, Ordering::SeqCst) + n >= 8 << 20
+            {
+                stop.store(true, Ordering::SeqCst);
+            }
+        })
+    };
+    let mut req = CompressRequest::new(vec![src], out.clone(), Format::SevenZ);
+    req.level = 9;
+    let start = Instant::now();
+    let err = onezip_core::compress(&req, observer, &stop).unwrap_err();
+    let took = start.elapsed();
+    assert!(err.chain().any(|c| c.is::<onezip_core::Cancelled>()), "{err:#}");
+    assert!(took < Duration::from_secs(10), "cancel took {took:?}");
+    let left: Vec<_> = fs::read_dir(dir.path())
+        .unwrap()
+        .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+        .collect();
+    assert!(!left.iter().any(|n| n.starts_with("大块.7z")), "{left:?}");
+}

@@ -5,6 +5,7 @@
 //! onezipc a <输出压缩包> <文件或文件夹>... [-t 7z|zip|tar.zst|tar.xz|tar.gz] [-l 0-9] [-p 密码]
 //! onezipc l <压缩包>
 //! onezipc t <压缩包>
+//! onezipc h <文件或文件夹>... [-a crc32,sha256|*]
 //! ```
 //! 解压时 Ctrl+C 会在下一个安全点暂停并保存进度；用同样的命令再运行一次即可继续。
 
@@ -109,6 +110,16 @@ enum Command {
         archive: PathBuf,
         #[arg(short, long)]
         password: Option<String>,
+    },
+    /// 计算校验值：CRC-32、CRC-64、MD5、SHA-1、SHA-256、SHA-512
+    #[command(alias = "hash")]
+    H {
+        /// 文件或文件夹（文件夹会递归）
+        #[arg(required = true)]
+        paths: Vec<PathBuf>,
+        /// 算法，逗号分隔；* 表示全部
+        #[arg(short, long, default_value = "crc32,sha256")]
+        algorithm: String,
     },
 }
 
@@ -241,6 +252,15 @@ fn run(command: Command) -> Result<u8> {
             }
             let files = entries.iter().filter(|e| !e.is_dir).count();
             println!("共 {files} 个文件，解压后 {}", human(total));
+            Ok(0)
+        }
+        Command::H { paths, algorithm } => {
+            let kinds = onezip_core::HashKind::parse_list(&algorithm)
+                .ok_or_else(|| anyhow!("不认识的算法 {algorithm}（可用：crc32 crc64 md5 sha1 sha256 sha512 *）"))?;
+            let (observer, bar) = progress();
+            let result = onezip_core::hash(&paths, &kinds, observer, &stop);
+            bar.lock().unwrap().finish_and_clear();
+            print!("{}", result?.to_text());
             Ok(0)
         }
         Command::T { archive, password } => {

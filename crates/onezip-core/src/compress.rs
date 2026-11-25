@@ -136,7 +136,19 @@ pub fn compress(req: &CompressRequest, observer: Observer, stop: &Arc<AtomicBool
     let tmp = temp_path(&output);
     let result = (|| -> Result<()> {
         let file = File::create(&tmp).with_context(|| format!("创建 {}", tmp.display()))?;
-        let ctx = Ctx { observer: &observer, stop };
+        // 多线程 LZMA2/XZ：进度由编码器按块报告。
+        let encoder_reports = threads() >= 2
+            && match req.format {
+                Format::SevenZ => req.level > 0,
+                Format::TarXz => true,
+                _ => false,
+            };
+        let ctx = Ctx {
+            observer: &observer,
+            stop,
+            reader_progress: !encoder_reports,
+        };
+        let _hooks = encoder_reports.then(|| EncoderProgress::install(&ctx, total));
         match req.format {
             Format::Zip => write_zip(file, &items, req, &ctx)?,
             Format::SevenZ => write_7z(file, &items, req, &ctx)?,
@@ -147,9 +159,9 @@ pub fn compress(req: &CompressRequest, observer: Observer, stop: &Arc<AtomicBool
                 finish(enc.finish()?)?;
             }
             Format::TarXz => {
-                let mut opts = lzma_rust2::XzOptions::with_preset(req.level.min(9));
+                let mut opts = lzma_mt::XzOptions::with_preset(req.level.min(9));
                 opts.set_block_size(NonZeroU64::new(64 << 20));
-                let enc = lzma_rust2::XzWriterMt::new(BufWriter::new(file), opts, threads())?;
+                let enc = lzma_mt::XzWriterMt::new(BufWriter::new(file), opts, threads())?;
                 let enc = write_tar(enc, &items, &ctx)?;
                 finish(enc.finish()?)?;
             }
@@ -173,6 +185,10 @@ pub fn compress(req: &CompressRequest, observer: Observer, stop: &Arc<AtomicBool
     })();
     if result.is_err() {
         let _ = fs::remove_file(&tmp);
+        // 被叫停时编码器返回的是各自的错误（如 encoder cancelled），统一报告成取消。
+        if stop.load(Ordering::Relaxed) {
+            bail!(Cancelled);
+        }
     }
     result
 }
@@ -192,22 +208,56 @@ impl std::error::Error for Cancelled {}
 struct Ctx<'a> {
     observer: &'a Observer,
     stop: &'a Arc<AtomicBool>,
+    /// 读文件时就报告进度。多线程 LZMA2/XZ 编码器会先把几百 MB 读进内存再压，
+    /// 那时改由编码器每压完一块报告一次（见 [`EncoderProgress`]）。
+    reader_progress: bool,
 }
 
 impl Ctx<'_> {
     fn open(&self, item: &Item) -> io::Result<Counting> {
         Ok(Counting {
             inner: File::open(&item.path)?,
-            observer: self.observer.clone(),
+            observer: self.reader_progress.then(|| self.observer.clone()),
             stop: self.stop.clone(),
         })
+    }
+}
+
+/// 在本线程上安装多线程 LZMA2/XZ 编码器的进度与取消钩子，离开作用域时撤掉。
+/// （钩子是 third_party/lzma-rust2 里加的。）
+struct EncoderProgress;
+
+impl EncoderProgress {
+    /// `total` 是要压缩的文件总大小。tar 流比它多出每个文件的头和对齐填充，
+    /// 所以按 tar 流报告的量要封顶，免得进度超过 100%。
+    fn install(ctx: &Ctx, total: u64) -> Self {
+        use std::sync::atomic::AtomicU64;
+        let observer = ctx.observer.clone();
+        let reported = AtomicU64::new(0);
+        lzma_mt::hooks::set(
+            Arc::new(move |n| {
+                let before = reported.fetch_add(n, Ordering::SeqCst);
+                let delta = (before + n).min(total) - before.min(total);
+                if delta > 0 {
+                    observer(Event::Progressed(delta));
+                }
+            }),
+            Some(ctx.stop.clone()),
+        );
+        EncoderProgress
+    }
+}
+
+impl Drop for EncoderProgress {
+    fn drop(&mut self) {
+        lzma_mt::hooks::clear();
     }
 }
 
 /// 读文件时报告进度，被叫停时返回错误让编码器尽快停下。
 struct Counting {
     inner: File,
-    observer: Observer,
+    observer: Option<Observer>,
     stop: Arc<AtomicBool>,
 }
 
@@ -217,8 +267,10 @@ impl Read for Counting {
             return Err(io::Error::other(Cancelled));
         }
         let n = self.inner.read(buf)?;
-        if n > 0 {
-            (self.observer)(Event::Progressed(n as u64));
+        if n > 0
+            && let Some(observer) = &self.observer
+        {
+            observer(Event::Progressed(n as u64));
         }
         Ok(n)
     }

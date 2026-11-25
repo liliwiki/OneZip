@@ -46,6 +46,17 @@ pub const EXTRACT_ITEMS: &[Item] = &[
     item("09addzip", "添加到 zip 压缩包", "--compress-zip", false),
 ];
 
+/// "CRC SHA" 二级菜单：（键名，菜单文字，算法）。与 onezip-shell 的 HASH_ITEMS 一致。
+pub const HASH_ITEMS: &[(&str, &str, &str)] = &[
+    ("1crc32", "CRC-32", "crc32"),
+    ("2crc64", "CRC-64", "crc64"),
+    ("3md5", "MD5", "md5"),
+    ("4sha1", "SHA-1", "sha1"),
+    ("5sha256", "SHA-256", "sha256"),
+    ("6sha512", "SHA-512", "sha512"),
+    ("7all", "*（全部）", "*"),
+];
+
 /// 其它文件和文件夹上的菜单。
 pub const COMPRESS_ITEMS: &[Item] = &[
     item("07add", "添加到压缩包…", "--compress", false),
@@ -61,6 +72,8 @@ mod imp {
 
     const ROOT: &str = r"Software\Classes";
     const VERB: &str = "OneZip";
+    /// 旧版本把 CRC SHA 放在第一层用过的键名，卸载时一并清掉。
+    const VERB_HASH: &str = "OneZipHash";
 
     fn add(base: &str, exe: &Path, items: &[Item]) -> Result<()> {
         let hkcu = RegKey::predef(HKEY_CURRENT_USER);
@@ -81,9 +94,28 @@ mod imp {
         Ok(())
     }
 
+    /// OneZip 子菜单最后的 "CRC SHA" 二级菜单（与 Win11 第一层菜单一致）。
+    fn add_hash(base: &str, exe: &Path) -> Result<()> {
+        let hkcu = RegKey::predef(HKEY_CURRENT_USER);
+        let (hash, _) =
+            hkcu.create_subkey(format!(r"{ROOT}\{base}\shell\{VERB}\shell\99hash"))?;
+        hash.set_value("MUIVerb", &"CRC SHA")?;
+        hash.set_value("SubCommands", &"")?;
+        // ECF_SEPARATORBEFORE
+        hash.set_value("CommandFlags", &0x20u32)?;
+        for (id, label, algo) in HASH_ITEMS {
+            let (k, _) = hash.create_subkey(format!(r"shell\{id}"))?;
+            k.set_value("MUIVerb", label)?;
+            let (cmd, _) = k.create_subkey("command")?;
+            cmd.set_value("", &format!("\"{}\" --hash {algo} \"%1\"", exe.display()))?;
+        }
+        Ok(())
+    }
+
     fn remove(base: &str) {
         let hkcu = RegKey::predef(HKEY_CURRENT_USER);
         let _ = hkcu.delete_subkey_all(format!(r"{ROOT}\{base}\shell\{VERB}"));
+        let _ = hkcu.delete_subkey_all(format!(r"{ROOT}\{base}\shell\{VERB_HASH}"));
     }
 
     fn bases() -> Vec<(String, bool)> {
@@ -104,6 +136,7 @@ mod imp {
             } else {
                 add(&base, exe, COMPRESS_ITEMS)?;
             }
+            add_hash(&base, exe)?;
         }
         notify();
         Ok(())

@@ -80,6 +80,27 @@ UI -Do type -Text '246810' | Out-Null; Start-Sleep 1
 UI -Do click -Window '添加到压缩包' -Name '开始压缩' | Out-Null
 Check '添加到压缩包…（对话框在最前，加密 7z）' ($fg -and (WaitFor { (Test-Path "$Dir\笔记.7z") -and ((& $cli t "$Dir\笔记.7z" -p 246810) -match '通过') }))
 
+# ---- 校验值（平铺在 OneZip 子菜单里）----
+# 结果窗口里的文字通过“复制”按钮取出来核对。
+$m = & powershell -NoProfile -ExecutionPolicy Bypass -File "$here\menu.ps1" -Folder $Dir -Items '笔记.txt'
+Check 'OneZip 子菜单里有校验值各项' (($m -match '^\s+CRC-32$') -and ($m -match '^\s+SHA-512$') -and ($m -match '校验值（全部算法）'))
+Set-Clipboard 'x'
+MN -Folder $Dir -Items '笔记.txt' -Command 'SHA-256'
+$want = (Get-FileHash "$Dir\笔记.txt" -Algorithm SHA256).Hash
+$ok = WaitFor { (UI -Do windows | Select-String 'foreground: 校验值') } 15
+UI -Do click -Window '校验值' -Name '复制' | Out-Null; Start-Sleep 1
+Check 'SHA-256（结果窗口在最前、可复制）' ($ok -and ((Get-Clipboard -Raw) -match $want)) $want
+UI -Do click -Window '校验值' -Name '关闭' | Out-Null; Start-Sleep 1
+
+Set-Clipboard 'x'
+MN -Folder $Dir -Items '照片' -Command '校验值（全部算法）'
+$ok = WaitFor { (UI -Do windows | Select-String 'foreground: 校验值') } 15
+UI -Do click -Window '校验值' -Name '复制' | Out-Null; Start-Sleep 1
+$txt = Get-Clipboard -Raw
+$md5 = (Get-FileHash "$Dir\照片\f1.txt" -Algorithm MD5).Hash
+Check '校验值全部算法（文件夹递归）' ($ok -and $txt -match $md5 -and $txt -match 'SHA-512' -and $txt -match 'CRC-64' -and $txt -match '共 5 个文件')
+UI -Do click -Window '校验值' -Name '关闭' | Out-Null; Start-Sleep 1
+
 # ---- 先开对话框再点“右键菜单…”（以前会卡死）----
 MN -Folder $Dir -Items '笔记.txt' -Command '添加到压缩包…'
 WaitFor { (UI -Do windows | Select-String 'foreground: 添加到压缩包') } 10 | Out-Null
@@ -89,6 +110,40 @@ UI -Do click -Window '右键菜单' -Name '确定' | Out-Null; Start-Sleep 1
 UI -Do click -Window '添加到压缩包' -Name '取消' | Out-Null; Start-Sleep 1
 $alive = (Get-Process OneZip).Responding -notcontains $false
 Check '对话框开着时点“右键菜单…”不卡死' ($box -and $alive)
+
+# ---- 7z 固实压缩：进度要逐步走，压缩中关窗口不能卡死、不能留下临时文件 ----
+$big = "$Dir\大块"; New-Item -ItemType Directory $big -Force | Out-Null
+$rng = [Security.Cryptography.RandomNumberGenerator]::Create()
+$text = [Text.Encoding]::UTF8.GetBytes(("OneZip 固实压缩进度测试 " * 4000))
+foreach ($i in 0..3) {
+  $fs = [IO.File]::Create("$big\part$i.bin")
+  $rb = New-Object byte[] (1MB)
+  foreach ($j in 0..39) { $rng.GetBytes($rb); $fs.Write($rb, 0, $rb.Length); $fs.Write($text, 0, $text.Length) }
+  $fs.Close()
+}
+UI -Do click -Window OneZip -Name '清除已完成' | Out-Null; Start-Sleep 1
+MN -Folder $Dir -Items '大块' -Command '添加到*大块.7z*'
+$pcts = @()
+foreach ($k in 1..8) {
+  Start-Sleep -Milliseconds 700
+  $p = (UI -Do dump -Window OneZip | Select-String '^Text: (\d+)%$' | Select -First 1)
+  if ($p) { $pcts += [int]$p.Matches[0].Groups[1].Value }
+}
+$distinct = @($pcts | Sort-Object -Unique).Count
+Check '7z 进度逐步增加（不是一下 100%）' ($distinct -ge 3 -and ($pcts | Select -First 1) -lt 100) ($pcts -join ',')
+# 再压一次，压到一半关窗口
+Remove-Item "$Dir\大块.7z" -EA SilentlyContinue
+MN -Folder $Dir -Items '大块' -Command '添加到*大块.7z*'
+Start-Sleep 2
+$proc = Get-Process OneZip
+$proc.CloseMainWindow() | Out-Null
+WaitFor { (UI -Do windows | Select-String 'foreground: OneZip') -and (UI -Do dump -Window OneZip | Select-String '还有任务在进行') } 10 | Out-Null
+$t0 = Get-Date
+UI -Do click -Window OneZip -Name '确定' | Out-Null
+$exited = WaitFor { $proc.HasExited } 15
+$secs = ((Get-Date) - $t0).TotalSeconds
+$left = @(Get-ChildItem $Dir -Filter '大块.7z*')
+Check '压缩中关闭：几秒内退出，不留临时文件' ($exited -and $left.Count -eq 0) ("{0:n1}s, 残留 {1}" -f $secs, ($left.Name -join ','))
 
 $results | Format-Table -AutoSize | Out-String -Width 200
 "通过 {0} / {1}" -f @($results | ? 结果 -eq '通过').Count, $results.Count

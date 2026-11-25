@@ -14,7 +14,7 @@ use slint::{ComponentHandle, ModelRc, SharedString, Timer, TimerMode, VecModel};
 
 use crate::request::{Action, Request};
 use crate::tasks::{Kind, Manager, Status, file_name};
-use crate::{CompressDialog, MainWindow, PasswordDialog, TaskRow, menu, win};
+use crate::{CompressDialog, HashDialog, MainWindow, PasswordDialog, TaskRow, menu, win};
 
 struct App {
     window: MainWindow,
@@ -24,6 +24,10 @@ struct App {
     password: RefCell<Option<PasswordDialog>>,
     /// 已经自动弹过密码框的任务（输入后又报密码错误时会移出，再弹一次）。
     prompted: RefCell<HashSet<u64>>,
+    /// 打开着的校验值结果窗口。
+    hashes: RefCell<Vec<HashDialog>>,
+    /// 已经自动弹过结果窗口的校验值任务。
+    shown: RefCell<HashSet<u64>>,
 }
 
 pub fn run(first: Request, incoming: Receiver<Request>) -> anyhow::Result<()> {
@@ -34,6 +38,8 @@ pub fn run(first: Request, incoming: Receiver<Request>) -> anyhow::Result<()> {
         compress: RefCell::new(None),
         password: RefCell::new(None),
         prompted: RefCell::new(HashSet::new()),
+        hashes: RefCell::new(Vec::new()),
+        shown: RefCell::new(HashSet::new()),
     });
     wire(&app);
     app.window.set_status(status_text().into());
@@ -58,8 +64,27 @@ pub fn run(first: Request, incoming: Receiver<Request>) -> anyhow::Result<()> {
             refresh(&app);
         });
     }
-    app.window.run()?;
+    // 不用 window.run()：关窗口后可能还要在后台等任务停到安全点，
+    // 由 [`quit_when_idle`] 决定什么时候真正退出。
+    app.window.show()?;
+    slint::run_event_loop_until_quit()?;
     Ok(())
+}
+
+/// 窗口已经隐藏：等在跑的任务停下（解压停在安全点、压缩删掉临时文件）后退出。
+/// 在后台线程里等，界面线程不阻塞；最多等 30 秒。
+fn quit_when_idle(tasks: Arc<Manager>) {
+    std::thread::spawn(move || {
+        let deadline = std::time::Instant::now() + Duration::from_secs(30);
+        while std::time::Instant::now() < deadline
+            && tasks.snapshot().iter().any(|t| t.is_running())
+        {
+            std::thread::sleep(Duration::from_millis(100));
+        }
+        let _ = slint::invoke_from_event_loop(|| {
+            let _ = slint::quit_event_loop();
+        });
+    });
 }
 
 /// 归属 `parent` 的提示框：始终在它上面，不会跑到别的窗口后面让人以为程序卡死。
@@ -101,6 +126,16 @@ fn refresh(app: &Rc<App>) {
         app.prompted.borrow_mut().insert(id);
         ask_password(app, id);
     }
+    // 校验值算完就弹出结果窗口（像 7-Zip 一样）。
+    let finished: Vec<u64> = snapshot
+        .iter()
+        .filter(|t| t.report.is_some() && !app.shown.borrow().contains(&t.id))
+        .map(|t| t.id)
+        .collect();
+    for id in finished {
+        app.shown.borrow_mut().insert(id);
+        show_hash(app, id);
+    }
     let rows: Vec<TaskRow> = snapshot
         .iter()
         .map(|t| TaskRow {
@@ -113,7 +148,8 @@ fn refresh(app: &Rc<App>) {
             can_resume: t.can_resume(),
             can_cancel: t.can_cancel(),
             can_remove: t.can_remove(),
-            can_open: t.status == Status::Done && t.output.is_some(),
+            can_open: t.status == Status::Done && (t.output.is_some() || t.report.is_some()),
+            open_label: if t.report.is_some() { "查看" } else { "打开" }.into(),
             needs_password: matches!(t.status, Status::NeedsPassword { .. }),
         })
         .collect();
@@ -146,9 +182,13 @@ fn wire(app: &Rc<App>) {
         move || t.clear_finished()
     });
     w.on_open({
-        let t = tasks.clone();
+        let app = Rc::downgrade(app);
         move |id| {
-            if let Some(p) = t.get(id as u64).and_then(|t| t.output) {
+            let Some(app) = app.upgrade() else { return };
+            let Some(task) = app.tasks.get(id as u64) else { return };
+            if task.report.is_some() {
+                show_hash(&app, id as u64);
+            } else if let Some(p) = task.output {
                 reveal(&p);
             }
         }
@@ -260,13 +300,9 @@ fn wire(app: &Rc<App>) {
                     return slint::CloseRequestResponse::KeepWindowShown;
                 }
                 tasks.pause_all();
-                for _ in 0..100 {
-                    if !tasks.snapshot().iter().any(|t| t.is_running()) {
-                        break;
-                    }
-                    std::thread::sleep(Duration::from_millis(100));
-                }
             }
+            // 先把窗口藏起来，在后台等任务停稳再退出；以前在这里同步等待，窗口会“未响应”。
+            quit_when_idle(tasks.clone());
             slint::CloseRequestResponse::HideWindow
         }
     });
@@ -429,6 +465,23 @@ fn handle(app: &Rc<App>, req: Request) {
         Action::Compress(None) => {
             if !req.paths.is_empty() {
                 open_compress_dialog(app, req.paths);
+            }
+        }
+        Action::Hash(kinds) => {
+            if !req.paths.is_empty() {
+                let name = match req.paths.as_slice() {
+                    [one] => file_name(one),
+                    [first, ..] => format!("{} 等 {} 项", file_name(first), req.paths.len()),
+                    [] => String::new(),
+                };
+                let algos = kinds.iter().map(|k| k.name()).collect::<Vec<_>>().join(" ");
+                app.tasks.add(
+                    format!("校验 {name}（{algos}）"),
+                    Kind::Hash {
+                        paths: req.paths,
+                        kinds,
+                    },
+                );
             }
         }
         Action::RegisterMenu | Action::UnregisterMenu => toggle_menu(w.window()),
@@ -619,4 +672,38 @@ fn ask_password(app: &Rc<App>, id: u64) {
     }
     win::present_owned(&d, &app.window);
     *app.password.borrow_mut() = Some(d);
+}
+
+/// 显示某个校验值任务的结果。
+fn show_hash(app: &Rc<App>, id: u64) {
+    let Some(text) = app.tasks.get(id).and_then(|t| t.report) else {
+        return;
+    };
+    let Ok(d) = HashDialog::new() else { return };
+    d.set_text(text.clone().into());
+    d.on_copy({
+        let d = d.as_weak();
+        move || {
+            let Some(d) = d.upgrade() else { return };
+            let msg = if win::set_clipboard(&text) {
+                "已复制到剪贴板"
+            } else {
+                "复制失败，可以在上面选中文字后按 Ctrl+C"
+            };
+            d.set_copied(msg.into());
+        }
+    });
+    d.on_dismiss({
+        let app = Rc::downgrade(app);
+        let weak = d.as_weak();
+        move || {
+            let (Some(app), Some(d)) = (app.upgrade(), weak.upgrade()) else {
+                return;
+            };
+            let _ = d.hide();
+            app.hashes.borrow_mut().retain(|h| h.window().is_visible());
+        }
+    });
+    win::present_owned(&d, &app.window);
+    app.hashes.borrow_mut().push(d);
 }

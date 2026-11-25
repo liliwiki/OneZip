@@ -39,6 +39,8 @@ fn clsid() -> GUID {
     GUID::try_from(CLSID_TEXT).expect("CLSID")
 }
 
+
+
 /// OneZip.exe 与本 DLL 在同一目录。
 fn exe_path() -> Option<PathBuf> {
     let module = HMODULE(*MODULE.get()? as *mut c_void);
@@ -164,35 +166,7 @@ impl IExplorerCommand_Impl for Sub_Impl {
         let Entry::Command(command) = self.entry else {
             return Ok(());
         };
-        let paths = paths(items.as_ref());
-        if paths.is_empty() {
-            return Ok(());
-        }
-        let Some(exe) = exe_path() else {
-            return Err(E_POINTER.into());
-        };
-        // 资源管理器把前台权限交给了我们；转交出去，OneZip 的窗口才能出现在最前面，
-        // 而不是被压在资源管理器后面。
-        unsafe {
-            let _ = AllowSetForegroundWindow(ASFW_ANY);
-        }
-        let args = command_line(command.args(), &paths);
-        // 首选让资源管理器替我们启动：这样 OneZip.exe 不带稀疏包的应用身份，
-        // 任务栏显示 exe 自己的图标（带包身份时只会显示一块灰色方块）。
-        if args.len() < 30_000 && launch_via_shell(&exe, &args).is_ok() {
-            return Ok(());
-        }
-        std::process::Command::new(exe)
-            .args(command.args())
-            .args(&paths)
-            .spawn()
-            .map_err(|e| {
-                windows_core::Error::new(
-                    HRESULT::from_win32(e.raw_os_error().unwrap_or(0) as u32),
-                    "OneZip.exe",
-                )
-            })?;
-        Ok(())
+        launch(command.args(), &paths(items.as_ref()))
     }
 
     fn GetFlags(&self) -> Result<u32> {
@@ -205,6 +179,38 @@ impl IExplorerCommand_Impl for Sub_Impl {
     fn EnumSubCommands(&self) -> Result<IEnumExplorerCommand> {
         Err(E_NOTIMPL.into())
     }
+}
+
+/// 把选中的路径交给 OneZip.exe。
+fn launch(flags: &[&str], paths: &[String]) -> Result<()> {
+    if paths.is_empty() {
+        return Ok(());
+    }
+    let Some(exe) = exe_path() else {
+        return Err(E_POINTER.into());
+    };
+    // 资源管理器把前台权限交给了我们；转交出去，OneZip 的窗口才能出现在最前面，
+    // 而不是被压在资源管理器后面。
+    unsafe {
+        let _ = AllowSetForegroundWindow(ASFW_ANY);
+    }
+    let args = command_line(flags, paths);
+    // 首选让资源管理器替我们启动：这样 OneZip.exe 不带稀疏包的应用身份，
+    // 任务栏显示 exe 自己的图标（带包身份时只会显示一块灰色方块）。
+    if args.len() < 30_000 && launch_via_shell(&exe, &args).is_ok() {
+        return Ok(());
+    }
+    std::process::Command::new(exe)
+        .args(flags)
+        .args(paths)
+        .spawn()
+        .map_err(|e| {
+            windows_core::Error::new(
+                HRESULT::from_win32(e.raw_os_error().unwrap_or(0) as u32),
+                "OneZip.exe",
+            )
+        })?;
+    Ok(())
 }
 
 /// 拼命令行参数：每个路径加引号（路径里不会有引号）。

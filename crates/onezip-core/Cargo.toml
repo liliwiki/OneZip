@@ -14,10 +14,19 @@ peel-rs.workspace = true
 # 压缩用的编码器。都已经在 hatchzip-core / peel 的依赖树里，这里直接点名用到的功能。
 zip = { version = "9.8", default-features = false, features = ["deflate", "aes-crypto"] }
 sevenz-rust2 = { version = "0.24.2", default-features = false, features = ["compress", "aes256"] }
-lzma-rust2 = { version = "0.24", default-features = false, features = ["std", "encoder", "optimization", "xz"] }
+# sevenz-rust2 内部用的 0.23（换成了 third_party 里加了进度/取消钩子的副本）。
+# 7z 和 tar.xz 都走它，这样多线程压缩时进度真实、能及时取消。
+lzma-mt = { package = "lzma-rust2", version = "=0.23.0", default-features = false, features = ["std", "encoder", "optimization", "xz"] }
 zstd = { version = "0.13", features = ["zstdmt"] }
 flate2 = "1.1"
 tar = "0.4.46"
+
+# 右键菜单 "CRC SHA"：校验值。
+crc32fast = "1.5"
+crc = "3"
+md5 = { package = "md-5", version = "0.11" }
+sha1 = "0.11"
+sha2 = "0.11"
 
 [dev-dependencies]
 tempfile = "3.27.0"

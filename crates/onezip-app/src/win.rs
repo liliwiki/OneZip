@@ -91,6 +91,39 @@ mod imp {
             let _ = AllowSetForegroundWindow(ASFW_ANY);
         }
     }
+
+    /// 把文本放进剪贴板。
+    pub fn set_clipboard(text: &str) -> bool {
+        use windows::Win32::Foundation::{HANDLE, HGLOBAL};
+        use windows::Win32::System::DataExchange::{
+            CloseClipboard, EmptyClipboard, OpenClipboard, SetClipboardData,
+        };
+        use windows::Win32::System::Memory::{GMEM_MOVEABLE, GlobalAlloc, GlobalLock, GlobalUnlock};
+        const CF_UNICODETEXT: u32 = 13;
+
+        let wide: Vec<u16> = text.encode_utf16().chain(std::iter::once(0)).collect();
+        unsafe {
+            if OpenClipboard(None).is_err() {
+                return false;
+            }
+            let ok = (|| -> Option<()> {
+                EmptyClipboard().ok()?;
+                let mem: HGLOBAL = GlobalAlloc(GMEM_MOVEABLE, wide.len() * 2).ok()?;
+                let ptr = GlobalLock(mem) as *mut u16;
+                if ptr.is_null() {
+                    return None;
+                }
+                std::ptr::copy_nonoverlapping(wide.as_ptr(), ptr, wide.len());
+                let _ = GlobalUnlock(mem);
+                // 成功后内存归剪贴板所有，不能再释放。
+                SetClipboardData(CF_UNICODETEXT, Some(HANDLE(mem.0))).ok()?;
+                Some(())
+            })()
+            .is_some();
+            let _ = CloseClipboard();
+            ok
+        }
+    }
 }
 
 #[cfg(not(windows))]
@@ -99,9 +132,12 @@ mod imp {
     pub fn set_owner(_child: &slint::Window, _owner: &slint::Window) {}
     pub fn center_on(_child: &slint::Window, _owner: &slint::Window) {}
     pub fn allow_any_foreground() {}
+    pub fn set_clipboard(_text: &str) -> bool {
+        false
+    }
 }
 
-pub use imp::{allow_any_foreground, bring_to_front, center_on, set_owner};
+pub use imp::{allow_any_foreground, bring_to_front, center_on, set_clipboard, set_owner};
 
 /// 显示并提到最前。窗口可能要等事件循环跑一轮才真正创建，所以稍后再提一次。
 pub fn present<C: ComponentHandle + 'static>(component: &C) {

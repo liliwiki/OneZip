@@ -16,7 +16,11 @@ $isWin11 = [Environment]::OSVersion.Version.Build -ge 22000
 
 # 正在运行的 OneZip 会锁住文件。
 Get-Process OneZip -ErrorAction SilentlyContinue | Where-Object { $_.Path -like "$dest\*" } | Stop-Process -Force
-# 旧的稀疏包也会被 dllhost 占着。
+# 旧的稀疏包会被加载了菜单 DLL 的 dllhost 占着，不先关掉它，卸载旧包会一直卡在
+# "DeploymentInProgress"。
+Get-Process dllhost -ErrorAction SilentlyContinue | Where-Object {
+    try { $_.Modules.FileName -like "*\onezip_shell.dll" } catch { $false }
+} | Stop-Process -Force -ErrorAction SilentlyContinue
 Get-AppxPackage -Name OneZip.ShellExtension | Remove-AppxPackage -ErrorAction SilentlyContinue
 
 New-Item -ItemType Directory -Force $dest | Out-Null

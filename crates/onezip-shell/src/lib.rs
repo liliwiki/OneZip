@@ -8,6 +8,9 @@
 //! 资源管理器才会把它放进第一层菜单。
 
 /// 本扩展的 COM 类 ID，与 AppxManifest.xml 里的一致。
+///
+/// 只注册这一个第一层菜单项：同一个应用注册两项时，Win11 会把它们再套进一层
+/// 没有图标的同名菜单里（OneZip ▸ OneZip ▸ …），反而更深。
 pub const CLSID_TEXT: &str = "3847becd-6a0c-43a7-b898-e1f2c38be845";
 
 /// 会出现"解压"类菜单项的扩展名（小写，不带点）。
@@ -42,7 +45,23 @@ pub enum Command {
     AddTo,
     Add7z,
     AddZip,
+    /// 校验值，参数是 [`HASH_ITEMS`] 里的序号。
+    ///
+    /// Win11 新式右键菜单不显示应用菜单里的第三层（实测：资源管理器会取走各项，
+    /// 但弹出的是空框），所以像 NanaZip 一样平铺在 OneZip 子菜单里。
+    Hash(usize),
 }
+
+/// 校验值各项：（菜单文字，传给 `--hash` 的参数）。
+pub const HASH_ITEMS: &[(&str, [&str; 2])] = &[
+    ("CRC-32", ["--hash", "crc32"]),
+    ("CRC-64", ["--hash", "crc64"]),
+    ("MD5", ["--hash", "md5"]),
+    ("SHA-1", ["--hash", "sha1"]),
+    ("SHA-256", ["--hash", "sha256"]),
+    ("SHA-512", ["--hash", "sha512"]),
+    ("校验值（全部算法）", ["--hash", "*"]),
+];
 
 pub const MENU: &[Entry] = &[
     Entry::Command(Command::SmartExtract),
@@ -56,6 +75,14 @@ pub const MENU: &[Entry] = &[
     Entry::Command(Command::AddTo),
     Entry::Command(Command::Add7z),
     Entry::Command(Command::AddZip),
+    Entry::Separator(Show::Always),
+    Entry::Command(Command::Hash(0)),
+    Entry::Command(Command::Hash(1)),
+    Entry::Command(Command::Hash(2)),
+    Entry::Command(Command::Hash(3)),
+    Entry::Command(Command::Hash(4)),
+    Entry::Command(Command::Hash(5)),
+    Entry::Command(Command::Hash(6)),
 ];
 
 impl Entry {
@@ -70,7 +97,7 @@ impl Entry {
 impl Command {
     pub fn show(self) -> Show {
         match self {
-            Command::AddTo | Command::Add7z | Command::AddZip => Show::Always,
+            Command::AddTo | Command::Add7z | Command::AddZip | Command::Hash(_) => Show::Always,
             _ => Show::Archives,
         }
     }
@@ -87,6 +114,7 @@ impl Command {
             Command::AddTo => &["--compress"],
             Command::Add7z => &["--compress-7z"],
             Command::AddZip => &["--compress-zip"],
+            Command::Hash(i) => &HASH_ITEMS[i].1,
         }
     }
 
@@ -105,6 +133,7 @@ impl Command {
             Command::AddTo => "添加到压缩包…".into(),
             Command::Add7z => format!("添加到 \"{}.7z\"", compress_stem(paths, is_dir)),
             Command::AddZip => format!("添加到 \"{}.zip\"", compress_stem(paths, is_dir)),
+            Command::Hash(i) => HASH_ITEMS[i].0.into(),
         }
     }
 }

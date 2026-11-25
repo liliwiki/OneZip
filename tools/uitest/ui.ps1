@@ -8,9 +8,19 @@ Add-Type @"
 using System; using System.Runtime.InteropServices;
 public static class U {
   [DllImport("user32.dll")] public static extern bool SetCursorPos(int x,int y);
+  [StructLayout(LayoutKind.Sequential)] public struct PT { public int X; public int Y; }
+  [DllImport("user32.dll")] public static extern IntPtr WindowFromPoint(PT p);
+  [DllImport("user32.dll")] public static extern IntPtr GetAncestor(IntPtr h, uint f);
+  [DllImport("user32.dll", EntryPoint="GetWindowThreadProcessId")] public static extern uint PidOf(IntPtr h, out int p);
+  public static string ProcAt(int x, int y) {
+    var pt = new PT(); pt.X = x; pt.Y = y;
+    int pid; PidOf(GetAncestor(WindowFromPoint(pt), 2), out pid);
+    try { return System.Diagnostics.Process.GetProcessById(pid).ProcessName; } catch { return ""; }
+  }
   [DllImport("user32.dll")] public static extern void mouse_event(uint f,int x,int y,uint d,UIntPtr e);
   [DllImport("user32.dll")] public static extern bool SetProcessDPIAware();
   [DllImport("user32.dll")] public static extern IntPtr GetForegroundWindow();
+  [DllImport("user32.dll")] public static extern uint GetWindowThreadProcessId(IntPtr h, out int p);
   [DllImport("user32.dll")] public static extern bool SetForegroundWindow(IntPtr h);
   [DllImport("user32.dll")] public static extern bool ShowWindow(IntPtr h, int n);
   [DllImport("user32.dll")] public static extern bool IsHungAppWindow(IntPtr h);
@@ -41,7 +51,7 @@ switch ($Do) {
     $e = Find $scope $Name
     if (-not $e) { "'$Name' not found"; exit 3 }
     $r = $e.Current.BoundingRectangle
-    [U]::SetCursorPos([int]($r.X + $r.Width/2), [int]($r.Y + $r.Height/2)) | Out-Null
+    if ([U]::ProcAt([int]($r.X + $r.Width/2), [int]($r.Y + $r.Height/2)) -eq 'Cage') { "refuse click: Cage is under the target"; exit 7 }; [U]::SetCursorPos([int]($r.X + $r.Width/2), [int]($r.Y + $r.Height/2)) | Out-Null
     Start-Sleep -Milliseconds 200
     [U]::mouse_event(2,0,0,0,[UIntPtr]::Zero); [U]::mouse_event(4,0,0,0,[UIntPtr]::Zero)
     "clicked '$Name' at $r"
@@ -79,12 +89,16 @@ switch ($Do) {
     $e = $all[[int]$Name]
     if (-not $e) { "no $Type #$Name (found $($all.Count))"; exit 3 }
     $r = $e.Current.BoundingRectangle
-    [U]::SetCursorPos([int]($r.X + $r.Width/2), [int]($r.Y + $r.Height/2)) | Out-Null
+    if ([U]::ProcAt([int]($r.X + $r.Width/2), [int]($r.Y + $r.Height/2)) -eq 'Cage') { "refuse click: Cage is under the target"; exit 7 }; [U]::SetCursorPos([int]($r.X + $r.Width/2), [int]($r.Y + $r.Height/2)) | Out-Null
     Start-Sleep -Milliseconds 200
     [U]::mouse_event(2,0,0,0,[UIntPtr]::Zero); [U]::mouse_event(4,0,0,0,[UIntPtr]::Zero)
     "clicked $Type #$Name at $r"
   }
   'type' {
+    # 最前面是 Claude 应用（Cage）时不按：在那里按 Esc 会停掉当前会话。
+    $procId = 0; [void][U]::GetWindowThreadProcessId([U]::GetForegroundWindow(), [ref]$procId)
+    $fp = try { (Get-Process -Id $procId).ProcessName } catch { '' }
+    if ($fp -eq 'Cage') { "skip typing (Cage is foreground)"; exit 4 }
     [System.Windows.Forms.SendKeys]::SendWait($Text); "typed"
   }
   'setvalue' {
@@ -115,7 +129,7 @@ switch ($Do) {
   'wheel' {
     # 在窗口中部向下滚动
     $r = $scope.Current.BoundingRectangle
-    [U]::SetCursorPos([int]($r.X + $r.Width/2), [int]($r.Y + $r.Height*0.7)) | Out-Null
+    if ([U]::ProcAt([int]($r.X + $r.Width/2), [int]($r.Y + $r.Height*0.7)) -eq 'Cage') { "refuse click: Cage is under the target"; exit 7 }; [U]::SetCursorPos([int]($r.X + $r.Width/2), [int]($r.Y + $r.Height*0.7)) | Out-Null
     Start-Sleep -Milliseconds 200
     1..10 | % { [U]::mouse_event(0x800,0,0,[uint32]4294967176,[UIntPtr]::Zero); Start-Sleep -Milliseconds 50 }
     "wheel"

@@ -9,7 +9,9 @@ use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::Duration;
 
-use onezip_core::{CompressRequest, Event, ExtractRequest, Observer, Outcome, Source, human};
+use onezip_core::{
+    CompressRequest, Event, ExtractRequest, HashKind, Observer, Outcome, Source, human,
+};
 
 const MAX_RUNNING: usize = 2;
 
@@ -20,6 +22,11 @@ pub enum Kind {
     Test {
         path: PathBuf,
         password: Option<String>,
+    },
+    /// 计算校验值（右键菜单 "CRC SHA"）。
+    Hash {
+        paths: Vec<PathBuf>,
+        kinds: Vec<HashKind>,
     },
 }
 
@@ -48,6 +55,8 @@ pub struct Task {
     pub remote: Option<(u64, u64)>,
     pub note: String,
     pub output: Option<PathBuf>,
+    /// 校验值任务的结果文本。
+    pub report: Option<String>,
     stop: Arc<AtomicBool>,
 }
 
@@ -145,6 +154,11 @@ impl Task {
             },
             Kind::Test { path, .. } => file_name(path),
             Kind::Compress(r) => file_name(&r.output),
+            Kind::Hash { paths, .. } => match paths.as_slice() {
+                [one] => file_name(one),
+                [first, ..] => format!("{} 等 {} 项", file_name(first), paths.len()),
+                [] => String::new(),
+            },
         }
     }
 }
@@ -159,6 +173,8 @@ pub fn file_name(p: &std::path::Path) -> String {
 pub struct Manager {
     tasks: Mutex<Vec<Task>>,
     next: Mutex<u64>,
+    /// 正在退出：不再启动排队中的任务。
+    closing: AtomicBool,
 }
 
 impl Manager {
@@ -190,6 +206,7 @@ impl Manager {
             remote: None,
             note: String::new(),
             output: None,
+            report: None,
             stop: Arc::new(AtomicBool::new(false)),
         });
         id
@@ -256,7 +273,7 @@ impl Manager {
             match &mut t.kind {
                 Kind::Extract(r) => r.password = Some(password),
                 Kind::Test { password: p, .. } => *p = Some(password),
-                Kind::Compress(_) => return,
+                Kind::Compress(_) | Kind::Hash { .. } => return,
             }
             t.stop = Arc::new(AtomicBool::new(false));
             t.status = Status::Queued;
@@ -272,8 +289,9 @@ impl Manager {
             .any(|t| matches!(t.status, Status::Running | Status::Queued))
     }
 
-    /// 让所有在跑的解压停在安全点（退出前调用）。
+    /// 退出前调用：在跑的解压停在安全点、压缩取消，排队中的不再启动。
     pub fn pause_all(&self) {
+        self.closing.store(true, Ordering::SeqCst);
         for t in self.tasks.lock().unwrap().iter_mut() {
             if t.is_running() {
                 t.stop.store(true, Ordering::SeqCst);
@@ -282,6 +300,9 @@ impl Manager {
     }
 
     fn schedule(self: &Arc<Self>) {
+        if self.closing.load(Ordering::SeqCst) {
+            return;
+        }
         let mut tasks = self.tasks.lock().unwrap();
         let running = tasks.iter().filter(|t| t.is_running()).count();
         for t in tasks
@@ -347,6 +368,16 @@ impl Manager {
                     (Status::Done, None)
                 })
             }
+            Kind::Hash { paths, kinds } => {
+                onezip_core::hash(paths, kinds, observer, &stop).map(|report| {
+                    let text = report.to_text();
+                    self.with(id, |t| {
+                        t.note = format!("{} 个文件，点“查看”看结果", report.files.len());
+                        t.report = Some(text);
+                    });
+                    (Status::Done, None)
+                })
+            }
         };
         self.with(id, |t| match result {
             Ok((status, output)) => {
@@ -365,7 +396,7 @@ impl Manager {
                 let had = match &t.kind {
                     Kind::Extract(r) => r.password.is_some(),
                     Kind::Test { password, .. } => password.is_some(),
-                    Kind::Compress(_) => false,
+                    Kind::Compress(_) | Kind::Hash { .. } => false,
                 };
                 t.status = Status::NeedsPassword { retry: had };
             }

@@ -9,6 +9,7 @@
 //! 前端只和这里的类型打交道，不直接接触上游类型，以后换引擎或加格式不影响前端。
 
 pub mod compress;
+pub mod hash;
 mod local;
 mod remote;
 mod source;
@@ -20,6 +21,7 @@ use std::sync::atomic::AtomicBool;
 use anyhow::Result;
 
 pub use compress::{Cancelled, CompressRequest, Format, compress};
+pub use hash::{HashKind, HashReport, hash};
 pub use local::{Entry, list, test};
 pub use source::Source;
 
