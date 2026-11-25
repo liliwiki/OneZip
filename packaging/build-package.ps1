@@ -31,9 +31,12 @@ $build = [int][math]::Floor(((Get-Date) - [datetime]'2026-01-01').TotalHours) % 
 $pkgVersion = "$Version.$build"
 
 # ---- 编译 ----
-$env:RUSTUP_HOME = 'D:\Tools\Rust\rustup'
-$env:CARGO_HOME = 'D:\Tools\Rust\cargo'
-$env:Path = "D:\Tools\Rust\cargo\bin;$env:Path"
+# 本机把 Rust 装在 D:\Tools\Rust；在 GitHub Actions 等别的环境里用 PATH 上已有的 cargo。
+if (Test-Path 'D:\Tools\Rust\cargo\bin\cargo.exe') {
+    $env:RUSTUP_HOME = 'D:\Tools\Rust\rustup'
+    $env:CARGO_HOME = 'D:\Tools\Rust\cargo'
+    $env:Path = "D:\Tools\Rust\cargo\bin;$env:Path"
+}
 & cargo build --release -p onezip-app -p onezip-cli -p onezip-shell
 if ($LASTEXITCODE -ne 0) { throw "编译失败" }
 
@@ -55,7 +58,7 @@ if (Test-Path $dist) { Remove-Item $dist -Recurse -Force }
 New-Item -ItemType Directory -Force $dist | Out-Null
 $rel = Join-Path $root 'target\release'
 Copy-Item "$rel\OneZip.exe", "$rel\onezipc.exe", "$rel\onezip_shell.dll" $dist
-Copy-Item LICENSE-MIT, LICENSE-APACHE, NOTICE, README.md $dist
+Copy-Item LICENSE, THIRD_PARTY_NOTICES.md, README.md, README.zh-CN.md $dist
 Copy-Item "$PSScriptRoot\install.ps1", "$PSScriptRoot\uninstall.ps1" $dist
 
 # ---- 稀疏包 ----

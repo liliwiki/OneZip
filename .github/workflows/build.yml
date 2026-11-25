@@ -1,0 +1,81 @@
+# 在 GitHub 上编译、检查、测试、打包。
+# 推送到 main 或提 PR 时只检查能不能打包；推送 v* 标签时把安装包和 SHA-256 发布到 Release。
+# 已经发布过的 Release 不会被覆盖。
+name: Build
+
+on:
+  workflow_dispatch:
+  pull_request:
+  push:
+    branches: ["main"]
+    tags: ["v*"]
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust
+        run: |
+          rustup toolchain install stable --profile minimal --component clippy
+          rustup default stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Read version
+        id: app
+        shell: powershell
+        run: |
+          $v = (Select-String -Path Cargo.toml -Pattern '^version = "(.+)"').Matches[0].Groups[1].Value
+          "version=$v" >> $env:GITHUB_OUTPUT
+
+      - name: Check the tag matches the version
+        if: startsWith(github.ref, 'refs/tags/v')
+        shell: powershell
+        run: |
+          if ("${{ github.ref_name }}" -ne "v${{ steps.app.outputs.version }}") {
+            throw "Tag ${{ github.ref_name }} does not match version ${{ steps.app.outputs.version }} in Cargo.toml"
+          }
+
+      - name: Clippy
+        run: cargo clippy --workspace --all-targets -- -D warnings
+
+      - name: Test
+        run: cargo test --workspace
+
+      - name: Package
+        shell: powershell
+        run: .\packaging\build-package.ps1
+
+      - name: Checksums
+        shell: powershell
+        run: |
+          Get-ChildItem target\dist\*.zip | Get-FileHash -Algorithm SHA256 |
+            ForEach-Object { "$($_.Hash.ToLower())  $(Split-Path $_.Path -Leaf)" } |
+            Set-Content -Encoding ascii target\dist\SHA256SUMS.txt
+          Get-Content target\dist\SHA256SUMS.txt
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: OneZip-${{ steps.app.outputs.version }}-x64
+          path: |
+            target/dist/*.zip
+            target/dist/SHA256SUMS.txt
+
+      - name: Publish release
+        if: startsWith(github.ref, 'refs/tags/v')
+        shell: powershell
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release view "${{ github.ref_name }}" *> $null
+          if ($LASTEXITCODE -eq 0) {
+            Write-Host "Release ${{ github.ref_name }} already exists; its files are left unchanged."
+            exit 0
+          }
+          $notes = "See [CHANGELOG.md](https://github.com/${{ github.repository }}/blob/${{ github.ref_name }}/CHANGELOG.md).`n`nSHA-256:`n``````text`n$(Get-Content target\dist\SHA256SUMS.txt -Raw)``````"
+          gh release create "${{ github.ref_name }}" (Get-ChildItem target\dist\*.zip).FullName target\dist\SHA256SUMS.txt --title "OneZip ${{ steps.app.outputs.version }}" --notes $notes
