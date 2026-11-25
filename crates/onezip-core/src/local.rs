@@ -31,6 +31,10 @@ pub struct Entry {
 
 /// 列出压缩包内容，不做任何改动。
 pub fn list(archive: &Path, password: Option<String>) -> Result<Vec<Entry>> {
+    #[cfg(windows)]
+    if crate::sevenzip::handles(archive) {
+        return crate::sevenzip::list(archive, password);
+    }
     let job = match open(archive, None, false, password)?.0 {
         State::Fresh(job, _) | State::Resume(job, _) => job,
         State::Orphan(_) => bail!("这个压缩包里已经没有剩余内容"),
@@ -51,6 +55,10 @@ pub fn list(archive: &Path, password: Option<String>) -> Result<Vec<Entry>> {
 
 /// 完整校验压缩包（解码一遍、核对校验和），不写出任何文件。
 pub fn test(archive: &Path, password: Option<String>, observer: Observer) -> Result<()> {
+    #[cfg(windows)]
+    if crate::sevenzip::handles(archive) {
+        return crate::sevenzip::test(archive, password, observer);
+    }
     let job = match open(archive, None, false, password)?.0 {
         State::Fresh(job, _) => job,
         _ => bail!("这个压缩包正解到一半，不能测试；继续解压即可完成"),
@@ -95,6 +103,10 @@ pub(crate) fn extract(
 ) -> Result<Outcome> {
     if crate::remote::handles_local(archive) {
         return crate::remote::extract_file(archive, req, observer, stop, confirm);
+    }
+    #[cfg(windows)]
+    if crate::sevenzip::handles(archive) {
+        return crate::sevenzip::extract(archive, req, observer, stop, confirm);
     }
     let (outcome, nested) = extract_one(archive, req, observer.clone(), stop, confirm)?;
     let Outcome::Finished { output, warning } = outcome else {

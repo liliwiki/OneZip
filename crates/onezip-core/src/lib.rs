@@ -11,6 +11,8 @@
 pub mod compress;
 pub mod hash;
 mod local;
+#[cfg(windows)]
+mod sevenzip;
 mod remote;
 mod source;
 
@@ -23,13 +25,34 @@ use anyhow::Result;
 pub use compress::{Cancelled, CompressRequest, Format, compress};
 pub use hash::{HashKind, HashReport, hash};
 pub use local::{Entry, list, test};
+
+/// 能边解压边删除原压缩包的格式（按扩展名）。前端据此决定是否显示"解压后删除压缩包"。
+pub fn can_extract_in_place(path: &Path) -> bool {
+    #[cfg(windows)]
+    if sevenzip::handles(path) {
+        return sevenzip::IN_PLACE_EXTENSIONS.contains(
+            &path.extension().map(|e| e.to_string_lossy().to_ascii_lowercase()).unwrap_or_default().as_str(),
+        );
+    }
+    true
+}
 pub use source::Source;
 
 /// 这个错误是不是"需要密码 / 密码不对"：前端据此弹出密码框，而不是报失败。
 pub fn needs_password(e: &anyhow::Error) -> bool {
     use hatchzip_core::archive::{PasswordNeeded, WrongPassword};
-    e.chain()
-        .any(|c| c.is::<PasswordNeeded>() || c.is::<WrongPassword>())
+    e.chain().any(|c| {
+        c.is::<PasswordNeeded>() || c.is::<WrongPassword>() || {
+            #[cfg(windows)]
+            {
+                c.is::<sevenzip::NeedPassword>() || c.is::<sevenzip::BadPassword>()
+            }
+            #[cfg(not(windows))]
+            {
+                false
+            }
+        }
+    })
 }
 
 /// 字节数的可读形式，如 `1.5 GB`。

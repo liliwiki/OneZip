@@ -26,7 +26,8 @@ pub(crate) fn handles_local(path: &Path) -> bool {
         .file_name()
         .map(|n| n.to_string_lossy().to_ascii_lowercase())
         .unwrap_or_default();
-    [".zst", ".tzst", ".lz4", ".rar"]
+    // RAR 交给 HatchZip（开了 rar 特性）：它支持密码、加密文件名和分卷，Peel 不支持。
+    [".zst", ".tzst", ".lz4"]
         .iter()
         .any(|ext| name.ends_with(ext))
 }

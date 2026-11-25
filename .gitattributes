@@ -20,6 +20,13 @@ Cargo.lock text eol=lf
 *.dll binary
 *.7z binary
 *.zip binary
+*.rar binary
+*.r[0-9][0-9] binary
 *.xz binary
 *.lz binary
 *.lzma binary
+*.iso binary
+*.cab binary
+*.wim binary
+*.arj binary
+*.lzh binary

@@ -16,10 +16,10 @@ onezip-core = { path = "crates/onezip-core" }
 anyhow = "1.0.100"
 
 # 本地"边解压边释放"：HatchZip 的引擎（MIT OR Apache-2.0）。
-# 默认不开 `rar` 特性：它会编译 UnRAR 的 C++ 源码（另有许可，见 LICENSE-UNRAR），
-# 等 MSVC 就绪、发布构建时再打开。
+# 打开 `rar` 特性：RAR4/RAR5、分卷、密码、加密文件名都由它处理。它会编译 UnRAR 的
+# C++ 源码（UnRAR 许可，见 third_party/hatchzip-core/LICENSE-UNRAR），需要 MSVC。
 # 用的是 third_party/hatchzip-core 里改过的副本（见文件末尾的 [patch.crates-io]）。
-hatchzip-core = { version = "=0.1.10" }
+hatchzip-core = { version = "=0.1.10", features = ["rar"] }
 
 # 边下载边解压：Peel 的引擎（MIT OR Apache-2.0）。尚未发布到 crates.io，
 # 固定到 agouin/peel 的 v0.8.0 提交。
