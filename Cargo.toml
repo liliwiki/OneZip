@@ -1,6 +1,6 @@
 [workspace]
 resolver = "3"
-members = ["crates/onezip-core", "crates/onezip-cli", "crates/onezip-app", "crates/onezip-shell"]
+members = ["crates/onezip-core", "crates/onezip-cli", "crates/onezip-app", "crates/onezip-shell", "crates/onezip-setup"]
 # 拷进来改过的上游代码，不当作工作区成员（不跑它们的测试、不套用本项目的 lint）。
 exclude = ["third_party"]
 

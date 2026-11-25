@@ -1,5 +1,6 @@
 ﻿<#
-  安装 OneZip（只对当前用户，不改系统目录）。在解压出的发布目录里运行：
+  安装 OneZip（只对当前用户，不改系统目录）。由 OneZip-<版本>-Setup.exe 解到临时目录后调用，
+  也可以在发布目录里手动运行：
     powershell -ExecutionPolicy Bypass -File install.ps1
 
   - 程序复制到 %LOCALAPPDATA%\Programs\OneZip

@@ -1,13 +1,16 @@
 ﻿<#
   构建 OneZip 发布包（在开发机上运行）。
 
-  产出 target\dist\OneZip-<版本>-x64\ 和同名 .zip，里面有：
+  产出 target\dist\OneZip-<版本>-Setup.exe（发布用的安装程序）。它是 onezip-setup.exe
+  后面接上发布目录 target\dist\OneZip-<版本>-x64\ 打成的 zip，目录里有：
     OneZip.exe              主程序（窗口 + 右键菜单的执行者）
     onezipc.exe             命令行
     onezip_shell.dll        Windows 11 第一层右键菜单
+    7z.dll                  7-Zip 的解码库：iso、wim、cab、dmg、vhd、msi、arj、lzh 等格式
     OneZip-Shell.msix       稀疏包（只含清单和图标，给 DLL 一个应用身份），已签名
     OneZip-Dev.cer          签名证书的公钥，安装时导入"受信任的人"
     install.ps1 / uninstall.ps1
+    许可证：LICENSE、THIRD_PARTY_NOTICES.md、7-Zip-License.txt、UnRAR-License.txt
 
   签名用的是自签名证书（CN=OneZip Dev），首次运行时在当前用户的证书库里创建。
   正式发布时换成受信任 CA 签发的代码签名证书，用 -CertThumbprint 指定即可，
@@ -37,7 +40,7 @@ if (Test-Path 'D:\Tools\Rust\cargo\bin\cargo.exe') {
     $env:CARGO_HOME = 'D:\Tools\Rust\cargo'
     $env:Path = "D:\Tools\Rust\cargo\bin;$env:Path"
 }
-& cargo build --release -p onezip-app -p onezip-cli -p onezip-shell
+& cargo build --release -p onezip-app -p onezip-cli -p onezip-shell -p onezip-setup
 if ($LASTEXITCODE -ne 0) { throw "编译失败" }
 
 # ---- 找 Windows SDK 工具 ----
@@ -58,7 +61,10 @@ if (Test-Path $dist) { Remove-Item $dist -Recurse -Force }
 New-Item -ItemType Directory -Force $dist | Out-Null
 $rel = Join-Path $root 'target\release'
 Copy-Item "$rel\OneZip.exe", "$rel\onezipc.exe", "$rel\onezip_shell.dll" $dist
+Copy-Item third_party\7zip\7z.dll $dist
 Copy-Item LICENSE, THIRD_PARTY_NOTICES.md, README.md, README.zh-CN.md $dist
+Copy-Item third_party\7zip\License.txt (Join-Path $dist '7-Zip-License.txt')
+Copy-Item third_party\hatchzip-core\LICENSE-UNRAR (Join-Path $dist 'UnRAR-License.txt')
 Copy-Item "$PSScriptRoot\install.ps1", "$PSScriptRoot\uninstall.ps1" $dist
 
 # ---- 稀疏包 ----
@@ -103,8 +109,23 @@ if (-not $CertThumbprint) {
 & $signtool sign /fd SHA256 /sha1 $CertThumbprint /s My $msix | Out-Host
 if ($LASTEXITCODE -ne 0) { throw "签名失败" }
 
-# ---- 打成 zip ----
-$zip = Join-Path $root "target\dist\$name.zip"
-if (Test-Path $zip) { Remove-Item $zip -Force }
-Compress-Archive -Path "$dist\*" -DestinationPath $zip
-Write-Host "完成：$zip"
+# ---- 安装程序：onezip-setup.exe + 发布目录的 zip + 尾标（zip 长度 u64 小端 + "OZSETUP1"） ----
+$payload = Join-Path $root "target\dist\$name.zip"
+if (Test-Path $payload) { Remove-Item $payload -Force }
+Compress-Archive -Path "$dist\*" -DestinationPath $payload
+$setup = Join-Path $root "target\dist\OneZip-$Version-Setup.exe"
+$zipBytes = [IO.File]::ReadAllBytes($payload)
+$out = [IO.File]::Create($setup)
+try {
+    $stub = [IO.File]::ReadAllBytes("$rel\onezip-setup.exe")
+    $out.Write($stub, 0, $stub.Length)
+    $out.Write($zipBytes, 0, $zipBytes.Length)
+    $len = [BitConverter]::GetBytes([uint64]$zipBytes.Length)
+    $out.Write($len, 0, 8)
+    $magic = [Text.Encoding]::ASCII.GetBytes('OZSETUP1')
+    $out.Write($magic, 0, 8)
+} finally {
+    $out.Close()
+}
+Remove-Item $payload -Force
+Write-Host "完成：$setup"

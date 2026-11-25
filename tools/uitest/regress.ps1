@@ -169,5 +169,36 @@ $secs = ((Get-Date) - $t0).TotalSeconds
 $left = @(Get-ChildItem $Dir -Filter '大块.7z*')
 Check '压缩中关进度窗口：几秒内退出，不留临时文件' ($exited -and $left.Count -eq 0) ("{0:n1}s, 残留 {1}" -f $secs, ($left.Name -join ','))
 
+# ---- 7z.dll 的格式、加密 RAR ----
+$fx = Join-Path (Split-Path (Split-Path $here)) 'crates\onezip-core\tests\fixtures'
+Copy-Item "$fx\sevenzip\iso\joliet.iso" "$Dir\光盘.iso"
+Copy-Item "$fx\sevenzip\iso\udf.iso" "$Dir\光盘删.iso"
+Copy-Item "$fx\sevenzip\cab\lzx.cab" "$Dir\驱动.cab"
+# 磁盘镜像不能边解边删：随便拿个文件改成 .vhd，只看菜单
+Copy-Item "$fx\sevenzip\iso\joliet.iso" "$Dir\磁盘.vhd"
+Copy-Item "$fx\rar\rar5-hp\set.rar" "$Dir\加密名.rar"
+$m = & powershell -NoProfile -ExecutionPolicy Bypass -File "$here\menu.ps1" -Folder $Dir -Items '光盘.iso'
+Check 'iso 菜单有“解压后删除压缩包”' (($m -match '智能解压') -and ($m -match '解压后删除压缩包'))
+$m = & powershell -NoProfile -ExecutionPolicy Bypass -File "$here\menu.ps1" -Folder $Dir -Items '磁盘.vhd'
+Check 'vhd 菜单能解压、没有“解压后删除压缩包”' (($m -match '智能解压') -and -not ($m -match '解压后删除压缩包'))
+
+MN -Folder $Dir -Items '光盘.iso' -Command '智能解压'
+Check 'iso 智能解压' ((WaitFor { (Test-Path "$Dir\光盘\docs\readme.txt") -and (Get-Item "$Dir\光盘\big file.bin" -EA SilentlyContinue).Length -eq 400000 }) -and (Test-Path "$Dir\光盘.iso"))
+MN -Folder $Dir -Items '驱动.cab' -Command '智能解压'
+Check 'cab 智能解压' (WaitFor { (Test-Path "$Dir\驱动\docs\readme.txt") -and (Get-Item "$Dir\驱动\sub\deep\data.bin" -EA SilentlyContinue).Length -eq 100000 })
+WaitFor { -not (Get-Process OneZip -EA SilentlyContinue) } 20 | Out-Null
+MN -Folder $Dir -Items '光盘删.iso' -Command '解压后删除压缩包*'
+Check 'iso 边解边删（UDF）' (WaitFor { (Test-Path "$Dir\光盘删\docs\readme.txt") -and -not (Test-Path "$Dir\光盘删.iso") -and -not (Test-Path "$Dir\光盘删.iso.onezip-progress") } 30)
+WaitFor { -not (Get-Process OneZip -EA SilentlyContinue) } 20 | Out-Null
+
+MN -Folder $Dir -Items '加密名.rar' -Command '智能解压'
+$pw = WaitFor { (UI -Do windows | Select-String 'foreground: 需要密码') } 15
+UI -Do clicktype -Window '需要密码' -Type Edit -Name 0 | Out-Null; Start-Sleep 1
+# 字母会被中文输入法拦下来，用剪贴板粘贴
+Set-Clipboard 'secret'; UI -Do type -Text '^v' | Out-Null; Start-Sleep 1
+UI -Do click -Window '需要密码' -Name '确定' | Out-Null
+Check 'RAR5 加密文件名：弹密码框，输对后解出' ($pw -and (WaitFor { (Get-Content "$Dir\game\config\settings.ini" -Raw -EA SilentlyContinue) -eq ("volume=7`n" * 2000) }))
+WaitFor { -not (Get-Process OneZip -EA SilentlyContinue) } 20 | Out-Null
+
 $results | Format-Table -AutoSize | Out-String -Width 200
 "通过 {0} / {1}" -f @($results | ? 结果 -eq '通过').Count, $results.Count
