@@ -15,6 +15,16 @@ The root MIT License applies only to original OneZip source and documentation cr
 
 OneZip enables HatchZip's `rar` feature, which compiles the UnRAR source code by Alexander Roshal into OneZip.exe and onezipc.exe. UnRAR has its own license: `third_party/hatchzip-core/LICENSE-UNRAR`, shipped as `UnRAR-License.txt`. In short, the UnRAR code may be used freely to extract RAR archives, but it may not be used to re-create the RAR compression algorithm.
 
+### Peel
+
+- Project: Peel (peel-rs) — https://github.com/agouin/peel
+- Version: 0.8.0, Git revision `77d2e34b6138cc6279a5e0d1a64271b07faa0219`, modified
+- Location: `third_party/peel/`
+- Copyright: (c) 2026 Andrew Gouin
+- License: MIT OR Apache-2.0 — `third_party/peel/LICENSE-MIT`, `third_party/peel/LICENSE-APACHE`
+- Its RAR5 decoder references libarchive (BSD 2-Clause); see `third_party/peel/NOTICE`.
+- Changes: WinZip AE-2 zip entries skip the CRC check (their CRC is zero by spec; the HMAC is checked), and 7z archives with encrypted file names decrypt their header with the password. See `third_party/peel/ONEZIP-CHANGES.md`.
+
 ### lzma-rust2 0.23
 
 - Project: lzma-rust2 — https://github.com/hasenbanck/lzma-rust2
@@ -36,14 +46,6 @@ OneZip enables HatchZip's `rar` feature, which compiles the UnRAR source code by
 - Use: listing, testing and extracting ISO, UDF, WIM/ESD, CAB, DMG, VHD/VHDX, VMDK, VDI, QCOW2, MSI, ARJ, LZH, CHM, CPIO, RPM, DEB, XAR, SquashFS, CramFS, HFS, APFS, Z and LZMA archives.
 
 ## Libraries linked into OneZip
-
-### Peel
-
-- Project: Peel (peel-rs) — https://github.com/agouin/peel
-- Version: 0.8.0, Git revision `77d2e34b6138cc6279a5e0d1a64271b07faa0219`
-- Copyright: (c) 2026 Andrew Gouin
-- License: MIT OR Apache-2.0
-- Its RAR5 decoder references libarchive (BSD 2-Clause); see Peel's NOTICE.
 
 ### Slint
 

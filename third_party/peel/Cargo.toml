@@ -1,0 +1,325 @@
+[package]
+name = "peel-rs"
+version = "0.8.0"
+edition = "2021"
+# MSRV. Declared floor for distros / downstream consumers building
+# against an older rustc. Deliberately lower than `rust-toolchain.toml`
+# (the dev/CI pin); rationale in `internal/PLAN_packaging.md` §0.6.
+# CI enforces this via the `msrv` job in `.github/workflows/ci.yml`.
+rust-version = "1.85"
+description = "Streaming, resumable, space-efficient extractor for compressed archives downloaded over HTTP."
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/agouin/peel"
+homepage = "https://github.com/agouin/peel"
+readme = "README.md"
+keywords = ["download", "extract", "archive", "streaming", "tar"]
+categories = ["command-line-utilities", "compression", "network-programming"]
+
+# `cargo deb` metadata. `release.yml` runs `cargo deb --no-build
+# --no-strip --target <triple>` after each Linux matrix build, then
+# uploads the resulting `.deb` as a release asset. See
+# `internal/PLAN_packaging.md` §2.4. This is the
+# "drop-in-on-any-Debian-family-distro" path; the (future) official
+# Debian archive package is a separate effort (§2.3 / §3) and will
+# build against the archive's `rustc` and `libzstd1`.
+#
+# `name = "peel"` because the crate is `peel-rs` but the binary,
+# man page, and Debian package name are all `peel` — see
+# `internal/PLAN_packaging.md` §0.1 for why the split exists.
+[package.metadata.deb]
+name = "peel"
+maintainer = "Andrew Gouin <andrew@gouin.io>"
+copyright = "2025-2026 Andrew Gouin <andrew@gouin.io>"
+license-file = ["LICENSE-MIT", "4"]
+section = "utils"
+priority = "optional"
+# `$auto` runs `dpkg-shlibdeps` against the built binary and lists
+# the shared libraries it actually pulls in. With default features
+# (vendored libzstd, statically-linked ring / rustls), this resolves
+# to libc6 and a small handful of standard system libs. The
+# `system-libs` route — used by the future official Debian archive
+# package — would also pick up libzstd1 here.
+depends = "$auto"
+extended-description = """\
+peel downloads compressed archives over HTTP and streams them through
+decompression in a single pass, hole-punching the compressed bytes from
+disk as the decoder advances. A SIGKILL mid-extraction resumes exactly
+where it left off, byte-identical to a clean run.
+
+Supports tar / tar.zst / tar.xz / tar.lz4 / tar.gz / tar.bz2 / zip /
+7z / rar (rar5 + rar3/rar4), plus the raw single-stream forms of those
+codecs."""
+# `assets` lists everything beyond the binary itself (which cargo-deb
+# auto-discovers from `[[bin]]`). Paths are relative to the source
+# tree; the binary's target-specific path is resolved by cargo-deb
+# from the build's actual `--target` triple.
+assets = [
+    ["target/release/peel", "/usr/bin/", "755"],
+    ["target/man/peel.1", "/usr/share/man/man1/peel.1", "644"],
+    ["LICENSE-MIT", "/usr/share/doc/peel/LICENSE-MIT", "644"],
+    ["LICENSE-APACHE", "/usr/share/doc/peel/LICENSE-APACHE", "644"],
+    ["NOTICE", "/usr/share/doc/peel/NOTICE", "644"],
+    ["README.md", "/usr/share/doc/peel/README.md", "644"],
+]
+
+[lib]
+name = "peel"
+path = "src/lib.rs"
+
+[[bin]]
+name = "peel"
+path = "src/main.rs"
+
+# §1 demo binary for `internal/PLAN_rar.md`. Reads a local RAR5 file and
+# prints the entry list + archive flags. Gated behind the `rar`
+# feature so `cargo build --no-default-features` doesn't try to
+# compile against the (then-absent) walker module.
+
+# Man-page generator for the `peel` binary. Renders `peel::cli::Cli`
+# through `clap_mangen` and writes troff to its first positional
+# argument (default `target/man/peel.1`). Invoked from `release.yml`
+# before packaging so every release tarball ships a `peel.1`, and
+# called from the Fedora `.spec` / Debian `rules` / Arch `PKGBUILD`
+# (`packaging/`) during the distro source build. Gated by the
+# `man-page` feature so the default `cargo install peel-rs` doesn't
+# build a generator nobody asked for. See
+# `internal/PLAN_packaging.md` §0.2 for the design rationale
+# (bin vs. example; optional normal dep vs. dev-dep).
+[[bin]]
+name = "peel-mangen"
+path = "src/bin/peel-mangen.rs"
+required-features = ["man-page"]
+
+
+[features]
+# Default feature set: every supported format is on, so plain
+# `cargo build` produces the standard `peel` binary. Distros /
+# size-conscious users opt formats out with
+# `--no-default-features --features <list>` (see
+# `internal/PLAN_packaging.md`). Tar (uncompressed `.tar`) is the
+# always-on substrate and is not feature-gated — it carries no
+# dependencies and is tiny.
+default = ["zstd", "xz", "lz4", "gzip", "bzip2", "zip", "sevenz", "rar"]
+# Per-format gates. Each format module is wrapped in
+# `#[cfg(feature = "<name>")]`; with the feature disabled the
+# crate still registers the format's suffix / magic against a
+# diagnostic-only factory so the user sees a precise
+# "compiled without `<name>` feature" error rather than
+# "unknown format". See `internal/PLAN_rar.md` §0.5 for the
+# original rationale (which now applies uniformly).
+#
+# Compression / stream codecs.
+zstd = ["dep:zstd"]
+xz = []
+# LZ4 block decompression is hand-rolled in `src/decode/lz4_native.rs`
+# (`internal/PLAN_lz4_block_decoder.md`), so this gate pulls no runtime
+# crate — it only switches the format module on. `lz4_flex` survives as
+# a dev-dependency: the differential reference for the native decoder.
+lz4 = []
+gzip = []
+bzip2 = []
+# Container formats. Each container's entry decoders rely on
+# specific compression codecs, so a container feature implies the
+# compression features it needs — enabling `zip` brings DEFLATE
+# (via `gzip`) and zstd along automatically, enabling `sevenz`
+# brings DEFLATE and LZMA/LZMA2 (via `xz`) along.
+zip = ["gzip", "zstd"]
+sevenz = ["gzip", "xz"]
+rar = []
+# Gates the `peel-mangen` helper binary that renders the man page
+# via `clap_mangen`. Off by default — most users `cargo install
+# peel-rs` for the runtime binary only. Distro packagers turn it
+# on (`packaging/fedora/peel.spec`, `packaging/aur/peel/PKGBUILD`,
+# `packaging/debian/rules`) so the man page can be generated from
+# source during the distro build. Implementation: enabling the
+# feature activates the optional `clap_mangen` dep so `peel-mangen`
+# can compile.
+man-page = ["dep:clap_mangen"]
+# Link against the distro's `libzstd.so` instead of vendoring and
+# statically linking the C source via `zstd-sys`. Off by default
+# (the crates.io release / GitHub-released binaries / `cargo install
+# peel-rs` all stay self-contained), on for distro builds where
+# security updates to libzstd should flow without rebuilding peel.
+# Weak feature reference (`zstd?/`) means this is a no-op if `zstd`
+# is also disabled — `cargo build --no-default-features --features
+# system-libs` won't fail trying to find libzstd. See
+# `internal/PLAN_packaging.md` §0.4 for the rationale.
+system-libs = ["zstd?/pkg-config"]
+
+[dependencies]
+thiserror = "2"
+# TLS dependencies are pre-approved per internal/ENGINEERING_STANDARDS.md §2.4.
+# `ring` is the crypto backend; `tls12` and `tls13` cover the protocol versions
+# we need; `std` enables the blocking-IO `rustls::StreamOwned` adapter we use
+# from `http::client`.
+rustls = { version = "0.23", default-features = false, features = ["std", "ring", "tls12"] }
+webpki-roots = "0.26"
+# Compression backends, pre-approved per internal/ENGINEERING_STANDARDS.md §2.2.
+# zstd-encoded ZIP entries (`src/zip/decode.rs`) decode through the
+# upstream `zstd` crate's streaming reader API; the streaming
+# `.tar.zst` / `.zst` decoder is hand-rolled in `src/decode/zstd/`
+# and does not depend on this crate. The default features (legacy
+# decoders, dictionary builder, etc.) are not needed and would expand
+# the audit surface for no gain.
+zstd = { version = "0.13", default-features = false, optional = true }
+# CLI argument parsing for the `peel` binary boundary; pre-approved per
+# internal/ENGINEERING_STANDARDS.md §2.2 with the `derive` feature.
+clap = { version = "4", features = ["derive"] }
+# Companion `clap` crate that renders a `clap::Command` to troff for
+# `man(1)`. Maintained by the clap-rs org, same MIT/Apache-2.0
+# license as `clap`, no transitive C deps. Optional + gated by the
+# `man-page` feature so it only enters the build closure when a
+# packager runs `cargo build --bin peel-mangen --features man-page`.
+# The default `peel` binary does not link it. Sits logically under
+# the `clap` row in `internal/ENGINEERING_STANDARDS.md` §2.2; see
+# `internal/PLAN_packaging.md` §0.2 for the rationale.
+clap_mangen = { version = "0.2", optional = true }
+# Application-level error reporting at the binary boundary, pre-approved
+# per internal/ENGINEERING_STANDARDS.md §2.2 / §3.2.
+anyhow = "1"
+# Structured logging, pre-approved per internal/ENGINEERING_STANDARDS.md §2.2 /
+# §10. The `progress::LogRenderer` (PLAN_v2.md §6) emits non-TTY progress
+# as `tracing::info!` events; the binary boundary configures a subscriber
+# that writes those events to stderr.
+tracing = { version = "0.1", default-features = false, features = ["std"] }
+tracing-subscriber = { version = "0.3", default-features = false, features = ["fmt", "ansi"] }
+# HTTP client stack (PLAN_v2.md §3 / internal/ENGINEERING_STANDARDS.md §2.2 / §2.3).
+# All confined to `http::client`; the boundary rule from §2.3 forbids
+# imports of these crates outside that module. Feature sets are kept
+# minimal: hyper itself only `client` + `http1` + `http2`; hyper-util
+# `client-legacy` + the tokio executor; hyper-rustls just the protocol
+# layers (we build the rustls config ourselves so it composes with the
+# existing TLS dependency in §2.4). `tokio` runs as a current-thread
+# runtime confined to the client (see §2.5); `rt-multi-thread` is
+# deliberately not enabled.
+hyper = { version = "1", default-features = false, features = ["client", "http1", "http2"] }
+hyper-util = { version = "0.1", default-features = false, features = ["client", "client-legacy", "http1", "http2", "tokio"] }
+hyper-rustls = { version = "0.27", default-features = false, features = ["http1", "http2", "ring", "tls12"] }
+http = { version = "1", default-features = false, features = ["std"] }
+http-body = { version = "1", default-features = false }
+http-body-util = { version = "0.1", default-features = false }
+bytes = { version = "1", default-features = false, features = ["std"] }
+tokio = { version = "1", default-features = false, features = ["rt", "net", "time", "macros", "sync"] }
+
+# io_uring file-IO backend (PLAN_v2.md §7 / internal/ENGINEERING_STANDARDS.md §2.2).
+# Linux-only target dep so non-Linux builds stay clean. We use the
+# crate's sync API (`Submitter::submit_and_wait` on a dedicated IO
+# thread); no async runtime is added. The runtime probe in
+# `io_backend::uring` falls back to the blocking backend if the kernel
+# rejects the ring construction, so the dep being present does not by
+# itself force uring at runtime.
+[target.'cfg(target_os = "linux")'.dependencies]
+io-uring = { version = "0.6", default-features = false }
+
+# Win32 API bindings (PLAN_v3_windows.md §0.1 /
+# internal/ENGINEERING_STANDARDS.md §2.2). Microsoft-maintained, no
+# transitive deps. Windows-only target dep so Linux/macOS builds are
+# unchanged. The feature set is the minimum needed across the §1–§9
+# phases of `PLAN_v3_windows.md`:
+#
+#   * Win32_Foundation        — HANDLE, BOOL, error codes (ERROR_*),
+#                               GetLastError.
+#   * Win32_Storage_FileSystem — FSCTL_SET_SPARSE / FSCTL_SET_ZERO_DATA
+#                               argument structs, MoveFileExW, the
+#                               GetFileInformationByHandleEx surface used
+#                               by the puncher's allocation-size assertion.
+#   * Win32_System_IO         — DeviceIoControl + the OVERLAPPED type it
+#                               takes.
+#   * Win32_System_Console    — SetConsoleCtrlHandler, GetConsoleMode /
+#                               SetConsoleMode, GetStdHandle for the
+#                               signal-handler and password-prompt
+#                               parity paths.
+#   * Win32_System_Threading  — ExitProcess (the async-signal-safe exit
+#                               sibling of `_exit` on Unix).
+#
+# Other Win32 surfaces — long-path support (`\\?\` opt-in), reparse
+# points, ADS — are explicit round-two follow-ons in §11 of the plan
+# and would extend this feature list when promoted.
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.59", features = [
+    "Win32_Foundation",
+    "Win32_Storage_FileSystem",
+    "Win32_System_IO",
+    "Win32_System_Console",
+    "Win32_System_Threading",
+] }
+
+[dev-dependencies]
+# Dev-only reference implementation used by `hash::sha256` tests to
+# cross-check the hand-rolled SHA-256 against a battle-tested upstream
+# (`PLAN_v2.md` §10 / `internal/ENGINEERING_STANDARDS.md` §2.2). The
+# runtime binary does not link `sha2`.
+sha2 = "0.10"
+# Dev-only reference implementation used by `hash::blake2sp` tests to
+# cross-check the hand-rolled BLAKE2sp against a battle-tested
+# upstream (`internal/PLAN_rar.md` §2). RAR5 file-data integrity uses
+# BLAKE2sp (parallel BLAKE2s, 8 lanes); the upstream `blake2` crate
+# stays at `dev-dependencies` scope so the runtime binary doesn't
+# link it. Same precedent as `sha2` for SHA-256.
+blake2 = "0.10"
+# Dev-only: liblzma binding kept for the differential test suite in
+# `tests/test_xz_native.rs` (encodes fixtures with `xz2`, decodes with
+# both xz2 and the hand-rolled decoder, byte-compares). Phase 7 of
+# `internal/PLAN_xz_block_decoder.md` swapped `xz2` out of the runtime
+# decode path; it stays here so the differential corpus keeps a real
+# liblzma reference implementation in the loop.
+xz2 = "0.1"
+# Dev-only: pure-Rust DEFLATE / gzip codec used to encode round-trip
+# fixtures for the `decode::deflate_native` differential tests and
+# the `zip::decode` round-trip tests. Phase 9a of
+# `internal/PLAN_deflate_block_decoder.md` swapped the production
+# DEFLATE / gzip / zip-DEFLATE paths off this crate; it stays here
+# so the differential corpus keeps a real `miniz_oxide` reference
+# implementation in the loop. `rust_backend` selects the pure-Rust
+# variant — no C dependency, no zlib link.
+flate2 = { version = "1", default-features = false, features = ["rust_backend"] }
+# Dev-only: pure-Rust LZ4 codec kept as the differential reference for
+# the hand-rolled block decoder in `src/decode/lz4_native.rs`. Phase 3
+# of `internal/PLAN_lz4_block_decoder.md` swapped the production LZ4
+# block-decode path off this crate (dropping it from the runtime tree
+# so Fedora's rust2rpm spec resolves without a `rust-lz4_flex`
+# package); it stays here so `tests/test_lz4_native_diff.rs` and the
+# `lz4_native` unit tests keep a real reference encoder/decoder in the
+# loop. Same precedent as `flate2` for DEFLATE and `xz2` for xz.
+# `safe-decode` selects the bounds-checked reference decoder; `std`
+# enables the block compress/decompress helpers the corpus uses.
+lz4_flex = { version = "0.11", default-features = false, features = ["safe-decode", "std"] }
+# Dev-only: enable hyper's `server` feature for an in-process H2
+# (h2c, plaintext prior-knowledge) test server in
+# `tests/support/h2c_server.rs`. The `[dependencies]` block already
+# pulls hyper for the runtime client; this adds the server APIs only
+# for `cargo test` and does not affect release binaries. Cargo unions
+# features between dev and runtime for test builds.
+hyper = { version = "1", default-features = false, features = ["server"] }
+# Dev-only: rustls TLS *server* acceptor for the in-process
+# self-signed-cert server in `tests/support/tls_server.rs`, used by
+# `tests/test_http_insecure.rs` to prove `--insecure` completes a TLS
+# handshake against an untrusted certificate (over both H1 and H2
+# ALPN) while the default verifying client rejects it. `tokio-rustls`
+# already resolves transitively via the `hyper-rustls` connector, so
+# this only promotes an already-locked crate to a direct dev-dep — no
+# new code enters the tree and the runtime binary does not link it.
+# Sits under the `hyper-rustls` row in
+# `internal/ENGINEERING_STANDARDS.md` §2.2 as the server-side TLS
+# counterpart, dev-scoped. The cert/key are static PEM fixtures under
+# `tests/support/testdata/` (no runtime cert generation — no `rcgen`),
+# matching the "std/hand-rolled first" bias of §2.1.
+tokio-rustls = { version = "0.26", default-features = false, features = ["ring"] }
+# Dev-only reference implementations used by `src/crypto/` tests and
+# `tests/test_crypto_diff.rs` to cross-check the hand-rolled SHA-1,
+# HMAC, and PBKDF2 against battle-tested upstreams
+# (`internal/PLAN_archive_encryption.md` §2). Same precedent as `sha2`
+# and `blake2` above: the runtime binary does not link these.
+sha1 = "0.10"
+hmac = "0.12"
+pbkdf2 = { version = "0.12", default-features = false, features = ["hmac"] }
+# Dev-only AES reference for the AES / AES-CTR / AES-CBC
+# differential cross-check
+# (`internal/PLAN_archive_encryption.md` §2 / `tests/test_crypto_diff.rs`).
+aes = "0.8"
+ctr = "0.9"
+cbc = "0.1"
+
+[profile.release]
+debug = "line-tables-only"
+lto = "thin"

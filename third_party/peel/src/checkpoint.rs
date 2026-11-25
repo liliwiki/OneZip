@@ -1,0 +1,5027 @@
+//! Crash-safe checkpoint persistence for resumable extractions.
+//!
+//! A [`Checkpoint`] captures everything the §10 coordinator needs to
+//! pick a download + extraction back up after a `kill -9`: which source
+//! was being fetched (URL + ETag/Last-Modified), how the source is
+//! sliced (`total_size`, `chunk_size`), the lock-free completion bitmap
+//! the workers had populated, the decoder cursor, and a sink-specific
+//! [`SinkState`] blob describing how far into extraction we'd gotten.
+//!
+//! # File layout
+//!
+//! Checkpoints are not JSON. The format is a tiny custom binary frame
+//! so we can verify framing, version, and integrity in three reads
+//! without dragging in a serialization crate. All multi-byte integers
+//! are little-endian.
+//!
+//! ```text
+//! [ Header — 28 bytes, fixed                                       ]
+//!   8 B  magic                  = "peelckpt"
+//!   4 B  format_version (u32)
+//!   8 B  body_length    (u64)
+//!   8 B  body_checksum  (u64)   // FNV-1a-64 over the body bytes
+//! [ Body — body_length bytes, length-prefixed fields per version ]
+//!   u32 url_len + url utf8 bytes
+//!   u8  etag_present + (u32 len + etag utf8 bytes)?
+//!   u8  last_modified_present + (u32 len + last_modified utf8 bytes)?
+//!   u64 total_size
+//!   u64 chunk_size
+//!   u64 decoder_position
+//!   u32 bitmap_len + bitmap bytes
+//!   i64 created_at_unix_secs
+//!   u32 created_at_nanos
+//!   u8  sink_state_tag
+//!     tag 0 (Raw):  u64 bytes_written
+//!     tag 1 (Tar):  u32 count, then count × (u32 len + utf8 bytes)
+//!     tag 2 (Zip, v2+):
+//!                  u32 entries_completed.len, then count × u32 index
+//!                  u8  current_entry.is_some
+//!                  if some: u32 current_entry_index
+//!                  u64 current_entry_offset
+//!   u8  hash_state_present (v3+ only)
+//!     if 1: SERIALIZED_LEN bytes of `hash::sha256::Sha256` state
+//!   u8  chunk_crc32c_present (v4+ only)
+//!     if 1: u32 count, then count × u32 CRC-32C values
+//! ```
+//!
+//! # Forward compatibility
+//!
+//! Adding fields is allowed at the **end** of the body in a future
+//! `format_version`. Older readers that encounter a higher version
+//! number than they understand fail with
+//! [`CheckpointError::UnsupportedVersion`] rather than silently dropping
+//! the unknown trailing data. Newer readers that encounter an older
+//! version dispatch on the version number and parse the v1 layout.
+//!
+//! # Atomic writes
+//!
+//! [`Checkpoint::write`] writes to `<path>.tmp`, `fsync`s the data and
+//! then the parent directory, and finally `rename(2)`s `<path>.tmp` over
+//! `<path>`. On every supported filesystem `rename` is atomic, so a
+//! crash at any point leaves either the previous `<path>` intact or the
+//! new one in place — never a torn write. A stray `<path>.tmp` from a
+//! crashed previous run is overwritten by the next `write` and ignored
+//! by [`Checkpoint::read`].
+//!
+//! # Examples
+//!
+//! ```no_run
+//! use peel::checkpoint::{Checkpoint, PartRecord, RunMode, SinkState};
+//! use peel::types::ByteOffset;
+//!
+//! let url: String = "https://example.com/dataset.tar.zst".into();
+//! let total_size: u64 = 10 * 1024 * 1024;
+//! let etag = Some("\"abc123\"".to_string());
+//! let ckpt = Checkpoint {
+//!     url: url.clone(),
+//!     etag: etag.clone(),
+//!     last_modified: None,
+//!     parts: vec![PartRecord {
+//!         url,
+//!         size: total_size,
+//!         etag,
+//!         last_modified: None,
+//!         expected_sha256: None,
+//!         volume_role: None,
+//!     }],
+//!     total_size,
+//!     chunk_size: 4 * 1024 * 1024,
+//!     decoder_position: ByteOffset::new(2 * 1024 * 1024),
+//!     bitmap_completed: vec![0xFF, 0x0F],
+//!     created_at: std::time::SystemTime::now(),
+//!     sink_state: SinkState::Tar {
+//!         members_completed: vec!["root/a.txt".into()],
+//!         in_flight: None,
+//!     },
+//!     hash_state: None,
+//!     chunk_crc32c: None,
+//!     decoder_state: None,
+//!     mode: RunMode::Extract,
+//!     source_mtime: None,
+//!     cumulative_elapsed: std::time::Duration::ZERO,
+//! };
+//! ckpt.write(std::path::Path::new("/tmp/peel-demo.ckpt"))?;
+//! # Ok::<(), peel::checkpoint::CheckpointError>(())
+//! ```
+
+use std::fs::{File, OpenOptions};
+use std::io::{ErrorKind, Read, Write};
+use std::path::{Path, PathBuf};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+
+use thiserror::Error;
+
+use crate::types::ByteOffset;
+
+/// Atomically publish `tmp` over `dst`, replacing any existing entry
+/// at `dst`. The data already written to `tmp` is the visible
+/// `dst` afterward; concurrent observers see either the old or the
+/// new content, never a partial mix.
+///
+/// On Unix this is `rename(2)`, which atomically replaces the target
+/// directory entry on the same filesystem.
+///
+/// On Windows `std::fs::rename` fails by default when the destination
+/// exists; the equivalent atomic-replace primitive is
+/// `MoveFileExW(REPLACE_EXISTING | WRITE_THROUGH)`. `WRITE_THROUGH`
+/// commits the rename to disk before returning, which on NTFS gives
+/// the same durability guarantee the Unix path gets from the
+/// caller's parent-directory `fsync` (the Unix path that runs after
+/// the rename on first publish). (`PLAN_v3_windows.md` §9.)
+///
+/// # Errors
+///
+/// Returns the underlying [`std::io::Error`] for any OS-level
+/// failure.
+fn atomic_publish(tmp: &Path, dst: &Path) -> std::io::Result<()> {
+    #[cfg(unix)]
+    {
+        std::fs::rename(tmp, dst)
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::ffi::OsStrExt;
+        use windows_sys::Win32::Storage::FileSystem::{
+            MoveFileExW, MOVEFILE_REPLACE_EXISTING, MOVEFILE_WRITE_THROUGH,
+        };
+
+        // Convert both paths to NUL-terminated UTF-16 buffers per
+        // the Win32 wide-string contract. `encode_wide()` does the
+        // OsStr → UTF-16 encoding; we append the trailing NUL.
+        let to_wide = |p: &Path| -> Vec<u16> {
+            let mut v: Vec<u16> = p.as_os_str().encode_wide().collect();
+            v.push(0);
+            v
+        };
+        let src_w = to_wide(tmp);
+        let dst_w = to_wide(dst);
+
+        // SAFETY: `src_w` and `dst_w` are NUL-terminated UTF-16
+        // buffers owned by the caller for the duration of this
+        // call; `MoveFileExW` reads them by pointer and never
+        // retains them past return. The flags are valid bits per
+        // <fileapi.h>. The function returns non-zero on success.
+        let rc = unsafe {
+            MoveFileExW(
+                src_w.as_ptr(),
+                dst_w.as_ptr(),
+                MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH,
+            )
+        };
+        if rc == 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        Ok(())
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
+        // Other platforms (e.g. WASI) fall back to plain `rename`
+        // and accept whatever atomicity guarantees the host's libc
+        // provides.
+        std::fs::rename(tmp, dst)
+    }
+}
+
+/// Magic bytes at the start of every checkpoint file.
+///
+/// Eight bytes of ASCII so a `head -c 8 file.ckpt` is human-readable
+/// without a hex dump.
+pub const MAGIC: [u8; 8] = *b"peelckpt";
+
+/// The format version this build writes and is the highest version it
+/// can read. Future builds bump this when the body layout changes.
+///
+/// History:
+///
+/// - **v1** — `Raw` and `Tar` sink states.
+/// - **v2** — adds the `Zip` sink state for per-entry ZIP extraction
+///   (`internal/PLAN_v2.md` §5). The body layout is otherwise unchanged;
+///   v2 readers parse v1 files transparently.
+/// - **v3** — appends an optional [`Checkpoint::hash_state`] field
+///   carrying the serialized SHA-256 state used by `--sha256`
+///   integrity verification (`internal/PLAN_v2.md` §10). v3 readers
+///   parse v1 / v2 files transparently with `hash_state = None`.
+/// - **v4** — appends an optional [`Checkpoint::chunk_crc32c`]
+///   per-chunk fingerprint vector for `PLAN_v2.md` §11's mid-flight
+///   source-change detector. v4 readers parse v1 / v2 / v3 files
+///   transparently with `chunk_crc32c = None`.
+/// - **v5** — appends an optional opaque [`Checkpoint::decoder_state`]
+///   blob for `OPTIMIZATIONS.md` O.7b's mid-frame lz4 resume. The
+///   blob is decoder-private — checkpoint code only carries it
+///   verbatim. Length is capped at [`MAX_DECODER_STATE_LEN`] on
+///   decode to bound allocation. v5 readers parse v1 / v2 / v3 / v4
+///   files transparently with `decoder_state = None`. Older binaries
+///   refuse v5 files with [`CheckpointError::UnsupportedVersion`].
+/// - **v6** — extends [`SinkState::Tar`] with optional `in_flight`
+///   parser state so a kill at any block boundary (not just between
+///   tar members) is resumable. Supports the
+///   `OPTIMIZATIONS.md`-tracked Polkachu shape where alignment
+///   between LZ4 block boundaries and tar member boundaries is
+///   essentially never satisfied. v6 readers parse v1 / v2 / v3 /
+///   v4 / v5 files transparently with `in_flight = None`. Older
+///   binaries refuse v6 with [`CheckpointError::UnsupportedVersion`].
+/// - **v7** — extends [`SinkState::Zip`] with an optional opaque
+///   `current_entry_decoder_state` blob carrying the in-flight zip
+///   entry's codec state (`internal/PLAN_deflate_block_decoder.md`
+///   Phase 9b). v7 readers parse v1..=v6 files transparently
+///   with `current_entry_decoder_state = None` (which fall through
+///   to the existing per-entry "restart from byte 0" path for
+///   DEFLATE / zstd entries). Older binaries refuse v7 with
+///   [`CheckpointError::UnsupportedVersion`].
+/// - **v8** — replaces the legacy `(url, etag, last_modified)` trio
+///   with a [`Checkpoint::parts`] vec of [`PartRecord`]s, one per
+///   logical part (`internal/PLAN_multi_url_source.md` §5). Single-URL
+///   runs write a 1-element vec; multi-URL runs write the full
+///   list. The optional [`Checkpoint::hash_state`] also carries a
+///   `u32` `active_part_idx` so resume can rebuild the
+///   [`crate::hash::IntegrityHasher`] state machine at the right
+///   part. v8 readers parse v1..=v7 files transparently by
+///   synthesizing `parts[0]` from the legacy fields and treating
+///   the saved `hash_state` (when present) as `active_part_idx =
+///   0`. Older binaries refuse v8 with
+///   [`CheckpointError::UnsupportedVersion`].
+/// - **v9** — adds [`SinkState::Sevenz`] with `folders_completed` +
+///   optional `current_folder` for the 7z second-pipeline driver
+///   (`internal/PLAN_7z_support.md` §9). Older binaries refuse v9 files
+///   with [`CheckpointError::UnsupportedVersion`].
+/// - **v10** — adds [`SinkState::Rar`] with `entries_completed`,
+///   optional `current_entry`, and `current_entry_offset` for the
+///   RAR5 STORED-method pipeline (`internal/PLAN_rar.md` §3). Round-one
+///   resume restarts the in-flight entry from
+///   `current_entry_offset` (the on-disk file is truncated to that
+///   length and the running BLAKE2sp / CRC-32 are seeded by
+///   re-reading the prefix). Newer formats will add a serialized
+///   BLAKE2sp / RAR5-decoder snapshot on top of this same variant
+///   when §4 lands the hand-rolled compressed-method decoder.
+///   Older binaries refuse v10 files with
+///   [`CheckpointError::UnsupportedVersion`].
+/// - **v11** — extends [`SinkState::Rar`] with an optional opaque
+///   `current_entry_decoder_state` blob carrying the in-flight
+///   compressed entry's [`crate::decode::rar_native::RarStreamDecoder`]
+///   snapshot (`internal/PLAN_rar5_decoder.md` §F1). v11 readers parse
+///   v1..=v10 files transparently with the blob set to `None`
+///   (compressed entries fall through to the existing
+///   "restart entry from byte 0" path). The format version on
+///   disk only bumps to 11 when a SinkState::Rar checkpoint
+///   actually ships a non-`None` blob — STORED-only checkpoints
+///   keep writing the v10 layout so existing tight crash-resume
+///   tests don't see a byte-count drift in their checkpoint
+///   sidecar. Older binaries refuse v11 files with
+///   [`CheckpointError::UnsupportedVersion`].
+///
+/// **v12** — adds the [`Checkpoint::mode`] field
+/// (`internal/PLAN_download_modes.md` §5) so resume can detect drift
+/// between runs that pass different mode flags (e.g. a prior
+/// `--no-extract` checkpoint paired with a later run that omits
+/// the flag). Forward-compat: v11 and earlier read as
+/// [`RunMode::Extract`]; v12 writes only fire when `mode !=
+/// Extract` (the byte-identical lower bound).
+///
+/// **v13** — adds the [`Checkpoint::source_mtime`] trailer for
+/// [`RunMode::LocalDestructive`] runs
+/// (`internal/old/PLAN_local_file_extract.md` §5). The trailer is written
+/// only for `LocalDestructive`; every other mode falls through to
+/// the pre-§5 byte-identical layout.
+///
+/// **v14** — adds a per-[`PartRecord`] `volume_role` tag
+/// (`internal/PLAN_multivolume_archives.md` §5) so a multi-volume
+/// resume can verify the volume set's shape matches what the
+/// checkpoint was written under. The tag is per-part because each
+/// part of a multi-volume archive is its own self-contained volume
+/// with its own format-specific metadata; the role identifies
+/// which format dialect the part belongs to.
+/// [`PartRecord::volume_role`] is [`Option<VolumeRole>`]: `None`
+/// is the legacy linear byte-concat shape (today's single-URL and
+/// multi-URL behaviour). The writer only bumps the on-disk header
+/// to v14 when at least one part has `Some(role)`; runs whose
+/// parts are all `None` continue writing v8..=v13 layouts
+/// byte-identically. v14 readers parse v1..=v13 transparently
+/// with every part's `volume_role` defaulting to `None`. Older
+/// binaries refuse v14 files with
+/// [`CheckpointError::UnsupportedVersion`].
+///
+/// **v15** — appends an optional [`Checkpoint::cumulative_elapsed`]
+/// trailer carrying the total wall-clock time spent on the
+/// operation across every run that has contributed to this
+/// checkpoint. The coordinator seeds the value from the prior
+/// checkpoint on resume and snapshots `prior + (now - run_start)`
+/// at every write so a crash-loop accumulates monotonically. v15
+/// readers parse v1..=v14 files transparently with the value
+/// defaulting to [`Duration::ZERO`]. The writer only bumps the
+/// on-disk version to 15 when the value is non-zero, so existing
+/// byte-identical regression tests (sample checkpoints constructed
+/// with `Duration::ZERO`) keep their v8..=v14 layouts. Older
+/// binaries refuse v15 files with
+/// [`CheckpointError::UnsupportedVersion`].
+///
+/// **v16** — extends [`TarSinkState`] with an optional
+/// `pending_linkpath` field carrying a buffered symlink / hard-link
+/// target override (PAX `linkpath=` or a GNU `K` long-link) that was
+/// captured between the extension header and the link entry it
+/// applies to. v16 readers parse v1..=v15 files transparently with
+/// the field defaulting to `None`. The writer only bumps the on-disk
+/// version to 16 when an in-flight tar state actually carries a
+/// `pending_linkpath`, so the overwhelmingly common quiescent /
+/// mid-file checkpoints keep their v6..=v15 layouts byte-identically.
+/// Older binaries refuse v16 files with
+/// [`CheckpointError::UnsupportedVersion`].
+pub const FORMAT_VERSION: u32 = 16;
+
+/// Pre-§F1 max format version, written when no SinkState payload
+/// uses v11-only fields. Keeping the on-disk version dynamic
+/// means STORED-only RAR checkpoints round-trip byte-identically
+/// to the v10 layout, which keeps tight crash-resume tests
+/// (whose checkpoint sidecar size is observed indirectly via
+/// kill-switch timing) stable across the §F1 transition.
+const FORMAT_VERSION_RAR_STORED_ONLY: u32 = 10;
+
+/// `internal/PLAN_rar5_decoder.md` §F1: format version the writer
+/// upgrades to when [`SinkState::Rar::current_entry_decoder_state`]
+/// is populated. The reader dispatches on `format_version >= 11`
+/// to know whether the per-entry decoder-state presence byte is
+/// present in the body.
+const FORMAT_VERSION_RAR_F1: u32 = 11;
+
+/// `internal/PLAN_download_modes.md` §5: format version the writer
+/// upgrades to when [`Checkpoint::mode`] is anything other than
+/// [`RunMode::Extract`]. Default-mode runs keep writing the
+/// pre-§5 layout (v10 / v11 depending on the SinkState payload)
+/// so byte-identical regression checks pass.
+const FORMAT_VERSION_RUN_MODE: u32 = 12;
+
+/// `internal/old/PLAN_local_file_extract.md` §5: format version the
+/// writer upgrades to when [`Checkpoint::mode`] is
+/// [`RunMode::LocalDestructive`]. Carries the source-file mtime
+/// trailer so the resume path can defend against a same-size
+/// swap of the underlying archive between runs.
+const FORMAT_VERSION_LOCAL_DESTRUCTIVE: u32 = 13;
+
+/// `internal/PLAN_multivolume_archives.md` §5: format version the
+/// writer upgrades to when at least one [`PartRecord`] carries a
+/// non-`None` [`VolumeRole`]. The per-part role byte is appended
+/// for every part in the body (uniformly, so the read loop has a
+/// fixed shape) — runs where every part is linear byte-concat
+/// keep writing v8..=v13 layouts byte-identically so the existing
+/// resume tests do not see a sidecar-size drift on the bump.
+const FORMAT_VERSION_MULTIVOLUME: u32 = 14;
+
+/// Format version the writer upgrades to when
+/// [`Checkpoint::cumulative_elapsed`] is non-zero. The 12-byte
+/// trailer (i64 secs + u32 nanos) is appended unconditionally at
+/// v15, so the read path is "read trailer iff `format_version >=
+/// 15 && cursor.remaining() > 0`". Zero-valued checkpoints keep
+/// writing the v8..=v14 layout byte-identically.
+const FORMAT_VERSION_CUMULATIVE_ELAPSED: u32 = 15;
+
+/// Format version the writer upgrades to when a
+/// [`SinkState::Tar`]'s in-flight state carries a
+/// [`TarSinkState::pending_linkpath`]. The optional `linkpath`
+/// override string is written inside the tar-sink-state body
+/// (right after `pending_size`) and read back under a
+/// `format_version >= 16` guard; checkpoints without a buffered
+/// link target keep writing the v6..=v15 tar layout byte-identically.
+const FORMAT_VERSION_TAR_LINKPATH: u32 = 16;
+
+/// Fixed-size header length, in bytes.
+const HEADER_LEN: usize = 8 + 4 + 8 + 8;
+
+/// Tag for [`SinkState::Raw`] in the on-disk format.
+const SINK_TAG_RAW: u8 = 0;
+/// Tag for [`SinkState::Tar`] in the on-disk format.
+const SINK_TAG_TAR: u8 = 1;
+/// Tag for [`SinkState::Sevenz`] in the on-disk format. Added in
+/// v9 of the format (`internal/PLAN_7z_support.md` §9).
+const SINK_TAG_SEVENZ: u8 = 3;
+/// Tag for [`SinkState::Zip`] in the on-disk format. Added in v2 of
+/// the checkpoint layout.
+const SINK_TAG_ZIP: u8 = 2;
+/// Tag for [`SinkState::Rar`] in the on-disk format. Added in v10
+/// of the format (`internal/PLAN_rar.md` §3).
+const SINK_TAG_RAR: u8 = 4;
+
+/// `internal/PLAN_download_modes.md` §5: which top-level mode a
+/// checkpoint was written by, persisted in v12 so resume can
+/// detect a user changing flags between runs and refuse to silently
+/// "forget" extractor or download-only progress.
+#[derive(Debug, Default, Clone, Copy, Eq, PartialEq)]
+pub enum RunMode {
+    /// Default extract pipeline: download → decode → extract →
+    /// hole-punch → delete source on success. Writers default to
+    /// this value, and readers of pre-v12 checkpoints synthesize
+    /// it.
+    #[default]
+    Extract,
+    /// Download-only mode: scheduler fills `.peel.part`, no
+    /// decoder runs, the part-file is renamed to the final output
+    /// path on completion (`internal/PLAN_download_modes.md` §2).
+    NoExtract,
+    /// Extract-and-preserve mode: decoder runs and the puncher is
+    /// forced to no-op so the source archive stays at its full
+    /// `Content-Length`. On completion the `.peel.part` is renamed
+    /// to a user-supplied keep-archive path
+    /// (`internal/PLAN_download_modes.md` §3).
+    KeepArchive,
+    /// Local-file destructive mode: the user-supplied archive on
+    /// disk is progressively hole-punched as the decoder advances
+    /// and deleted on clean completion
+    /// (`internal/old/PLAN_local_file_extract.md` §5). Carries a
+    /// `source_mtime` trailer in the on-disk format (v13+) so a
+    /// same-size swap between runs is detected on resume.
+    LocalDestructive,
+}
+
+/// Run-mode tag for [`RunMode::Extract`] in the on-disk format
+/// (`internal/PLAN_download_modes.md` §5). Implicit for pre-v12
+/// checkpoints — the deserializer synthesizes the value.
+const RUN_MODE_TAG_EXTRACT: u8 = 0;
+/// Run-mode tag for [`RunMode::NoExtract`].
+const RUN_MODE_TAG_NO_EXTRACT: u8 = 1;
+/// Run-mode tag for [`RunMode::KeepArchive`].
+const RUN_MODE_TAG_KEEP_ARCHIVE: u8 = 2;
+/// Run-mode tag for [`RunMode::LocalDestructive`]. Added in v13.
+const RUN_MODE_TAG_LOCAL_DESTRUCTIVE: u8 = 3;
+
+/// `internal/PLAN_multivolume_archives.md` §5: which multi-volume
+/// archive format a [`PartRecord`] represents one volume of.
+///
+/// Carried as `Option<VolumeRole>` on [`PartRecord`]; `None` means
+/// "linear byte-concat" — every pre-v14 [`PartRecord`] decodes as
+/// `None`, single-URL runs serialize `None`, and the
+/// multi-URL-source path (`internal/PLAN_multi_url_source.md`) also
+/// serializes `None` because its parts byte-concatenate into one
+/// logical stream rather than each carrying their own format
+/// metadata.
+///
+/// The three concrete variants describe the three multi-volume
+/// archive formats `peel` discovers in
+/// [`crate::multivolume`]. They are persisted so a resume can
+/// confirm the volume set discovered on the second run still has
+/// the same shape — a heterogeneous mix (e.g. a checkpoint that
+/// recorded `Rar5Volume` parts resuming against a `.7z.NNN` set)
+/// is a hard error rather than a silently-wrong decode.
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+pub enum VolumeRole {
+    /// One volume of a RAR5 multi-volume archive
+    /// (`<base>.part<NN>.rar`). Volumes are not a byte-concat —
+    /// each volume carries its own RAR main+end headers, and
+    /// files marked `FHD_SPLIT_BEFORE` / `FHD_SPLIT_AFTER` span
+    /// volume boundaries with the format parser stitching the
+    /// logical stream.
+    Rar5Volume,
+    /// One volume of a 7z multi-volume archive
+    /// (`<base>.7z.<NNN>`). Volumes *are* a byte-concat — the
+    /// logical `.7z` is `cat name.7z.001 … name.7z.NNN`. The role
+    /// tag is still recorded so the resume path can verify the
+    /// discovered set is a 7z volume set (and not, say, a same-
+    /// shaped numbered URL list whose parts happen to byte-
+    /// concatenate into a tar stream).
+    SevenZVolume,
+    /// One volume of a spanned ZIP archive (`<base>.z<NN>`
+    /// siblings + trailing `<base>.zip`). The final `.zip`
+    /// carries the EOCD + central directory; earlier volumes
+    /// hold the per-entry local-file-header payload, which can
+    /// itself span volume boundaries.
+    ZipSpannedVolume,
+}
+
+/// Volume-role tag for [`VolumeRole::Rar5Volume`]. Added in v14.
+const VOLUME_ROLE_TAG_RAR5: u8 = 0;
+/// Volume-role tag for [`VolumeRole::SevenZVolume`]. Added in v14.
+const VOLUME_ROLE_TAG_SEVENZ: u8 = 1;
+/// Volume-role tag for [`VolumeRole::ZipSpannedVolume`]. Added in v14.
+const VOLUME_ROLE_TAG_ZIP_SPANNED: u8 = 2;
+
+impl VolumeRole {
+    fn to_tag(self) -> u8 {
+        match self {
+            VolumeRole::Rar5Volume => VOLUME_ROLE_TAG_RAR5,
+            VolumeRole::SevenZVolume => VOLUME_ROLE_TAG_SEVENZ,
+            VolumeRole::ZipSpannedVolume => VOLUME_ROLE_TAG_ZIP_SPANNED,
+        }
+    }
+
+    fn from_tag(tag: u8) -> Option<Self> {
+        match tag {
+            VOLUME_ROLE_TAG_RAR5 => Some(VolumeRole::Rar5Volume),
+            VOLUME_ROLE_TAG_SEVENZ => Some(VolumeRole::SevenZVolume),
+            VOLUME_ROLE_TAG_ZIP_SPANNED => Some(VolumeRole::ZipSpannedVolume),
+            _ => None,
+        }
+    }
+}
+
+impl std::fmt::Display for RunMode {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.label())
+    }
+}
+
+impl RunMode {
+    /// Stable human-readable label used in [`CheckpointError::ModeMismatch`]
+    /// messages and in `tracing` output. Mirrors the flag the user
+    /// would type on the CLI for each mode.
+    #[must_use]
+    pub fn label(&self) -> &'static str {
+        match self {
+            RunMode::Extract => "extract",
+            RunMode::NoExtract => "--no-extract",
+            RunMode::KeepArchive => "--keep-archive",
+            RunMode::LocalDestructive => "local-destructive",
+        }
+    }
+
+    fn to_tag(self) -> u8 {
+        match self {
+            RunMode::Extract => RUN_MODE_TAG_EXTRACT,
+            RunMode::NoExtract => RUN_MODE_TAG_NO_EXTRACT,
+            RunMode::KeepArchive => RUN_MODE_TAG_KEEP_ARCHIVE,
+            RunMode::LocalDestructive => RUN_MODE_TAG_LOCAL_DESTRUCTIVE,
+        }
+    }
+
+    fn from_tag(tag: u8) -> Option<Self> {
+        match tag {
+            RUN_MODE_TAG_EXTRACT => Some(RunMode::Extract),
+            RUN_MODE_TAG_NO_EXTRACT => Some(RunMode::NoExtract),
+            RUN_MODE_TAG_KEEP_ARCHIVE => Some(RunMode::KeepArchive),
+            RUN_MODE_TAG_LOCAL_DESTRUCTIVE => Some(RunMode::LocalDestructive),
+            _ => None,
+        }
+    }
+}
+
+/// Maximum length of the v5 [`Checkpoint::decoder_state`] blob.
+///
+/// Sized to accommodate the hand-rolled zstd decoder's resume blob
+/// (`internal/PLAN_zstd_block_decoder.md` Phase 7), which carries a
+/// sliding-window snapshot of up to `MAX_WINDOW_SIZE` (128 MiB at
+/// `windowLog = 27`) plus ~10 KiB of metadata. The lz4 blob is on
+/// the order of 50 bytes; the upper bound is a zstd-only concern.
+/// [`MAX_BODY_LEN`] (1 GiB) still bounds the worst-case allocation
+/// a hostile checkpoint can trigger before
+/// [`Checkpoint::deserialize`] checks the body checksum.
+pub const MAX_DECODER_STATE_LEN: u32 = (1 << 27) + 32 * 1024;
+
+/// Per-step wall-clock timings for one [`Checkpoint::write_timed`]
+/// call.
+///
+/// Each field measures one stage of the atomic-write sequence so
+/// `PLAN_checkpoint_cadence_throughput.md` Phase 0 can attribute the
+/// per-checkpoint stall to a specific syscall. The fields are
+/// non-overlapping; their sum is the wall-clock spent inside
+/// `write_timed`.
+#[derive(Debug, Default, Clone, Copy)]
+pub struct CheckpointWriteTimings {
+    /// Time to serialize the [`Checkpoint`] body into a `Vec<u8>`.
+    pub serialize_time: Duration,
+    /// Time from `OpenOptions::open(.tmp)` through the final
+    /// `write_all` (no `fsync`).
+    pub tmp_write_time: Duration,
+    /// Time spent inside `File::sync_all` on the `.tmp` file.
+    pub tmp_fsync_time: Duration,
+    /// Time spent inside `fs::rename(.tmp, path)`.
+    pub rename_time: Duration,
+    /// Time spent inside `File::sync_all` on the parent directory.
+    /// Zero when [`Self::dir_fsync_called`] is `false` (parent open
+    /// failed, parent path was empty, or we're on a platform that
+    /// can't fsync directories).
+    pub dir_fsync_time: Duration,
+    /// Whether the parent-directory `sync_all` was attempted.
+    pub dir_fsync_called: bool,
+}
+
+/// Errors produced by [`Checkpoint::read`] / [`Checkpoint::write`] and
+/// the in-memory [`Checkpoint::deserialize`] / [`Checkpoint::serialize`]
+/// helpers.
+///
+/// Variants are specific so callers can decide what to log vs. retry
+/// vs. surface as a hard failure. Per `internal/ENGINEERING_BEST_PRACTICES`
+/// §3.1 every variant carries enough structured context that the
+/// `Display` message alone is debuggable.
+#[derive(Debug, Error)]
+pub enum CheckpointError {
+    /// A filesystem syscall failed.
+    #[error("io error operating on {path}")]
+    Io {
+        /// Path involved in the failing call.
+        path: PathBuf,
+        /// The underlying OS error.
+        #[source]
+        source: std::io::Error,
+    },
+
+    /// The first eight bytes of the file did not match [`MAGIC`].
+    #[error("not a peel checkpoint (magic was {found:02X?})")]
+    BadMagic {
+        /// The eight bytes the reader actually saw.
+        found: [u8; 8],
+    },
+
+    /// The file declares a `format_version` outside the supported
+    /// range `1..=FORMAT_VERSION`. Version 0 has never existed and
+    /// versions above [`FORMAT_VERSION`] are produced by newer
+    /// binaries; per §9.4 the older binary refuses to guess at either
+    /// shape and surfaces this so the caller can produce a clean
+    /// "checkpoint not readable / upgrade required" message.
+    #[error("checkpoint format version {found} is not in supported range 1..={supported_max}")]
+    UnsupportedVersion {
+        /// The version recorded in the file header.
+        found: u32,
+        /// The highest version this build understands.
+        supported_max: u32,
+    },
+
+    /// The file's framing is internally consistent (magic, version) but
+    /// the body length is shorter than the version's minimum, or
+    /// truncated mid-field.
+    #[error("checkpoint is truncated or malformed: {reason}")]
+    Truncated {
+        /// Human-readable detail naming which field overran.
+        reason: String,
+    },
+
+    /// The body checksum recorded in the header does not match the
+    /// computed checksum of the body bytes — the file has been
+    /// corrupted on disk or in transit.
+    #[error(
+        "checkpoint body checksum mismatch (header {expected:#018x}, computed {computed:#018x})"
+    )]
+    BodyChecksumMismatch {
+        /// Checksum the header recorded.
+        expected: u64,
+        /// Checksum we computed over the body bytes we read.
+        computed: u64,
+    },
+
+    /// A `Vec<u8>`-prefixed UTF-8 field failed to decode.
+    #[error("checkpoint field {field} is not valid utf-8")]
+    InvalidUtf8 {
+        /// Name of the field that failed to decode.
+        field: &'static str,
+        /// Underlying conversion error.
+        #[source]
+        source: std::string::FromUtf8Error,
+    },
+
+    /// A discriminant byte (`SinkState` tag) had an unknown value.
+    #[error("checkpoint field {field} has unknown enum tag {tag}")]
+    InvalidEnumTag {
+        /// Name of the field whose tag was unknown.
+        field: &'static str,
+        /// The unknown tag value.
+        tag: u8,
+    },
+
+    /// A boolean-coded presence byte (etag / last-modified) was neither
+    /// `0` nor `1`.
+    #[error("checkpoint field {field} presence byte {value} is not a valid boolean")]
+    InvalidPresence {
+        /// Name of the field whose presence byte was invalid.
+        field: &'static str,
+        /// The byte we observed.
+        value: u8,
+    },
+
+    /// `internal/PLAN_download_modes.md` §5: the on-disk checkpoint
+    /// declares a [`RunMode`] that disagrees with the current run's
+    /// mode. Resume would silently lose progress (or attempt the
+    /// wrong cleanup), so the resume path surfaces this as a hard
+    /// error.
+    #[error(
+        "checkpoint was written by mode `{old}` but current run uses mode `{new}`; \
+         re-run with the matching flag or delete the .peel.ckpt file to start over"
+    )]
+    ModeMismatch {
+        /// The mode recorded in the on-disk checkpoint.
+        old: RunMode,
+        /// The mode the current invocation is running under.
+        new: RunMode,
+    },
+
+    /// `internal/old/PLAN_local_file_extract.md` §5: the local
+    /// destructive-mode resume path detected drift between the
+    /// checkpoint's view of the source archive and the file
+    /// currently on disk — either the source path moved, its
+    /// length changed, or its `mtime` shifted. Silently
+    /// "resuming" against the wrong bytes would either feed the
+    /// decoder garbage or produce a byte-different output tree;
+    /// surface a hard error and let the user decide.
+    #[error(
+        "local-destructive resume rejected: source archive has changed since the \
+         checkpoint was written ({reason}); either restore the original archive at \
+         {expected_path} or delete the .peel.ckpt to start over (which will leave \
+         the partially-punched source unrecoverable)"
+    )]
+    SourceMismatch {
+        /// The source path the checkpoint expects.
+        expected_path: PathBuf,
+        /// Human-readable summary of the drift.
+        reason: String,
+    },
+
+    /// The file declares a `body_length` that exceeds the configured
+    /// safety cap. Defensive against pathological inputs.
+    #[error("checkpoint body length {found} exceeds safety cap {cap}")]
+    BodyTooLarge {
+        /// The declared body length.
+        found: u64,
+        /// The configured cap.
+        cap: u64,
+    },
+}
+
+/// In-flight [`crate::sink::TarSink`] parser state captured at a
+/// checkpoint, mirroring the live `TarSink::State` enum in a form that
+/// can be (de)serialized.
+///
+/// Stored inside [`SinkState::Tar`]'s `in_flight` field so a kill
+/// mid-member is resumable without requiring decoder block boundaries
+/// to coincide with tar member boundaries (a rare alignment for
+/// real-world `tar.lz4` archives like Polkachu's chain snapshots).
+///
+/// Deserialization rejects out-of-range fields (e.g. `header_filled >
+/// 512`, `padding > 511`) so a corrupt checkpoint can't drive the
+/// resumed sink into UB-adjacent states.
+#[derive(Debug, Clone, Eq, PartialEq)]
+pub struct TarSinkState {
+    /// Cumulative archive bytes the sink has consumed at the
+    /// checkpoint moment. Diagnostic only; the resumed sink rebuilds
+    /// its own counter from `state` and the resumed decoder's output.
+    pub archive_offset: u64,
+    /// Number of *consecutive* trailing zero blocks the sink has
+    /// observed leading up to the checkpoint. Tar uses two zero
+    /// blocks as the end-of-archive marker.
+    pub zero_blocks_seen: u8,
+    /// PAX `path=` override applying to the next non-PAX entry, if
+    /// any was buffered when the checkpoint fired.
+    pub pending_path: Option<String>,
+    /// PAX `size=` override applying to the next non-PAX entry, if
+    /// any.
+    pub pending_size: Option<u64>,
+    /// Link-target override (PAX `linkpath=` or a GNU `K` long-link)
+    /// applying to the next symlink / hard-link entry, if any was
+    /// buffered when the checkpoint fired. Serialized only from
+    /// [`FORMAT_VERSION_TAR_LINKPATH`] (v16) onward; older readers
+    /// reconstruct it as `None`.
+    pub pending_linkpath: Option<String>,
+    /// The parser's driving state.
+    pub state: TarMemberState,
+}
+
+/// Serializable companion of `crate::sink::tar::State`.
+///
+/// `Header` carries the partial 512-byte buffer accumulated so far so
+/// resume picks up reading the rest of it. `File` carries the path,
+/// remaining payload bytes, and remaining padding bytes — the resumed
+/// sink reopens the file at offset `total_size - remaining` and
+/// continues. `PaxData` and `LongName` carry their accumulator
+/// buffers. `Finished` is the terminal state.
+#[derive(Debug, Clone, Eq, PartialEq)]
+pub enum TarMemberState {
+    /// Buffering bytes toward the next 512-byte tar header. `filled`
+    /// is in `0..=512`; `buf` carries exactly the bytes received so
+    /// far (length == `filled`; the rest of the 512-byte block is
+    /// not stored).
+    Header {
+        /// Bytes already received toward the header.
+        filled: u32,
+        /// The bytes received so far (length == `filled`).
+        buf: Vec<u8>,
+    },
+    /// Mid-payload write to a regular file. The resumed sink reopens
+    /// `path` (relative to the extraction root), seeks to the
+    /// already-written offset, and continues.
+    File {
+        /// Bytes of file payload still to receive.
+        remaining: u64,
+        /// Bytes of trailing zero padding still to consume.
+        padding: u32,
+        /// Output path the sink is writing into, relative to the
+        /// extraction root.
+        path: String,
+        /// Original payload size declared by the tar header, used to
+        /// derive the resumed file's seek offset
+        /// (`total_size - remaining`).
+        total_size: u64,
+    },
+    /// Mid-PAX-extended-header read.
+    PaxData {
+        /// Bytes of PAX body still to receive.
+        remaining: u64,
+        /// Bytes of trailing zero padding still to consume.
+        padding: u32,
+        /// Accumulator for the PAX entry data so far.
+        buf: Vec<u8>,
+    },
+    /// Mid-GNU-long-name read.
+    LongName {
+        /// Bytes of body still to receive.
+        remaining: u64,
+        /// Bytes of trailing zero padding still to consume.
+        padding: u32,
+        /// Accumulator for the long path so far.
+        buf: Vec<u8>,
+        /// `true` for 'K' (long link target, discarded), `false` for
+        /// 'L' (long path, applied to the next entry).
+        is_link: bool,
+    },
+    /// End-of-archive marker observed; further bytes are an error.
+    Finished,
+}
+
+/// Maximum buffered data the v6 [`TarSinkState`] decoder will trust
+/// before [`Checkpoint::deserialize`] rejects with
+/// [`CheckpointError::Truncated`]. Bounds the allocation a hostile
+/// blob can trigger before the body checksum kicks in.
+const MAX_TAR_BUFFER_LEN: u32 = 16 * 1024;
+
+/// Tag for [`TarMemberState::Header`].
+const TAR_TAG_HEADER: u8 = 0;
+/// Tag for [`TarMemberState::File`].
+const TAR_TAG_FILE: u8 = 1;
+/// Tag for [`TarMemberState::PaxData`].
+const TAR_TAG_PAX: u8 = 2;
+/// Tag for [`TarMemberState::LongName`].
+const TAR_TAG_LONGNAME: u8 = 3;
+/// Tag for [`TarMemberState::Finished`].
+const TAR_TAG_FINISHED: u8 = 4;
+
+/// Sink-specific extraction state opaque to everything but the sink.
+///
+/// `Raw` and `Tar` are the two MVP sinks (see [`crate::sink`]); each
+/// carries the minimum state required to skip already-extracted output
+/// on resume:
+///
+/// - [`SinkState::Raw`] records bytes already written to the single
+///   output file, so resume seeks past them rather than redoing them.
+/// - [`SinkState::Tar`] records the in-flight parser state so resume
+///   picks up exactly where the killed run left off — including in
+///   the middle of a multi-MB tar member, which is the common case
+///   for archives whose decoder block boundaries don't align with
+///   tar-member boundaries.
+///
+/// The §10 coordinator captures the appropriate variant whenever the
+/// extractor reports a checkpoint.
+#[derive(Debug, Clone, Eq, PartialEq)]
+pub enum SinkState {
+    /// State for [`crate::sink::RawSink`].
+    Raw {
+        /// Total bytes successfully written to the output file at the
+        /// checkpoint moment. Resume seeks past `bytes_written` and
+        /// continues writing from there.
+        bytes_written: u64,
+    },
+
+    /// State for [`crate::sink::TarSink`].
+    Tar {
+        /// Tar member names already extracted at the checkpoint moment.
+        /// Vestigial: the streaming pipeline does not re-present prior
+        /// members on resume (the resumed decoder produces only the
+        /// archive suffix), so this list is empty in v6 producers and
+        /// is preserved only for v5-and-earlier on-disk compatibility.
+        members_completed: Vec<String>,
+        /// In-flight tar parser state, captured at the checkpoint
+        /// moment. `Some(...)` whenever the sink was mid-member (or
+        /// mid-header / mid-PAX / mid-LongName); `None` only when the
+        /// sink had just finished a member and was quiescent or fully
+        /// finished. The resumed sink restores this state directly
+        /// instead of starting from scratch — necessary for archive
+        /// shapes (e.g. Polkachu's single-frame `tar.lz4`) where
+        /// alignment between decoder block boundaries and tar member
+        /// boundaries is rare. Added in checkpoint format v6; older
+        /// readers see `None`.
+        in_flight: Option<TarSinkState>,
+    },
+
+    /// State for [`crate::sink::ZipSink`].
+    ///
+    /// ZIP archives are extracted per-entry in central-directory
+    /// order. The checkpoint records which entries are durable on
+    /// disk via `entries_completed`, and (when a crash interrupts an
+    /// entry) the in-flight entry index plus the byte offset within
+    /// it. STORED entries resume from `current_entry_offset`;
+    /// DEFLATE / zstd entries resume from `current_entry_offset` *and*
+    /// the codec's `current_entry_decoder_state` blob (Phase 9b of
+    /// `internal/PLAN_deflate_block_decoder.md`). When the blob is
+    /// `None` for a DEFLATE / zstd entry — either because the
+    /// checkpoint was captured at byte 0 or the v6 reader couldn't
+    /// see it — the pipeline falls back to "restart entry from byte
+    /// 0", matching the pre-Phase-9b behaviour.
+    Zip {
+        /// Indices (within the central directory) of entries that
+        /// finished extracting before this checkpoint was written.
+        /// Ordered, deduplicated in the producer; the on-disk form
+        /// trusts the producer rather than re-checking on read.
+        entries_completed: Vec<u32>,
+        /// Index of the entry that was in flight when the checkpoint
+        /// was written, if any. `None` means the sink was quiescent.
+        current_entry: Option<u32>,
+        /// Bytes already written into the in-flight entry. `0` when
+        /// `current_entry` is `None`.
+        current_entry_offset: u64,
+        /// Opaque decoder-state blob captured at the most recent
+        /// in-entry checkpoint. `None` when the in-flight entry is
+        /// at byte 0, when the entry uses STORED (no codec state),
+        /// or when the checkpoint was written by a pre-v7 binary.
+        /// Added in checkpoint format v7; v6 readers see `None` and
+        /// fall through to the per-entry "restart from byte 0" path.
+        current_entry_decoder_state: Option<Vec<u8>>,
+    },
+
+    /// State for [`crate::sink::RarSink`] (added in v10 of the
+    /// format, `internal/PLAN_rar.md` §3).
+    ///
+    /// RAR5 archives are extracted entry-by-entry in archive
+    /// order. The checkpoint records which entries are durable on
+    /// disk via `entries_completed`, and (when a crash interrupts
+    /// an entry) the in-flight entry index plus the byte offset
+    /// within it. STORED entries (round-one §3) resume from
+    /// `current_entry_offset`; compressed entries (round-one §4 /
+    /// `PLAN_rar5_decoder.md` §F1) resume from
+    /// `current_entry_offset` *plus* the
+    /// `current_entry_decoder_state` blob — together those two
+    /// fields let the next run pick up the in-flight entry
+    /// without restarting from byte 0.
+    Rar {
+        /// Indices (in archive order) of entries that finished
+        /// extracting before this checkpoint was written. Ordered
+        /// and deduplicated by the producer.
+        entries_completed: Vec<u32>,
+        /// Index of the entry that was in flight when the
+        /// checkpoint was written, if any. `None` means the sink
+        /// was quiescent.
+        current_entry: Option<u32>,
+        /// Bytes already written into the in-flight entry. `0`
+        /// when `current_entry` is `None`.
+        current_entry_offset: u64,
+        /// Opaque decoder-state blob captured at the most recent
+        /// in-entry checkpoint. For RAR5 archives this is a
+        /// serialized
+        /// [`crate::decode::rar_native::RarStreamDecoder`] snapshot
+        /// (`PLAN_rar5_decoder.md` §F1); for legacy (RAR3/RAR4)
+        /// archives it is a serialized
+        /// [`crate::decode::rar_legacy::RarLegacyStreamDecoder`]
+        /// snapshot (`PLAN_rar3.md` §F1). The two formats are
+        /// distinguished by their leading 4-byte magic (`RR5S`
+        /// vs. `RR3S`), so a checkpoint's blob is always routable
+        /// back to the decoder that produced it. `None` when:
+        ///
+        /// - the in-flight entry uses STORED (no decoder state to
+        ///   capture; resume re-reads the on-disk prefix);
+        /// - the in-flight entry is at byte 0 (no work to resume);
+        /// - the checkpoint was written by a v1..=v10 binary
+        ///   (the field didn't exist yet).
+        ///
+        /// When `None` for a compressed entry the resume path
+        /// truncates the on-disk file to byte 0 and re-extracts —
+        /// matching the §E1 fallback behaviour.
+        current_entry_decoder_state: Option<Vec<u8>>,
+    },
+
+    /// State for [`crate::sink::SevenzSink`] (added in v9 of the
+    /// format, `internal/PLAN_7z_support.md` §9).
+    ///
+    /// 7z archives are extracted folder-by-folder in archive
+    /// order. The checkpoint records which folders are durable on
+    /// disk in `folders_completed`; when a crash interrupts a
+    /// folder, `current_folder` names it. Round-one resume
+    /// restarts the in-flight folder from byte 0 (mid-folder
+    /// resume is `O.32c` in `OPTIMIZATIONS.md` and depends on
+    /// `xz_liblzma::resume`'s sliding-window snapshot machinery).
+    Sevenz {
+        /// Folder indices (in archive order) that finished
+        /// extracting before this checkpoint was written.
+        folders_completed: Vec<u32>,
+        /// Index of the folder that was in flight when the
+        /// checkpoint was written, if any. `None` means the sink
+        /// was quiescent (between folders).
+        current_folder: Option<u32>,
+    },
+}
+
+/// One logical part of a multi-URL split source
+/// (`internal/PLAN_multi_url_source.md` §5). Single-URL runs serialize a
+/// one-element [`Checkpoint::parts`] vec whose only entry mirrors the
+/// legacy `(url, etag, last_modified, total_size)` fields; multi-URL
+/// runs serialize one record per part.
+#[derive(Debug, Clone, Eq, PartialEq)]
+pub struct PartRecord {
+    /// URL the part is fetched from, verbatim from the CLI's
+    /// positional arguments.
+    pub url: String,
+    /// `Content-Length` of this part. The full source size is
+    /// `parts.iter().map(|p| p.size).sum()` and equals
+    /// [`Checkpoint::total_size`].
+    pub size: u64,
+    /// `ETag` recorded at this part's `HEAD` time, if the server
+    /// sent one. Each part has its own — distinct objects need not
+    /// agree on `ETag`.
+    pub etag: Option<String>,
+    /// `Last-Modified` recorded at this part's `HEAD` time, if the
+    /// server sent one.
+    pub last_modified: Option<String>,
+    /// User-supplied SHA-256 digest for this part, if any. Verified
+    /// at the part-end boundary by the
+    /// [`crate::hash::IntegrityHasher`] state machine.
+    pub expected_sha256: Option<[u8; crate::hash::sha256::DIGEST_LEN]>,
+    /// Multi-volume archive role this part plays, if any
+    /// (`internal/PLAN_multivolume_archives.md` §5).
+    ///
+    /// `None` is the linear byte-concat shape — every single-URL
+    /// run, every multi-URL run that byte-concatenates into a tar
+    /// (`internal/PLAN_multi_url_source.md`), and every checkpoint
+    /// written by a pre-v14 binary.
+    ///
+    /// `Some(role)` identifies which multi-volume format this
+    /// part is one volume of, so a resume can refuse to silently
+    /// stitch the wrong volume set together. Added in checkpoint
+    /// format v14; v13-and-earlier readers see `None`. The on-
+    /// disk header bumps to v14 only when at least one part has
+    /// `Some(role)` — runs whose parts are all `None` keep
+    /// writing the pre-v14 layout byte-identically so existing
+    /// crash-resume sidecar-size assertions hold.
+    pub volume_role: Option<VolumeRole>,
+}
+
+/// Active-part hasher snapshot stored in [`Checkpoint::hash_state`]
+/// (`internal/PLAN_multi_url_source.md` §5).
+///
+/// `active_part_idx` is the part the saved hasher state is partway
+/// through; `bytes` is the output of
+/// [`crate::hash::sha256::Sha256::serialize`] for that mid-stream
+/// state. Single-URL checkpoints always record `active_part_idx = 0`;
+/// multi-URL checkpoints record the actual active part so resume
+/// rebuilds the [`crate::hash::IntegrityHasher`] state machine without
+/// re-verifying earlier parts.
+#[derive(Debug, Clone, Eq, PartialEq)]
+pub struct HashState {
+    /// Index into [`Checkpoint::parts`] identifying the part the
+    /// saved hasher is mid-way through.
+    pub active_part_idx: u32,
+    /// Serialized [`crate::hash::sha256::Sha256`] state for that
+    /// part's in-flight bytes.
+    pub bytes: [u8; crate::hash::sha256::SERIALIZED_LEN],
+}
+
+/// On-disk checkpoint of a download+extraction in progress.
+///
+/// All fields are owned values — there are no borrows so the struct is
+/// `Send` and the coordinator can shuttle it between threads.
+#[derive(Debug, Clone, Eq, PartialEq)]
+pub struct Checkpoint {
+    /// The URL the download is fetching from. Stored verbatim so the
+    /// resume path can compare against the URL the user passed on the
+    /// CLI. For multi-URL runs (`internal/PLAN_multi_url_source.md`) this
+    /// mirrors `parts[0].url` and the full per-part list lives in
+    /// [`Self::parts`].
+    pub url: String,
+    /// `ETag` recorded at the initial `HEAD` time, if the server sent
+    /// one. For multi-URL runs this mirrors `parts[0].etag`.
+    pub etag: Option<String>,
+    /// `Last-Modified` recorded at the initial `HEAD` time, if the
+    /// server sent one. For multi-URL runs this mirrors
+    /// `parts[0].last_modified`.
+    pub last_modified: Option<String>,
+    /// Per-part record list (`internal/PLAN_multi_url_source.md` §5).
+    /// Always at least one element. Single-URL runs carry a
+    /// one-element vec mirroring the `url`/`etag`/`last_modified`
+    /// fields above; multi-URL runs carry one record per
+    /// positional URL passed on the CLI.
+    ///
+    /// Added in checkpoint format v8. v7 readers synthesize a
+    /// one-element vec from the legacy fields on read so older
+    /// checkpoints resume cleanly.
+    pub parts: Vec<PartRecord>,
+    /// Total source size in bytes (from `Content-Length`).
+    pub total_size: u64,
+    /// Chunk size the scheduler used to slice the source.
+    pub chunk_size: u64,
+    /// Most recent decoder cursor durably reachable from this
+    /// checkpoint. Resume rewinds the decoder to this position.
+    pub decoder_position: ByteOffset,
+    /// Serialized chunk completion bitmap as raw bytes. The
+    /// coordinator reconstructs a [`crate::bitmap::ChunkBitmap`] from
+    /// these bytes plus `total_size / chunk_size`.
+    pub bitmap_completed: Vec<u8>,
+    /// Wall-clock time the checkpoint was written. Diagnostic only —
+    /// the resume path uses ETag/Last-Modified to validate freshness.
+    pub created_at: SystemTime,
+    /// Sink-specific state captured at the same instant the checkpoint
+    /// was taken.
+    pub sink_state: SinkState,
+    /// Active-part [`crate::hash::IntegrityHasher`] state when
+    /// integrity tracking is on (`internal/PLAN_v2.md` §10 and
+    /// `internal/PLAN_multi_url_source.md` §5), or `None` when the run
+    /// is not verifying a `--sha256` digest.
+    ///
+    /// `bytes` are the output of
+    /// [`crate::hash::sha256::Sha256::serialize`] for the active
+    /// part's mid-stream hasher; `active_part_idx` identifies which
+    /// part those bytes are mid-way through. Single-URL runs always
+    /// store `active_part_idx = 0`; multi-URL runs record the
+    /// current part so resume rebuilds the state machine without
+    /// re-verifying parts already finalized.
+    ///
+    /// Added in v3 (active_part_idx field added in v8). v7 and
+    /// earlier readers parse the legacy single-part shape and lift
+    /// it into `active_part_idx = 0` on the way out.
+    pub hash_state: Option<HashState>,
+    /// Per-bitmap-chunk CRC-32C fingerprints (`PLAN_v2.md` §11)
+    /// captured by the download workers, or `None` when the §11
+    /// drift detector is off (or the checkpoint predates v4).
+    ///
+    /// Length, when `Some`, equals the chunk count implied by
+    /// `total_size / chunk_size`. Workers populate the slot for
+    /// each completed chunk as they record CRCs; an unset slot
+    /// (chunk not yet downloaded) holds `0`. Coordinator's resume
+    /// path uses the populated slots to verify the source has not
+    /// changed since the checkpoint was written.
+    pub chunk_crc32c: Option<Vec<u32>>,
+    /// Opaque per-decoder resume state captured by the extractor at
+    /// the same step the boundary advanced
+    /// (`internal/OPTIMIZATIONS.md` §O.7b). Today this is populated by
+    /// `lz4` for mid-frame block boundaries; every other in-tree
+    /// decoder reports `None`. The bytes are decoder-private — the
+    /// checkpoint format treats the blob as opaque and only enforces
+    /// the [`MAX_DECODER_STATE_LEN`] length cap on decode. Added in
+    /// checkpoint format v5; older readers see `None`.
+    pub decoder_state: Option<Vec<u8>>,
+    /// `internal/PLAN_download_modes.md` §5: which top-level mode this
+    /// checkpoint was written by. Added in checkpoint format v12;
+    /// pre-v12 readers synthesize [`RunMode::Extract`]. Resume
+    /// surfaces [`CheckpointError::ModeMismatch`] when the prior
+    /// mode and the current run's mode disagree.
+    pub mode: RunMode,
+
+    /// `internal/old/PLAN_local_file_extract.md` §5: the source archive's
+    /// `mtime` at the moment the checkpoint was written. Populated
+    /// only when [`Self::mode`] is [`RunMode::LocalDestructive`];
+    /// [`None`] for every other mode and for pre-v13 checkpoints
+    /// (the on-disk trailer is omitted entirely on the
+    /// byte-identical fallback path). The resume path compares
+    /// this against the current source's mtime so a same-size
+    /// swap between runs surfaces a typed
+    /// [`CheckpointError::SourceMismatch`] before any decoder
+    /// state restores from a stale blob.
+    pub source_mtime: Option<SystemTime>,
+
+    /// Total wall-clock time spent on this operation, accumulated
+    /// across every run that has written to this checkpoint. The
+    /// coordinator seeds this from the prior checkpoint on resume
+    /// (or [`Duration::ZERO`] for a fresh run) and writes
+    /// `prior + (now - run_start)` at every observer-driven
+    /// checkpoint, so a long-running operation killed and resumed
+    /// many times still reports a coherent "total time to
+    /// complete" in the final `[done]` line.
+    ///
+    /// Added in checkpoint format v15. Pre-v15 readers default to
+    /// [`Duration::ZERO`] (the value is also written as
+    /// byte-identical-with-v14 when zero, so sample checkpoints
+    /// and tests that don't care about wall-clock keep their
+    /// existing on-disk shape).
+    pub cumulative_elapsed: Duration,
+}
+
+/// Maximum body length [`Checkpoint::deserialize`] will trust before
+/// returning [`CheckpointError::BodyTooLarge`]. Defensive: the bitmap
+/// scales linearly with the chunk count, so for `u32::MAX` chunks
+/// that's ~512 MiB; we leave headroom and cap at 1 GiB.
+pub const MAX_BODY_LEN: u64 = 1 << 30;
+
+impl Checkpoint {
+    /// Serialize the checkpoint to its on-disk binary representation.
+    ///
+    /// This is the in-memory companion to [`Self::write`]. Tests round
+    /// trip through this pair without touching the filesystem.
+    #[must_use]
+    pub fn serialize(&self) -> Vec<u8> {
+        // Default writer: copy the decoder_state field's bytes
+        // verbatim. The hot path
+        // (`PLAN_checkpoint_blob_dedup.md` Phase 2) calls
+        // `serialize_with` instead so the decoder writes the
+        // blob bytes directly into the body buffer with one
+        // memcpy.
+        let hint = self.decoder_state.as_ref().map_or(0, Vec::len);
+        self.serialize_with(hint, |out| match &self.decoder_state {
+            Some(blob) => {
+                out.extend_from_slice(blob);
+                true
+            }
+            None => false,
+        })
+    }
+
+    /// Serialize, but populate the `decoder_state` field by
+    /// invoking `write_decoder_state` to append bytes directly into
+    /// the body buffer.
+    ///
+    /// The closure should append a complete resume blob and return
+    /// `true`, or leave `out` untouched and return `false`. Length
+    /// prefix and presence byte are managed by the caller (this
+    /// function); the closure only writes the blob payload bytes.
+    /// The appended length is capped at [`MAX_DECODER_STATE_LEN`];
+    /// excess bytes are discarded with a `truncate`.
+    ///
+    /// `decoder_state_size_hint` lets the caller pre-reserve body
+    /// capacity so the closure's `extend_from_slice` of ~9 MiB
+    /// (xz_native) does not pay amortized-doubling memcpies as
+    /// the Vec grows from 0 to its final size. Pass `0` if no
+    /// upper bound is known; the caller then absorbs the growth
+    /// cost of the Vec doublings.
+    ///
+    /// Wire-format equivalence with [`Self::serialize`] is
+    /// pinned by the round-trip tests.
+    /// `PLAN_checkpoint_blob_dedup.md` Phase 2.
+    pub fn serialize_with<F>(
+        &self,
+        decoder_state_size_hint: usize,
+        write_decoder_state: F,
+    ) -> Vec<u8>
+    where
+        F: FnOnce(&mut Vec<u8>) -> bool,
+    {
+        let mut body = Vec::with_capacity(
+            self.estimated_body_size()
+                .saturating_add(decoder_state_size_hint),
+        );
+        // v8 (`internal/PLAN_multi_url_source.md` §5): write the parts
+        // vec at the top instead of the legacy `(url, etag,
+        // last_modified)` trio. Construction sites that built a
+        // [`Checkpoint`] by hand without populating `parts` get a
+        // synthesized one-element vec mirroring the legacy fields,
+        // so single-URL callers do not have to migrate their
+        // literals all at once.
+        let synthesized_parts: Vec<PartRecord>;
+        let parts_ref: &[PartRecord] = if self.parts.is_empty() {
+            synthesized_parts = vec![PartRecord {
+                url: self.url.clone(),
+                size: self.total_size,
+                etag: self.etag.clone(),
+                last_modified: self.last_modified.clone(),
+                expected_sha256: None,
+                volume_role: None,
+            }];
+            &synthesized_parts
+        } else {
+            &self.parts
+        };
+        // v14: write a per-part volume_role trailer when the
+        // on-disk version is v14 or higher. Writing it uniformly
+        // across every part (rather than only the populated ones)
+        // keeps the read loop's shape fixed: at v14 the reader
+        // always expects exactly one presence byte per part. The
+        // trailer fires whenever `required_format_version() >=
+        // 14`, which covers both "at least one part has Some(role)"
+        // (the original v14 trigger) AND "a later trailer like v15
+        // `cumulative_elapsed` has bumped the on-disk version past
+        // 14." When every part is `None` AND the on-disk version
+        // is below v14, the writer falls back to the v8..=v13
+        // layout byte-identically.
+        let on_disk_version = self.required_format_version();
+        let write_volume_role_trailer = on_disk_version >= FORMAT_VERSION_MULTIVOLUME;
+        let parts_count = u32::try_from(parts_ref.len()).unwrap_or(u32::MAX);
+        write_u32(&mut body, parts_count);
+        for part in parts_ref.iter().take(parts_count as usize) {
+            write_string(&mut body, &part.url);
+            write_u64(&mut body, part.size);
+            write_optional_string(&mut body, part.etag.as_deref());
+            write_optional_string(&mut body, part.last_modified.as_deref());
+            match &part.expected_sha256 {
+                Some(digest) => {
+                    body.push(1);
+                    body.extend_from_slice(digest);
+                }
+                None => body.push(0),
+            }
+            if write_volume_role_trailer {
+                match part.volume_role {
+                    Some(role) => {
+                        body.push(1);
+                        body.push(role.to_tag());
+                    }
+                    None => body.push(0),
+                }
+            }
+        }
+        write_u64(&mut body, self.total_size);
+        write_u64(&mut body, self.chunk_size);
+        write_u64(&mut body, self.decoder_position.get());
+        write_byte_array(&mut body, &self.bitmap_completed);
+
+        let (secs, nanos) = encode_system_time(self.created_at);
+        write_i64(&mut body, secs);
+        write_u32(&mut body, nanos);
+
+        match &self.sink_state {
+            SinkState::Raw { bytes_written } => {
+                body.push(SINK_TAG_RAW);
+                write_u64(&mut body, *bytes_written);
+            }
+            SinkState::Tar {
+                members_completed,
+                in_flight,
+            } => {
+                body.push(SINK_TAG_TAR);
+                // u32::try_from is the right boundary check; in practice the
+                // checkpoint is bounded long before this could overflow.
+                let count = u32::try_from(members_completed.len()).unwrap_or(u32::MAX);
+                write_u32(&mut body, count);
+                for name in members_completed.iter().take(count as usize) {
+                    write_string(&mut body, name);
+                }
+                // v6: optional in-flight tar parser state.
+                match in_flight {
+                    Some(s) => {
+                        body.push(1);
+                        write_tar_sink_state(&mut body, s, on_disk_version);
+                    }
+                    None => body.push(0),
+                }
+            }
+            SinkState::Zip {
+                entries_completed,
+                current_entry,
+                current_entry_offset,
+                current_entry_decoder_state,
+            } => {
+                body.push(SINK_TAG_ZIP);
+                let count = u32::try_from(entries_completed.len()).unwrap_or(u32::MAX);
+                write_u32(&mut body, count);
+                for idx in entries_completed.iter().take(count as usize) {
+                    write_u32(&mut body, *idx);
+                }
+                match current_entry {
+                    Some(idx) => {
+                        body.push(1);
+                        write_u32(&mut body, *idx);
+                    }
+                    None => body.push(0),
+                }
+                write_u64(&mut body, *current_entry_offset);
+                // v7: optional in-flight codec state blob. v6
+                // readers stop at the previous field and see the
+                // blob as absent, which matches the field's default.
+                match current_entry_decoder_state {
+                    Some(blob) => {
+                        body.push(1);
+                        let len = u32::try_from(blob.len()).unwrap_or(u32::MAX);
+                        write_u32(&mut body, len);
+                        body.extend_from_slice(&blob[..len as usize]);
+                    }
+                    None => body.push(0),
+                }
+            }
+            SinkState::Sevenz {
+                folders_completed,
+                current_folder,
+            } => {
+                body.push(SINK_TAG_SEVENZ);
+                let count = u32::try_from(folders_completed.len()).unwrap_or(u32::MAX);
+                write_u32(&mut body, count);
+                for idx in folders_completed.iter().take(count as usize) {
+                    write_u32(&mut body, *idx);
+                }
+                match current_folder {
+                    Some(idx) => {
+                        body.push(1);
+                        write_u32(&mut body, *idx);
+                    }
+                    None => body.push(0),
+                }
+            }
+            SinkState::Rar {
+                entries_completed,
+                current_entry,
+                current_entry_offset,
+                current_entry_decoder_state,
+            } => {
+                body.push(SINK_TAG_RAR);
+                let count = u32::try_from(entries_completed.len()).unwrap_or(u32::MAX);
+                write_u32(&mut body, count);
+                for idx in entries_completed.iter().take(count as usize) {
+                    write_u32(&mut body, *idx);
+                }
+                match current_entry {
+                    Some(idx) => {
+                        body.push(1);
+                        write_u32(&mut body, *idx);
+                    }
+                    None => body.push(0),
+                }
+                write_u64(&mut body, *current_entry_offset);
+                // v11: optional in-flight decoder state blob.
+                // Skipped entirely (no presence byte) when the
+                // blob is `None` AND the on-disk version stays
+                // below v11 — that keeps STORED-only RAR
+                // checkpoints byte-identical to the v10 layout
+                // so older readers parse them transparently and
+                // tight crash-resume tests keyed off checkpoint
+                // sidecar size do not see a drift. As soon as
+                // anything bumps the on-disk version past v10 —
+                // either a populated blob OR a later trailer like
+                // the v15 `cumulative_elapsed` — the presence byte
+                // must be written even for a `None` blob, because
+                // the v11+ reader unconditionally reads it.
+                if on_disk_version >= FORMAT_VERSION_RAR_F1 {
+                    match current_entry_decoder_state {
+                        Some(blob) => {
+                            body.push(1);
+                            let len = u32::try_from(blob.len()).unwrap_or(u32::MAX);
+                            write_u32(&mut body, len);
+                            body.extend_from_slice(&blob[..len as usize]);
+                        }
+                        None => body.push(0),
+                    }
+                }
+            }
+        }
+
+        match &self.hash_state {
+            Some(state) => {
+                body.push(1);
+                write_u32(&mut body, state.active_part_idx);
+                body.extend_from_slice(&state.bytes);
+            }
+            None => body.push(0),
+        }
+
+        match &self.chunk_crc32c {
+            Some(crcs) => {
+                body.push(1);
+                let count = u32::try_from(crcs.len()).unwrap_or(u32::MAX);
+                write_u32(&mut body, count);
+                for crc in crcs.iter().take(count as usize) {
+                    write_u32(&mut body, *crc);
+                }
+            }
+            None => body.push(0),
+        }
+
+        // Reserve the presence byte + length placeholder, run the
+        // closure to append the blob bytes, then backpatch length
+        // (or rewind if the closure declined).
+        //
+        // Two-pass writing avoids the previous Vec→clone→extend
+        // chain: the closure (in the streaming-pipeline observer)
+        // passes `body` straight to the decoder's
+        // `decoder_state_into`, so the dict bytes flow ring →
+        // body with one memcpy. `PLAN_checkpoint_blob_dedup.md`
+        // Phase 2.
+        let presence_pos = body.len();
+        body.push(1);
+        let len_pos = body.len();
+        write_u32(&mut body, 0);
+        let bytes_start = body.len();
+        let wrote = write_decoder_state(&mut body);
+        if wrote {
+            let written = body.len() - bytes_start;
+            // Encode-side cap mirrors the decode-side cap; a
+            // longer blob would round-trip but the cap on read
+            // would reject it, which would be confusing.
+            let capped = u32::try_from(written)
+                .unwrap_or(u32::MAX)
+                .min(MAX_DECODER_STATE_LEN);
+            if (capped as usize) < written {
+                body.truncate(bytes_start + capped as usize);
+            }
+            body[len_pos..len_pos + 4].copy_from_slice(&capped.to_le_bytes());
+        } else {
+            // Closure didn't append anything; rewrite the slot as
+            // "absent" (a single 0 byte) and drop the length
+            // placeholder.
+            body.truncate(presence_pos);
+            body.push(0);
+        }
+
+        // v12 (`internal/PLAN_download_modes.md` §5): the `mode` tag is
+        // written whenever the on-disk version is v12 or higher.
+        // For a default-mode (`Extract`) checkpoint with no later
+        // trailers (cumulative_elapsed = ZERO, etc.) the
+        // `required_format_version` rule keeps the on-disk version
+        // below v12, so the tag is omitted and the v10/v11
+        // byte-identical layout is preserved. As soon as a later
+        // trailer (e.g. the v15 `cumulative_elapsed`) bumps the
+        // on-disk version past v12, the mode tag MUST be present
+        // because the v12 reader's `remaining() > 0` heuristic
+        // would otherwise interpret the next trailer's first byte
+        // as a mode tag.
+        if on_disk_version >= FORMAT_VERSION_RUN_MODE {
+            body.push(self.mode.to_tag());
+        }
+
+        // v13 (`internal/old/PLAN_local_file_extract.md` §5): the
+        // `source_mtime` trailer is written only for
+        // [`RunMode::LocalDestructive`]. Layout: a single
+        // presence byte, then (if present) an 8-byte i64
+        // seconds-since-epoch + 4-byte u32 sub-second nanos —
+        // same shape `created_at` uses.
+        if self.mode == RunMode::LocalDestructive {
+            match self.source_mtime {
+                Some(t) => {
+                    body.push(1);
+                    let (secs, nanos) = encode_system_time(t);
+                    write_i64(&mut body, secs);
+                    write_u32(&mut body, nanos);
+                }
+                None => body.push(0),
+            }
+        }
+
+        // v15: the `cumulative_elapsed` trailer is written when
+        // (and only when) the value is non-zero. Layout: 8-byte
+        // u64 whole-seconds + 4-byte u32 sub-second nanos. The
+        // `required_format_version` rule above bumps the on-disk
+        // header to 15 in lockstep so older readers cleanly
+        // reject the bumped checkpoint instead of misparsing the
+        // trailing 12 bytes. ZERO-valued checkpoints (sample /
+        // test fixtures and short-lived runs that never crossed a
+        // checkpoint observer) keep the v8..=v14 byte-identical
+        // shape.
+        if self.cumulative_elapsed != Duration::ZERO {
+            write_u64(&mut body, self.cumulative_elapsed.as_secs());
+            write_u32(&mut body, self.cumulative_elapsed.subsec_nanos());
+        }
+
+        let body_len = body.len() as u64;
+        let body_checksum = fnv1a64(&body);
+
+        let mut buf = Vec::with_capacity(HEADER_LEN + body.len());
+        buf.extend_from_slice(&MAGIC);
+        write_u32(&mut buf, self.required_format_version());
+        write_u64(&mut buf, body_len);
+        write_u64(&mut buf, body_checksum);
+        buf.extend_from_slice(&body);
+        buf
+    }
+
+    /// Compute the minimum on-disk `format_version` that fully
+    /// captures this checkpoint's payload. The serialize path
+    /// writes this dynamically so a checkpoint whose body fits
+    /// in an older format's wire layout produces byte-identical
+    /// output to that older format. Currently only the §F1
+    /// `SinkState::Rar` variant has a conditional v11-vs-v10
+    /// path; every other variant writes its baseline version
+    /// (v9 for `Sevenz`, v10 for `Rar` STORED-only, etc.) and
+    /// the surrounding fields decide whether v11 is required.
+    fn required_format_version(&self) -> u32 {
+        // The §F1 SinkState::Rar-with-decoder-state path used to be
+        // the high-water mark (FORMAT_VERSION = 11). Subsequent
+        // bumps (v12 RunMode, v13 source_mtime, v14 volume_role,
+        // v15 cumulative_elapsed) layer on top. The
+        // `FORMAT_VERSION_RAR_F1` constant is now at module scope
+        // because the serializer's SinkState::Rar arm references it
+        // to decide whether to emit the presence byte (see the
+        // serialize_with comment for why the writer can no longer
+        // skip the byte purely on `decoder_state == None`).
+        // v12 (`internal/PLAN_download_modes.md` §5): a non-default
+        // `mode` forces v12. v13 (`internal/old/PLAN_local_file_extract.md`
+        // §5): a [`RunMode::LocalDestructive`] run forces v13
+        // because the `source_mtime` trailer requires a reader
+        // that knows to parse it. Take the max of the mode-driven
+        // floor and the sink-state-dictated version so a future
+        // `LocalDestructive` run with a `SinkState::Rar` carrying
+        // a decoder-state blob writes a single coherent header.
+        let mode_version = match self.mode {
+            RunMode::Extract => 0,
+            RunMode::NoExtract | RunMode::KeepArchive => FORMAT_VERSION_RUN_MODE,
+            RunMode::LocalDestructive => FORMAT_VERSION_LOCAL_DESTRUCTIVE,
+        };
+        let sink_version = match &self.sink_state {
+            SinkState::Rar {
+                current_entry_decoder_state: Some(_),
+                ..
+            } => FORMAT_VERSION_RAR_F1,
+            _ => FORMAT_VERSION_RAR_STORED_ONLY,
+        };
+        // v14 (`internal/PLAN_multivolume_archives.md` §5): any part
+        // carrying a non-`None` [`VolumeRole`] forces v14 so the
+        // reader's `format_version >= 14` dispatch picks up the
+        // per-part trailer. The synthesized one-element fallback
+        // path (`self.parts.is_empty()` in serialize_with) never
+        // populates a role, so it cannot drive this bump on its
+        // own — only an explicitly populated `parts` vec can.
+        let parts_version = if self.parts.iter().any(|p| p.volume_role.is_some()) {
+            FORMAT_VERSION_MULTIVOLUME
+        } else {
+            0
+        };
+        // v15: a non-zero cumulative_elapsed value requires a v15
+        // trailer so the reader's `format_version >= 15` dispatch
+        // picks up the duration. ZERO keeps the on-disk shape
+        // byte-identical with v14 (no trailer written).
+        let elapsed_version = if self.cumulative_elapsed != Duration::ZERO {
+            FORMAT_VERSION_CUMULATIVE_ELAPSED
+        } else {
+            0
+        };
+        // v16: a buffered tar symlink / hard-link target override
+        // forces v16 so the reader's `format_version >= 16` dispatch
+        // picks up the extra `pending_linkpath` field. A `None`
+        // override (every quiescent / mid-file / mid-PAX checkpoint
+        // that does not sit between a `K`/`linkpath` header and its
+        // link entry) keeps the v6..=v15 tar layout.
+        let linkpath_version = match &self.sink_state {
+            SinkState::Tar {
+                in_flight: Some(s), ..
+            } if s.pending_linkpath.is_some() => FORMAT_VERSION_TAR_LINKPATH,
+            _ => 0,
+        };
+        mode_version
+            .max(sink_version)
+            .max(parts_version)
+            .max(elapsed_version)
+            .max(linkpath_version)
+    }
+
+    /// Parse a checkpoint from its on-disk binary representation.
+    ///
+    /// # Errors
+    ///
+    /// Returns the appropriate [`CheckpointError`] variant on any
+    /// framing, version, checksum, or field-decode failure. The
+    /// function never panics on adversarial input.
+    pub fn deserialize(bytes: &[u8]) -> Result<Self, CheckpointError> {
+        if bytes.len() < HEADER_LEN {
+            return Err(CheckpointError::Truncated {
+                reason: format!(
+                    "expected at least {HEADER_LEN}-byte header, got {}",
+                    bytes.len(),
+                ),
+            });
+        }
+
+        let mut found_magic = [0u8; 8];
+        found_magic.copy_from_slice(&bytes[0..8]);
+        if found_magic != MAGIC {
+            return Err(CheckpointError::BadMagic { found: found_magic });
+        }
+
+        let format_version = read_u32(&bytes[8..12]);
+        // Version 0 has never existed; reject it explicitly so the
+        // body-layout dispatch below (which assumes 1..=FORMAT_VERSION)
+        // is unreachable on adversarial input. Found by `cargo fuzz`
+        // target `checkpoint_deserialize`.
+        if format_version == 0 || format_version > FORMAT_VERSION {
+            return Err(CheckpointError::UnsupportedVersion {
+                found: format_version,
+                supported_max: FORMAT_VERSION,
+            });
+        }
+
+        let body_len = read_u64(&bytes[12..20]);
+        if body_len > MAX_BODY_LEN {
+            return Err(CheckpointError::BodyTooLarge {
+                found: body_len,
+                cap: MAX_BODY_LEN,
+            });
+        }
+        let body_checksum_header = read_u64(&bytes[20..28]);
+
+        let body_start = HEADER_LEN;
+        let body_end = body_start
+            .checked_add(
+                usize::try_from(body_len).map_err(|_| CheckpointError::Truncated {
+                    reason: format!("body_length {body_len} does not fit in usize"),
+                })?,
+            )
+            .ok_or_else(|| CheckpointError::Truncated {
+                reason: format!("header + body length {body_len} overflows"),
+            })?;
+        if bytes.len() < body_end {
+            return Err(CheckpointError::Truncated {
+                reason: format!(
+                    "body declared {body_len} bytes, file has {} after header",
+                    bytes.len().saturating_sub(body_start),
+                ),
+            });
+        }
+        let body = &bytes[body_start..body_end];
+
+        let computed = fnv1a64(body);
+        if computed != body_checksum_header {
+            return Err(CheckpointError::BodyChecksumMismatch {
+                expected: body_checksum_header,
+                computed,
+            });
+        }
+
+        // v1 and v2 share the same body layout up to the sink tag;
+        // v2 adds [`SINK_TAG_ZIP`] as an accepted tag value. v3
+        // appends a single trailing `hash_state` field after the
+        // sink-state body. v4 appends a `chunk_crc32c` trailer after
+        // that. v5 appends an opaque `decoder_state` blob after that.
+        // v6 extends `SinkState::Tar` with an optional `in_flight`
+        // parser-state field. The `decode_body` helper takes the
+        // version so it can decide whether to read each trailer;
+        // future versions that *change* the layout will branch
+        // here.
+        debug_assert!(matches!(format_version, 1..=FORMAT_VERSION));
+        Self::decode_body(body, format_version)
+    }
+
+    /// Decode the body layout. v1 / v2 / v3 share the same prefix;
+    /// v3 appends an optional `hash_state` blob after `sink_state`,
+    /// v4 appends a `chunk_crc32c` trailer, v5 appends an opaque
+    /// `decoder_state` blob; v6 extends `SinkState::Tar` with an
+    /// optional `in_flight` parser-state trailer.
+    fn decode_body(body: &[u8], format_version: u32) -> Result<Self, CheckpointError> {
+        let mut cursor = Cursor::new(body);
+        // v8+ writes a length-prefixed `parts` vec at the top.
+        // v1..=v7 keep the legacy `(url, etag, last_modified)`
+        // trio at the top; we lift that into a synthetic
+        // single-element `parts[0]` after `total_size` is read.
+        let parts: Vec<PartRecord> = if format_version >= 8 {
+            // Each part begins with a u32 url-length read; that's the
+            // smallest commit per element. Don't preallocate against
+            // the untrusted count — even a count bounded by the cursor
+            // can multiply by `sizeof(PartRecord)` into a multi-GB
+            // allocation.
+            let count = cursor.read_count_capped("parts.len", 4)?;
+            let mut acc: Vec<PartRecord> = Vec::new();
+            for i in 0..count {
+                let url_label = format!("parts[{i}].url");
+                let url = cursor.read_string_dyn(&url_label)?;
+                let size = cursor.read_u64("parts[].size")?;
+                let etag = cursor.read_optional_string("parts[].etag")?;
+                let last_modified = cursor.read_optional_string("parts[].last_modified")?;
+                let presence = cursor.read_u8("parts[].expected_sha256.is_some")?;
+                let expected_sha256 = match presence {
+                    0 => None,
+                    1 => {
+                        let bytes = cursor.require(
+                            crate::hash::sha256::DIGEST_LEN,
+                            "parts[].expected_sha256.bytes",
+                        )?;
+                        let mut digest = [0u8; crate::hash::sha256::DIGEST_LEN];
+                        digest.copy_from_slice(bytes);
+                        Some(digest)
+                    }
+                    other => {
+                        return Err(CheckpointError::InvalidPresence {
+                            field: "parts[].expected_sha256",
+                            value: other,
+                        });
+                    }
+                };
+                let volume_role = if format_version >= FORMAT_VERSION_MULTIVOLUME {
+                    let presence = cursor.read_u8("parts[].volume_role.is_some")?;
+                    match presence {
+                        0 => None,
+                        1 => {
+                            let tag = cursor.read_u8("parts[].volume_role.tag")?;
+                            Some(VolumeRole::from_tag(tag).ok_or(
+                                CheckpointError::InvalidEnumTag {
+                                    field: "parts[].volume_role",
+                                    tag,
+                                },
+                            )?)
+                        }
+                        other => {
+                            return Err(CheckpointError::InvalidPresence {
+                                field: "parts[].volume_role",
+                                value: other,
+                            });
+                        }
+                    }
+                } else {
+                    None
+                };
+                acc.push(PartRecord {
+                    url,
+                    size,
+                    etag,
+                    last_modified,
+                    expected_sha256,
+                    volume_role,
+                });
+            }
+            acc
+        } else {
+            // v7 and earlier — legacy single-URL trio. The
+            // synthesized `parts[0]` is built below once
+            // `total_size` is known.
+            Vec::new()
+        };
+        let url = if format_version >= 8 {
+            // For v8 the legacy `url` field mirrors `parts[0].url`
+            // so existing readers keep working. The vec is
+            // guaranteed non-empty by the writer.
+            parts
+                .first()
+                .ok_or_else(|| CheckpointError::Truncated {
+                    reason: "v8 checkpoint has zero parts".into(),
+                })?
+                .url
+                .clone()
+        } else {
+            cursor.read_string("url")?
+        };
+        let etag = if format_version >= 8 {
+            parts.first().and_then(|p| p.etag.clone())
+        } else {
+            cursor.read_optional_string("etag")?
+        };
+        let last_modified = if format_version >= 8 {
+            parts.first().and_then(|p| p.last_modified.clone())
+        } else {
+            cursor.read_optional_string("last_modified")?
+        };
+        let total_size = cursor.read_u64("total_size")?;
+        let chunk_size = cursor.read_u64("chunk_size")?;
+        let decoder_position = cursor.read_u64("decoder_position")?;
+        let bitmap_completed = cursor.read_byte_array("bitmap_completed")?;
+        let secs = cursor.read_i64("created_at_unix_secs")?;
+        let nanos = cursor.read_u32("created_at_nanos")?;
+        let created_at = decode_system_time(secs, nanos);
+
+        let sink_tag = cursor.read_u8("sink_state_tag")?;
+        let sink_state = match sink_tag {
+            SINK_TAG_RAW => SinkState::Raw {
+                bytes_written: cursor.read_u64("sink.raw.bytes_written")?,
+            },
+            SINK_TAG_TAR => {
+                // Each member is a length-prefixed string; minimum on
+                // the wire is the u32 length prefix.
+                let count = cursor.read_count_capped("sink.tar.members_completed.len", 4)?;
+                let mut members: Vec<String> = Vec::new();
+                for i in 0..count {
+                    // Use the index in the field tag so a malformed
+                    // entry's position is in the error message.
+                    let label_owned = format!("sink.tar.members_completed[{i}]");
+                    let s = cursor.read_string_dyn(&label_owned)?;
+                    members.push(s);
+                }
+                let in_flight = if format_version >= 6 {
+                    let presence = cursor.read_u8("sink.tar.in_flight.is_some")?;
+                    match presence {
+                        0 => None,
+                        1 => Some(read_tar_sink_state(&mut cursor, format_version)?),
+                        other => {
+                            return Err(CheckpointError::InvalidPresence {
+                                field: "sink.tar.in_flight",
+                                value: other,
+                            });
+                        }
+                    }
+                } else {
+                    None
+                };
+                SinkState::Tar {
+                    members_completed: members,
+                    in_flight,
+                }
+            }
+            SINK_TAG_ZIP => {
+                // Each entry is a u32 index — 4 bytes on the wire.
+                let count = cursor.read_count_capped("sink.zip.entries_completed.len", 4)?;
+                let mut entries: Vec<u32> = Vec::new();
+                for _ in 0..count {
+                    entries.push(cursor.read_u32("sink.zip.entries_completed[i]")?);
+                }
+                let current_present = cursor.read_u8("sink.zip.current_entry.is_some")?;
+                let current_entry = match current_present {
+                    0 => None,
+                    1 => Some(cursor.read_u32("sink.zip.current_entry")?),
+                    other => {
+                        return Err(CheckpointError::InvalidPresence {
+                            field: "sink.zip.current_entry",
+                            value: other,
+                        });
+                    }
+                };
+                let current_entry_offset = cursor.read_u64("sink.zip.current_entry_offset")?;
+                // v7: optional in-flight codec state blob. v6 and
+                // earlier files have no further bytes here; the
+                // remaining body (hash_state / chunk_crc32c /
+                // decoder_state) reads correctly because each of
+                // those fields is its own length-prefixed
+                // optional field.
+                let current_entry_decoder_state = if format_version >= 7 {
+                    let presence =
+                        cursor.read_u8("sink.zip.current_entry_decoder_state.is_some")?;
+                    match presence {
+                        0 => None,
+                        1 => {
+                            let len =
+                                cursor.read_u32("sink.zip.current_entry_decoder_state.len")?;
+                            // Bound the allocation; reuse the same
+                            // ceiling as `Checkpoint::decoder_state`
+                            // since the deflate / gzip / zstd-in-zip
+                            // resume blobs all stay well under it.
+                            if len > MAX_DECODER_STATE_LEN {
+                                return Err(CheckpointError::Truncated {
+                                    reason: format!(
+                                        "sink.zip.current_entry_decoder_state length {len} \
+                                         exceeds cap {MAX_DECODER_STATE_LEN}",
+                                    ),
+                                });
+                            }
+                            let bytes = cursor.require(
+                                len as usize,
+                                "sink.zip.current_entry_decoder_state.bytes",
+                            )?;
+                            Some(bytes.to_vec())
+                        }
+                        other => {
+                            return Err(CheckpointError::InvalidPresence {
+                                field: "sink.zip.current_entry_decoder_state",
+                                value: other,
+                            });
+                        }
+                    }
+                } else {
+                    None
+                };
+                SinkState::Zip {
+                    entries_completed: entries,
+                    current_entry,
+                    current_entry_offset,
+                    current_entry_decoder_state,
+                }
+            }
+            SINK_TAG_SEVENZ => {
+                let count = cursor.read_count_capped("sink.sevenz.folders_completed.len", 4)?;
+                let mut folders: Vec<u32> = Vec::new();
+                for _ in 0..count {
+                    folders.push(cursor.read_u32("sink.sevenz.folders_completed[i]")?);
+                }
+                let current_present = cursor.read_u8("sink.sevenz.current_folder.is_some")?;
+                let current_folder = match current_present {
+                    0 => None,
+                    1 => Some(cursor.read_u32("sink.sevenz.current_folder")?),
+                    other => {
+                        return Err(CheckpointError::InvalidPresence {
+                            field: "sink.sevenz.current_folder",
+                            value: other,
+                        });
+                    }
+                };
+                SinkState::Sevenz {
+                    folders_completed: folders,
+                    current_folder,
+                }
+            }
+            SINK_TAG_RAR => {
+                // v10: layout shared with `SinkState::Zip` minus
+                // the decoder-state blob. v11 (§F1) appends an
+                // optional `current_entry_decoder_state`
+                // length-prefixed blob.
+                let count = cursor.read_count_capped("sink.rar.entries_completed.len", 4)?;
+                let mut entries: Vec<u32> = Vec::new();
+                for _ in 0..count {
+                    entries.push(cursor.read_u32("sink.rar.entries_completed[i]")?);
+                }
+                let current_present = cursor.read_u8("sink.rar.current_entry.is_some")?;
+                let current_entry = match current_present {
+                    0 => None,
+                    1 => Some(cursor.read_u32("sink.rar.current_entry")?),
+                    other => {
+                        return Err(CheckpointError::InvalidPresence {
+                            field: "sink.rar.current_entry",
+                            value: other,
+                        });
+                    }
+                };
+                let current_entry_offset = cursor.read_u64("sink.rar.current_entry_offset")?;
+                let current_entry_decoder_state = if format_version >= 11 {
+                    let presence =
+                        cursor.read_u8("sink.rar.current_entry_decoder_state.is_some")?;
+                    match presence {
+                        0 => None,
+                        1 => {
+                            let len =
+                                cursor.read_u32("sink.rar.current_entry_decoder_state.len")?;
+                            if len > MAX_DECODER_STATE_LEN {
+                                return Err(CheckpointError::Truncated {
+                                    reason: format!(
+                                        "sink.rar.current_entry_decoder_state length {len} \
+                                         exceeds cap {MAX_DECODER_STATE_LEN}",
+                                    ),
+                                });
+                            }
+                            let bytes = cursor.require(
+                                len as usize,
+                                "sink.rar.current_entry_decoder_state.bytes",
+                            )?;
+                            Some(bytes.to_vec())
+                        }
+                        other => {
+                            return Err(CheckpointError::InvalidPresence {
+                                field: "sink.rar.current_entry_decoder_state",
+                                value: other,
+                            });
+                        }
+                    }
+                } else {
+                    None
+                };
+                SinkState::Rar {
+                    entries_completed: entries,
+                    current_entry,
+                    current_entry_offset,
+                    current_entry_decoder_state,
+                }
+            }
+            other => {
+                return Err(CheckpointError::InvalidEnumTag {
+                    field: "sink_state_tag",
+                    tag: other,
+                });
+            }
+        };
+
+        let hash_state = if format_version >= 3 {
+            let presence = cursor.read_u8("hash_state.is_some")?;
+            match presence {
+                0 => None,
+                1 => {
+                    // v8 prepends a `u32` `active_part_idx` so
+                    // the resume path can rebuild the per-part
+                    // [`crate::hash::IntegrityHasher`] state
+                    // machine. v3..=v7 store only the bytes; we
+                    // lift those into `active_part_idx = 0` for
+                    // backward compatibility.
+                    let active_part_idx = if format_version >= 8 {
+                        cursor.read_u32("hash_state.active_part_idx")?
+                    } else {
+                        0
+                    };
+                    let bytes =
+                        cursor.require(crate::hash::sha256::SERIALIZED_LEN, "hash_state.bytes")?;
+                    let mut buf = [0u8; crate::hash::sha256::SERIALIZED_LEN];
+                    buf.copy_from_slice(bytes);
+                    Some(HashState {
+                        active_part_idx,
+                        bytes: buf,
+                    })
+                }
+                other => {
+                    return Err(CheckpointError::InvalidPresence {
+                        field: "hash_state",
+                        value: other,
+                    });
+                }
+            }
+        } else {
+            None
+        };
+
+        let chunk_crc32c = if format_version >= 4 {
+            let presence = cursor.read_u8("chunk_crc32c.is_some")?;
+            match presence {
+                0 => None,
+                1 => {
+                    // Each CRC is a u32 — 4 bytes on the wire.
+                    let count = cursor.read_count_capped("chunk_crc32c.len", 4)?;
+                    let mut crcs: Vec<u32> = Vec::new();
+                    for _ in 0..count {
+                        crcs.push(cursor.read_u32("chunk_crc32c[i]")?);
+                    }
+                    Some(crcs)
+                }
+                other => {
+                    return Err(CheckpointError::InvalidPresence {
+                        field: "chunk_crc32c",
+                        value: other,
+                    });
+                }
+            }
+        } else {
+            None
+        };
+
+        let decoder_state = if format_version >= 5 {
+            let presence = cursor.read_u8("decoder_state.is_some")?;
+            match presence {
+                0 => None,
+                1 => {
+                    let len = cursor.read_u32("decoder_state.len")?;
+                    if len > MAX_DECODER_STATE_LEN {
+                        return Err(CheckpointError::Truncated {
+                            reason: format!(
+                                "decoder_state length {len} exceeds cap {MAX_DECODER_STATE_LEN}",
+                            ),
+                        });
+                    }
+                    let bytes = cursor.require(len as usize, "decoder_state.bytes")?;
+                    Some(bytes.to_vec())
+                }
+                other => {
+                    return Err(CheckpointError::InvalidPresence {
+                        field: "decoder_state",
+                        value: other,
+                    });
+                }
+            }
+        } else {
+            None
+        };
+
+        // v12 (`internal/PLAN_download_modes.md` §5): one trailing tag
+        // byte that names the [`RunMode`] this checkpoint was
+        // written under. v11-and-earlier readers synthesize
+        // [`RunMode::Extract`] — every pre-v12 checkpoint was
+        // written by the default extract pipeline. The tag is
+        // optional even at v12, because the writer omits it
+        // entirely when the mode is `Extract` (the byte-identical
+        // lower-bound path).
+        let mode = if format_version >= FORMAT_VERSION_RUN_MODE && cursor.remaining() > 0 {
+            let tag = cursor.read_u8("mode.tag")?;
+            RunMode::from_tag(tag).ok_or(CheckpointError::InvalidEnumTag { field: "mode", tag })?
+        } else {
+            RunMode::Extract
+        };
+
+        // v13 (`internal/old/PLAN_local_file_extract.md` §5): a
+        // `source_mtime` trailer is written when (and only when)
+        // the mode is [`RunMode::LocalDestructive`]. Read it for
+        // local-destructive checkpoints at v13+; default to
+        // `None` for every other mode / version.
+        let source_mtime = if format_version >= FORMAT_VERSION_LOCAL_DESTRUCTIVE
+            && mode == RunMode::LocalDestructive
+        {
+            let presence = cursor.read_u8("source_mtime.is_some")?;
+            match presence {
+                0 => None,
+                1 => {
+                    let secs = cursor.read_i64("source_mtime.secs")?;
+                    let nanos = cursor.read_u32("source_mtime.nanos")?;
+                    Some(decode_system_time(secs, nanos))
+                }
+                other => {
+                    return Err(CheckpointError::InvalidPresence {
+                        field: "source_mtime",
+                        value: other,
+                    });
+                }
+            }
+        } else {
+            None
+        };
+
+        // v15: a 12-byte `cumulative_elapsed` trailer (u64 secs +
+        // u32 nanos) is appended when the value is non-zero. The
+        // writer omits it for zero-valued checkpoints (those keep
+        // the v8..=v14 byte-identical shape), so at v15 the
+        // trailer may or may not be present — `remaining() > 0`
+        // is the signal. Pre-v15 readers see no trailer; the
+        // value defaults to ZERO.
+        let cumulative_elapsed =
+            if format_version >= FORMAT_VERSION_CUMULATIVE_ELAPSED && cursor.remaining() > 0 {
+                let secs = cursor.read_u64("cumulative_elapsed.secs")?;
+                let nanos = cursor.read_u32("cumulative_elapsed.nanos")?;
+                Duration::new(secs, nanos)
+            } else {
+                Duration::ZERO
+            };
+
+        if cursor.remaining() != 0 {
+            return Err(CheckpointError::Truncated {
+                reason: format!(
+                    "{} trailing bytes after final field in v{format_version} body",
+                    cursor.remaining(),
+                ),
+            });
+        }
+
+        // For v7-and-earlier readers, lift the legacy URL trio
+        // into a synthetic single-element `parts[0]` so downstream
+        // code (resume validation, snapshot/restore) can treat
+        // every checkpoint shape uniformly.
+        // (`internal/PLAN_multi_url_source.md` §5 step 3.)
+        let parts = if format_version >= 8 {
+            parts
+        } else {
+            vec![PartRecord {
+                url: url.clone(),
+                size: total_size,
+                etag: etag.clone(),
+                last_modified: last_modified.clone(),
+                expected_sha256: None,
+                volume_role: None,
+            }]
+        };
+
+        Ok(Self {
+            url,
+            etag,
+            last_modified,
+            parts,
+            total_size,
+            chunk_size,
+            decoder_position: ByteOffset::new(decoder_position),
+            bitmap_completed,
+            created_at,
+            sink_state,
+            hash_state,
+            chunk_crc32c,
+            decoder_state,
+            mode,
+            source_mtime,
+            cumulative_elapsed,
+        })
+    }
+
+    /// Atomically write the checkpoint to `path`.
+    ///
+    /// Writes to `<path>.tmp` first, `fsync`s the data and the parent
+    /// directory, then `rename(2)`s `<path>.tmp` over `<path>`. A crash
+    /// at any point leaves either the previous `<path>` intact or the
+    /// new one in place; readers never observe a partial write.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CheckpointError::Io`] for any failing syscall, with
+    /// `path` set to the file involved (the temp file or the parent
+    /// directory, as appropriate).
+    pub fn write(&self, path: &Path) -> Result<(), CheckpointError> {
+        self.write_timed(path).map(drop)
+    }
+
+    /// Same contract as [`Self::write`], but returns a per-step timing
+    /// breakdown for diagnostics. `PLAN_checkpoint_cadence_throughput.md`
+    /// Phase 0 uses this to attribute the per-checkpoint stall to a
+    /// specific syscall (serialize / `pwrite` of `.tmp` / `fsync` of
+    /// `.tmp` / `rename` / parent-directory `fsync`).
+    ///
+    /// Phase 1 changed two stages:
+    ///
+    /// * The `.tmp` file is published with
+    ///   [`crate::io_backend::order_writes_blocking`] (macOS:
+    ///   `F_BARRIERFSYNC`; Linux: `fdatasync`) instead of a full
+    ///   `File::sync_all`. The barrier guarantees that pre-barrier
+    ///   writes hit stable storage *no later than* the subsequent
+    ///   `rename`, which is what publication needs: if a future run
+    ///   sees the renamed `path`, the body bytes the rename promotes
+    ///   are at least as durable as the rename itself.
+    /// * The parent-directory `fsync` only fires when this rename
+    ///   *creates* a new directory entry (i.e. `path` did not exist
+    ///   before the call). Subsequent writes target an existing entry
+    ///   that the rename replaces atomically; the directory inode the
+    ///   first write made durable doesn't need another flush.
+    pub fn write_timed(&self, path: &Path) -> Result<CheckpointWriteTimings, CheckpointError> {
+        // Default closure: copy `self.decoder_state`'s bytes
+        // verbatim, mirroring the existing field-driven shape.
+        // Hot-path callers reach for `write_timed_with` instead so
+        // the resume blob bytes flow into the body buffer with one
+        // memcpy. `PLAN_checkpoint_blob_dedup.md` Phase 2.
+        let hint = self.decoder_state.as_ref().map_or(0, Vec::len);
+        self.write_timed_with(path, hint, |out| match &self.decoder_state {
+            Some(blob) => {
+                out.extend_from_slice(blob);
+                true
+            }
+            None => false,
+        })
+    }
+
+    /// Same contract as [`Self::write_timed`], but the
+    /// `decoder_state` field is populated by the supplied
+    /// closure. The closure runs once during `serialize_time`.
+    /// `decoder_state_size_hint` is forwarded to
+    /// [`Self::serialize_with`] for body-capacity pre-reservation.
+    /// `PLAN_checkpoint_blob_dedup.md` Phase 2.
+    pub fn write_timed_with<F>(
+        &self,
+        path: &Path,
+        decoder_state_size_hint: usize,
+        write_decoder_state: F,
+    ) -> Result<CheckpointWriteTimings, CheckpointError>
+    where
+        F: FnOnce(&mut Vec<u8>) -> bool,
+    {
+        let mut t = CheckpointWriteTimings::default();
+
+        let serialize_start = Instant::now();
+        let bytes = self.serialize_with(decoder_state_size_hint, write_decoder_state);
+        t.serialize_time = serialize_start.elapsed();
+
+        let tmp_path = tmp_path_for(path);
+
+        // Snapshot existence *before* the rename so we know whether
+        // this call creates the directory entry or replaces an
+        // existing one. `try_exists()` keeps races and permission
+        // errors observable; on either kind of error we err on the
+        // side of doing the parent-dir fsync (correct, just not
+        // optimal).
+        let path_existed_before = path.try_exists().unwrap_or(false);
+
+        let tmp_write_start = Instant::now();
+        // Open the temp file: create or truncate so a stale .tmp from
+        // a previous crash is overwritten cleanly.
+        let mut file = OpenOptions::new()
+            .create(true)
+            .truncate(true)
+            .write(true)
+            .open(&tmp_path)
+            .map_err(|source| CheckpointError::Io {
+                path: tmp_path.clone(),
+                source,
+            })?;
+
+        file.write_all(&bytes)
+            .map_err(|source| CheckpointError::Io {
+                path: tmp_path.clone(),
+                source,
+            })?;
+        t.tmp_write_time = tmp_write_start.elapsed();
+
+        let tmp_fsync_start = Instant::now();
+        // Phase 1: barrier instead of full fsync. Ordered against
+        // the subsequent `rename`, which is exactly what publication
+        // needs. On Unix this resolves to `F_BARRIERFSYNC` (macOS) or
+        // `fdatasync` (Linux); on platforms without an ordering
+        // primitive we fall back to `File::sync_all` so the
+        // publication contract still holds.
+        #[cfg(unix)]
+        {
+            use std::os::fd::AsFd;
+            crate::io_backend::order_writes_blocking(file.as_fd()).map_err(|source| {
+                CheckpointError::Io {
+                    path: tmp_path.clone(),
+                    source,
+                }
+            })?;
+        }
+        #[cfg(not(unix))]
+        {
+            file.sync_all().map_err(|source| CheckpointError::Io {
+                path: tmp_path.clone(),
+                source,
+            })?;
+        }
+        t.tmp_fsync_time = tmp_fsync_start.elapsed();
+        // Drop the file handle before renaming. On POSIX the rename
+        // works either way, but closing first matches the canonical
+        // sequence and keeps the resource lifetime obvious.
+        drop(file);
+
+        let rename_start = Instant::now();
+        atomic_publish(&tmp_path, path).map_err(|source| CheckpointError::Io {
+            path: path.to_path_buf(),
+            source,
+        })?;
+        t.rename_time = rename_start.elapsed();
+
+        // Phase 1: only fsync the parent directory when this rename
+        // creates a new entry. Subsequent writes promote a `.tmp` over
+        // an existing entry; the directory inode the prior write
+        // already made durable doesn't need another flush.
+        //
+        // On platforms where opening a directory for fsync is
+        // unsupported (Windows) the open silently fails and we skip,
+        // matching the pre-Phase-1 best-effort behaviour. A failure
+        // here is non-fatal: the data is durable; only the directory
+        // entry's flush is at stake.
+        if !path_existed_before {
+            if let Some(parent) = path.parent() {
+                if !parent.as_os_str().is_empty() {
+                    if let Ok(dir) = File::open(parent) {
+                        let dir_fsync_start = Instant::now();
+                        let _ = dir.sync_all();
+                        t.dir_fsync_time = dir_fsync_start.elapsed();
+                        t.dir_fsync_called = true;
+                    }
+                }
+            }
+        }
+
+        Ok(t)
+    }
+
+    // (helper `atomic_publish` lives at module scope below so it
+    // doesn't accidentally pull in `&self`-related state.)
+
+    /// Read a checkpoint from `path` if one exists.
+    ///
+    /// Returns `Ok(None)` if `path` does not exist (the common
+    /// first-run case). Returns `Ok(Some(_))` on a valid checkpoint.
+    /// Returns the appropriate [`CheckpointError`] on any other
+    /// failure — including a corrupt or truncated checkpoint, which
+    /// the §10 coordinator surfaces to the user rather than silently
+    /// discarding.
+    ///
+    /// # Errors
+    ///
+    /// See [`CheckpointError`].
+    pub fn read(path: &Path) -> Result<Option<Self>, CheckpointError> {
+        let mut file = match File::open(path) {
+            Ok(f) => f,
+            Err(e) if e.kind() == ErrorKind::NotFound => return Ok(None),
+            Err(source) => {
+                return Err(CheckpointError::Io {
+                    path: path.to_path_buf(),
+                    source,
+                });
+            }
+        };
+
+        let mut bytes = Vec::new();
+        file.read_to_end(&mut bytes)
+            .map_err(|source| CheckpointError::Io {
+                path: path.to_path_buf(),
+                source,
+            })?;
+        Self::deserialize(&bytes).map(Some)
+    }
+
+    fn estimated_body_size(&self) -> usize {
+        // Rough ceiling so the Vec only grows once for typical inputs.
+        // Bitmap dominates; everything else is bounded by short strings.
+        4 + self.url.len()
+            + 1
+            + 4
+            + self.etag.as_ref().map_or(0, String::len)
+            + 1
+            + 4
+            + self.last_modified.as_ref().map_or(0, String::len)
+            + 8
+            + 8
+            + 8
+            + 4
+            + self.bitmap_completed.len()
+            + 8
+            + 4
+            + 1
+            + 32
+            + 1
+            + self
+                .hash_state
+                .as_ref()
+                .map_or(0, |_| crate::hash::sha256::SERIALIZED_LEN)
+            + 1
+            + self.chunk_crc32c.as_ref().map_or(0, |c| 4 + c.len() * 4)
+            + 1
+            + self.decoder_state.as_ref().map_or(0, |b| 4 + b.len())
+    }
+}
+
+/// Compute `<path>.tmp` for the atomic-write dance. Public so tests
+/// and callers (like §10's coordinator) can clean up stale temp files.
+#[must_use]
+pub fn tmp_path_for(path: &Path) -> PathBuf {
+    let mut name = path.as_os_str().to_owned();
+    name.push(".tmp");
+    PathBuf::from(name)
+}
+
+// -- internal serializer helpers --------------------------------------
+
+fn write_u32(buf: &mut Vec<u8>, v: u32) {
+    buf.extend_from_slice(&v.to_le_bytes());
+}
+
+fn write_u64(buf: &mut Vec<u8>, v: u64) {
+    buf.extend_from_slice(&v.to_le_bytes());
+}
+
+fn write_i64(buf: &mut Vec<u8>, v: i64) {
+    buf.extend_from_slice(&v.to_le_bytes());
+}
+
+fn write_string(buf: &mut Vec<u8>, s: &str) {
+    write_byte_array(buf, s.as_bytes());
+}
+
+fn write_byte_array(buf: &mut Vec<u8>, bytes: &[u8]) {
+    let len = u32::try_from(bytes.len()).unwrap_or(u32::MAX);
+    write_u32(buf, len);
+    buf.extend_from_slice(&bytes[..len as usize]);
+}
+
+fn write_optional_string(buf: &mut Vec<u8>, s: Option<&str>) {
+    match s {
+        Some(value) => {
+            buf.push(1);
+            write_string(buf, value);
+        }
+        None => buf.push(0),
+    }
+}
+
+fn write_tar_sink_state(buf: &mut Vec<u8>, s: &TarSinkState, format_version: u32) {
+    write_u64(buf, s.archive_offset);
+    buf.push(s.zero_blocks_seen);
+    write_optional_string(buf, s.pending_path.as_deref());
+    match s.pending_size {
+        Some(v) => {
+            buf.push(1);
+            write_u64(buf, v);
+        }
+        None => buf.push(0),
+    }
+    // v16: the `pending_linkpath` override is written only when the
+    // on-disk version was bumped to v16 (which `required_format_version`
+    // does exactly when this field is `Some`). Below v16 the field is
+    // absent from the wire and the reader reconstructs it as `None`.
+    if format_version >= FORMAT_VERSION_TAR_LINKPATH {
+        write_optional_string(buf, s.pending_linkpath.as_deref());
+    }
+    write_tar_member_state(buf, &s.state);
+}
+
+fn write_tar_member_state(buf: &mut Vec<u8>, m: &TarMemberState) {
+    match m {
+        TarMemberState::Header { filled, buf: hdr } => {
+            buf.push(TAR_TAG_HEADER);
+            write_u32(buf, *filled);
+            write_byte_array(buf, hdr);
+        }
+        TarMemberState::File {
+            remaining,
+            padding,
+            path,
+            total_size,
+        } => {
+            buf.push(TAR_TAG_FILE);
+            write_u64(buf, *remaining);
+            write_u32(buf, *padding);
+            write_string(buf, path);
+            write_u64(buf, *total_size);
+        }
+        TarMemberState::PaxData {
+            remaining,
+            padding,
+            buf: body,
+        } => {
+            buf.push(TAR_TAG_PAX);
+            write_u64(buf, *remaining);
+            write_u32(buf, *padding);
+            write_byte_array(buf, body);
+        }
+        TarMemberState::LongName {
+            remaining,
+            padding,
+            buf: body,
+            is_link,
+        } => {
+            buf.push(TAR_TAG_LONGNAME);
+            write_u64(buf, *remaining);
+            write_u32(buf, *padding);
+            write_byte_array(buf, body);
+            buf.push(u8::from(*is_link));
+        }
+        TarMemberState::Finished => {
+            buf.push(TAR_TAG_FINISHED);
+        }
+    }
+}
+
+fn read_u32(bytes: &[u8]) -> u32 {
+    // INVARIANT: caller slices a 4-byte window before calling.
+    let mut a = [0u8; 4];
+    a.copy_from_slice(&bytes[..4]);
+    u32::from_le_bytes(a)
+}
+
+fn read_u64(bytes: &[u8]) -> u64 {
+    // INVARIANT: caller slices an 8-byte window before calling.
+    let mut a = [0u8; 8];
+    a.copy_from_slice(&bytes[..8]);
+    u64::from_le_bytes(a)
+}
+
+/// Forward-only cursor used while decoding the body. Keeping the
+/// reader in a struct lets the per-field `read_*` helpers attach the
+/// failing field name to a `Truncated` error.
+struct Cursor<'a> {
+    buf: &'a [u8],
+    pos: usize,
+}
+
+impl<'a> Cursor<'a> {
+    fn new(buf: &'a [u8]) -> Self {
+        Self { buf, pos: 0 }
+    }
+
+    fn remaining(&self) -> usize {
+        self.buf.len().saturating_sub(self.pos)
+    }
+
+    fn require(&mut self, n: usize, field: &str) -> Result<&'a [u8], CheckpointError> {
+        if self.remaining() < n {
+            return Err(CheckpointError::Truncated {
+                reason: format!(
+                    "field {field}: needed {n} bytes, only {} available",
+                    self.remaining(),
+                ),
+            });
+        }
+        let slice = &self.buf[self.pos..self.pos + n];
+        self.pos += n;
+        Ok(slice)
+    }
+
+    fn read_u8(&mut self, field: &'static str) -> Result<u8, CheckpointError> {
+        Ok(self.require(1, field)?[0])
+    }
+
+    fn read_u32(&mut self, field: &'static str) -> Result<u32, CheckpointError> {
+        Ok(read_u32(self.require(4, field)?))
+    }
+
+    fn read_u64(&mut self, field: &'static str) -> Result<u64, CheckpointError> {
+        Ok(read_u64(self.require(8, field)?))
+    }
+
+    fn read_i64(&mut self, field: &'static str) -> Result<i64, CheckpointError> {
+        let bytes = self.require(8, field)?;
+        let mut a = [0u8; 8];
+        a.copy_from_slice(bytes);
+        Ok(i64::from_le_bytes(a))
+    }
+
+    fn read_byte_array(&mut self, field: &'static str) -> Result<Vec<u8>, CheckpointError> {
+        let len = self.read_u32(field)? as usize;
+        let bytes = self.require(len, field)?;
+        Ok(bytes.to_vec())
+    }
+
+    /// Read a u32 element count and reject it up front if the cursor
+    /// could not possibly contain that many elements: each element
+    /// must consume at least `min_bytes_per_element` bytes before the
+    /// inner-element loop can detect a malformed element, so any
+    /// declared count whose minimum byte budget overruns the remaining
+    /// body is provably malformed.
+    ///
+    /// This guards against adversarial counts (found by `cargo fuzz`
+    /// target `checkpoint_deserialize`) that would otherwise drive the
+    /// inner loop billions of iterations or — when paired with a
+    /// `Vec::with_capacity(count)` — request a multi-hundred-GB
+    /// allocation. Callers MUST still avoid `with_capacity(count)`
+    /// because even within this bound the count can be large enough
+    /// that `count * sizeof(T)` exceeds available memory; use
+    /// `Vec::new()` and let the loop grow the vec as elements parse.
+    fn read_count_capped(
+        &mut self,
+        field: &'static str,
+        min_bytes_per_element: usize,
+    ) -> Result<usize, CheckpointError> {
+        let count = self.read_u32(field)? as usize;
+        // INVARIANT: callers always pass min_bytes_per_element >= 1.
+        // Saturating multiply avoids overflow; on 64-bit `usize` the
+        // saturation point is far above MAX_BODY_LEN so saturation
+        // cannot mask a real overrun.
+        let need = count.saturating_mul(min_bytes_per_element.max(1));
+        if need > self.remaining() {
+            return Err(CheckpointError::Truncated {
+                reason: format!(
+                    "field {field} declares {count} elements (>= {need} bytes) \
+                     but only {} bytes remain",
+                    self.remaining(),
+                ),
+            });
+        }
+        Ok(count)
+    }
+
+    fn read_string(&mut self, field: &'static str) -> Result<String, CheckpointError> {
+        let bytes = self.read_byte_array(field)?;
+        String::from_utf8(bytes).map_err(|source| CheckpointError::InvalidUtf8 { field, source })
+    }
+
+    /// Like [`Self::read_string`] but takes a runtime-allocated label so
+    /// indexed-field error messages can report the index.
+    fn read_string_dyn(&mut self, field: &str) -> Result<String, CheckpointError> {
+        let len = {
+            // Reuse the static-label path for the length read; the
+            // composite label only matters when we hit utf-8 issues.
+            let len_label: &'static str = "string-len";
+            self.read_u32(len_label)? as usize
+        };
+        let bytes = self.require(len, "string-bytes")?.to_vec();
+        String::from_utf8(bytes).map_err(|source| {
+            // Promote the dynamic label to a leaked &'static str. We
+            // only do this on the error path, and the leak is bounded
+            // by the malformed-checkpoint failure: the binary is about
+            // to exit with the error.
+            let leaked: &'static str = Box::leak(field.to_string().into_boxed_str());
+            CheckpointError::InvalidUtf8 {
+                field: leaked,
+                source,
+            }
+        })
+    }
+
+    fn read_optional_string(
+        &mut self,
+        field: &'static str,
+    ) -> Result<Option<String>, CheckpointError> {
+        let presence = self.read_u8(field)?;
+        match presence {
+            0 => Ok(None),
+            1 => self.read_string(field).map(Some),
+            other => Err(CheckpointError::InvalidPresence {
+                field,
+                value: other,
+            }),
+        }
+    }
+
+    fn read_byte_array_capped(
+        &mut self,
+        field: &'static str,
+        cap: u32,
+    ) -> Result<Vec<u8>, CheckpointError> {
+        let len = self.read_u32(field)?;
+        if len > cap {
+            return Err(CheckpointError::Truncated {
+                reason: format!("{field} length {len} exceeds cap {cap}"),
+            });
+        }
+        let bytes = self.require(len as usize, field)?;
+        Ok(bytes.to_vec())
+    }
+}
+
+fn read_tar_sink_state(
+    cursor: &mut Cursor<'_>,
+    format_version: u32,
+) -> Result<TarSinkState, CheckpointError> {
+    let archive_offset = cursor.read_u64("sink.tar.in_flight.archive_offset")?;
+    let zero_blocks_seen = cursor.read_u8("sink.tar.in_flight.zero_blocks_seen")?;
+    let pending_path = cursor.read_optional_string("sink.tar.in_flight.pending_path")?;
+    let pending_size = match cursor.read_u8("sink.tar.in_flight.pending_size.is_some")? {
+        0 => None,
+        1 => Some(cursor.read_u64("sink.tar.in_flight.pending_size.value")?),
+        other => {
+            return Err(CheckpointError::InvalidPresence {
+                field: "sink.tar.in_flight.pending_size",
+                value: other,
+            });
+        }
+    };
+    // v16: the `pending_linkpath` override sits here, between
+    // `pending_size` and the parser state. Files written below v16
+    // never carried it, so the field defaults to `None`. (A v16 body
+    // is only produced when the field is `Some`, so a v6..=v15 reader
+    // — which would misread the bytes — never encounters one: it
+    // refuses the v16 version outright.)
+    let pending_linkpath = if format_version >= FORMAT_VERSION_TAR_LINKPATH {
+        cursor.read_optional_string("sink.tar.in_flight.pending_linkpath")?
+    } else {
+        None
+    };
+    let state = read_tar_member_state(cursor)?;
+    Ok(TarSinkState {
+        archive_offset,
+        zero_blocks_seen,
+        pending_path,
+        pending_size,
+        pending_linkpath,
+        state,
+    })
+}
+
+fn read_tar_member_state(cursor: &mut Cursor<'_>) -> Result<TarMemberState, CheckpointError> {
+    let tag = cursor.read_u8("sink.tar.in_flight.state_tag")?;
+    match tag {
+        TAR_TAG_HEADER => {
+            let filled = cursor.read_u32("sink.tar.in_flight.header.filled")?;
+            if filled > 512 {
+                return Err(CheckpointError::Truncated {
+                    reason: format!("tar header filled {filled} exceeds 512"),
+                });
+            }
+            let buf = cursor.read_byte_array_capped("sink.tar.in_flight.header.buf", 512)?;
+            if (buf.len() as u32) != filled {
+                return Err(CheckpointError::Truncated {
+                    reason: format!(
+                        "tar header buf length {} does not match filled {filled}",
+                        buf.len(),
+                    ),
+                });
+            }
+            Ok(TarMemberState::Header { filled, buf })
+        }
+        TAR_TAG_FILE => {
+            let remaining = cursor.read_u64("sink.tar.in_flight.file.remaining")?;
+            let padding = cursor.read_u32("sink.tar.in_flight.file.padding")?;
+            if padding >= 512 {
+                return Err(CheckpointError::Truncated {
+                    reason: format!("tar file padding {padding} ≥ 512"),
+                });
+            }
+            let path = cursor.read_string("sink.tar.in_flight.file.path")?;
+            let total_size = cursor.read_u64("sink.tar.in_flight.file.total_size")?;
+            if remaining > total_size {
+                return Err(CheckpointError::Truncated {
+                    reason: format!(
+                        "tar file remaining {remaining} exceeds total_size {total_size}",
+                    ),
+                });
+            }
+            Ok(TarMemberState::File {
+                remaining,
+                padding,
+                path,
+                total_size,
+            })
+        }
+        TAR_TAG_PAX => {
+            let remaining = cursor.read_u64("sink.tar.in_flight.pax.remaining")?;
+            let padding = cursor.read_u32("sink.tar.in_flight.pax.padding")?;
+            if padding >= 512 {
+                return Err(CheckpointError::Truncated {
+                    reason: format!("tar pax padding {padding} ≥ 512"),
+                });
+            }
+            let buf =
+                cursor.read_byte_array_capped("sink.tar.in_flight.pax.buf", MAX_TAR_BUFFER_LEN)?;
+            Ok(TarMemberState::PaxData {
+                remaining,
+                padding,
+                buf,
+            })
+        }
+        TAR_TAG_LONGNAME => {
+            let remaining = cursor.read_u64("sink.tar.in_flight.longname.remaining")?;
+            let padding = cursor.read_u32("sink.tar.in_flight.longname.padding")?;
+            if padding >= 512 {
+                return Err(CheckpointError::Truncated {
+                    reason: format!("tar longname padding {padding} ≥ 512"),
+                });
+            }
+            let buf = cursor
+                .read_byte_array_capped("sink.tar.in_flight.longname.buf", MAX_TAR_BUFFER_LEN)?;
+            let is_link = match cursor.read_u8("sink.tar.in_flight.longname.is_link")? {
+                0 => false,
+                1 => true,
+                other => {
+                    return Err(CheckpointError::InvalidPresence {
+                        field: "sink.tar.in_flight.longname.is_link",
+                        value: other,
+                    });
+                }
+            };
+            Ok(TarMemberState::LongName {
+                remaining,
+                padding,
+                buf,
+                is_link,
+            })
+        }
+        TAR_TAG_FINISHED => Ok(TarMemberState::Finished),
+        other => Err(CheckpointError::InvalidEnumTag {
+            field: "sink.tar.in_flight.state_tag",
+            tag: other,
+        }),
+    }
+}
+
+/// 64-bit FNV-1a hash. Hand-rolled because the dependency policy
+/// (`internal/ENGINEERING_STANDARDS.md` §2) says "anything we can write in
+/// 50 lines should be written, not depended on" and a checksum used
+/// only for tamper detection on a tiny file does not justify a crate.
+///
+/// We are not using FNV-1a as a cryptographic hash; collisions on
+/// adversarial input are possible. The threat model is corrupted
+/// disk blocks, partial writes, and accidental modification — all of
+/// which FNV-1a detects with overwhelming probability for a body
+/// bounded by [`MAX_BODY_LEN`].
+fn fnv1a64(bytes: &[u8]) -> u64 {
+    const OFFSET: u64 = 0xCBF2_9CE4_8422_2325;
+    const PRIME: u64 = 0x0000_0100_0000_01B3;
+    let mut hash = OFFSET;
+    for &b in bytes {
+        hash ^= u64::from(b);
+        hash = hash.wrapping_mul(PRIME);
+    }
+    hash
+}
+
+/// Encode `t` as `(secs_since_epoch, nanos)`. Times before `UNIX_EPOCH`
+/// produce a negative `secs`.
+fn encode_system_time(t: SystemTime) -> (i64, u32) {
+    match t.duration_since(UNIX_EPOCH) {
+        Ok(d) => (
+            i64::try_from(d.as_secs()).unwrap_or(i64::MAX),
+            d.subsec_nanos(),
+        ),
+        Err(e) => {
+            let d = e.duration();
+            // Pre-epoch: store a negative seconds value with positive
+            // sub-second remainder, matching the BSD `timespec` shape.
+            let secs = i64::try_from(d.as_secs())
+                .unwrap_or(i64::MAX)
+                .saturating_neg();
+            (secs, d.subsec_nanos())
+        }
+    }
+}
+
+/// Decode `(secs, nanos)` back into a [`SystemTime`]. Saturates to
+/// [`UNIX_EPOCH`] on negative seconds rather than returning an error;
+/// the timestamp is diagnostic only and a "before-epoch" round-trip
+/// is not load-bearing for resume.
+fn decode_system_time(secs: i64, nanos: u32) -> SystemTime {
+    if secs >= 0 {
+        UNIX_EPOCH
+            .checked_add(Duration::new(secs as u64, nanos))
+            .unwrap_or(UNIX_EPOCH)
+    } else {
+        let abs = secs.unsigned_abs();
+        UNIX_EPOCH
+            .checked_sub(Duration::new(abs, nanos))
+            .unwrap_or(UNIX_EPOCH)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    use std::path::PathBuf;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    static UNIQ: AtomicU64 = AtomicU64::new(0);
+
+    fn unique_temp(label: &str) -> PathBuf {
+        let pid = std::process::id();
+        let n = UNIQ.fetch_add(1, Ordering::Relaxed);
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+        std::env::temp_dir().join(format!("peel_checkpoint_unit_{label}_{pid}_{nanos}_{n}"))
+    }
+
+    struct CleanupOnDrop(PathBuf);
+    impl Drop for CleanupOnDrop {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_file(&self.0);
+            let tmp = tmp_path_for(&self.0);
+            let _ = std::fs::remove_file(&tmp);
+        }
+    }
+
+    fn sample_raw() -> Checkpoint {
+        let url = "https://example.com/file.zst".to_string();
+        let etag = Some("\"v1\"".to_string());
+        let last_modified = None;
+        let total_size = 1_048_576u64;
+        Checkpoint {
+            url: url.clone(),
+            etag: etag.clone(),
+            last_modified: last_modified.clone(),
+            parts: vec![PartRecord {
+                url,
+                size: total_size,
+                etag,
+                last_modified,
+                expected_sha256: None,
+                volume_role: None,
+            }],
+            total_size,
+            chunk_size: 65_536,
+            decoder_position: ByteOffset::new(32_768),
+            bitmap_completed: vec![0xFFu8; 16],
+            created_at: UNIX_EPOCH + Duration::new(1_700_000_000, 12_345),
+            sink_state: SinkState::Raw {
+                bytes_written: 4096,
+            },
+            hash_state: None,
+            chunk_crc32c: None,
+            decoder_state: None,
+            mode: RunMode::Extract,
+            source_mtime: None,
+            cumulative_elapsed: Duration::ZERO,
+        }
+    }
+
+    fn sample_tar() -> Checkpoint {
+        let url = "http://localhost:8080/data.tar.zst".to_string();
+        let etag = None;
+        let last_modified = Some("Wed, 21 Oct 2026 07:28:00 GMT".to_string());
+        let total_size = u64::MAX / 2;
+        Checkpoint {
+            url: url.clone(),
+            etag: etag.clone(),
+            last_modified: last_modified.clone(),
+            parts: vec![PartRecord {
+                url,
+                size: total_size,
+                etag,
+                last_modified,
+                expected_sha256: None,
+                volume_role: None,
+            }],
+            total_size,
+            chunk_size: 4 * 1024 * 1024,
+            decoder_position: ByteOffset::new(8 * 1024 * 1024),
+            bitmap_completed: (0u8..=255).collect(),
+            created_at: SystemTime::now(),
+            sink_state: SinkState::Tar {
+                members_completed: vec![
+                    "root/a.txt".into(),
+                    "root/sub/b.bin".into(),
+                    "root/empty/".into(),
+                ],
+                in_flight: None,
+            },
+            hash_state: None,
+            chunk_crc32c: None,
+            decoder_state: None,
+            mode: RunMode::Extract,
+            source_mtime: None,
+            cumulative_elapsed: Duration::ZERO,
+        }
+    }
+
+    /// Multi-part fixture exercising v8's `parts` vec with three
+    /// distinct part records and an active-part-aware `hash_state`.
+    fn sample_multi_part() -> Checkpoint {
+        let part0 = PartRecord {
+            url: "https://h/a.tar.part0000".into(),
+            size: 256 * 1024,
+            etag: Some("\"p0\"".into()),
+            last_modified: None,
+            expected_sha256: Some([0x11; crate::hash::sha256::DIGEST_LEN]),
+            volume_role: None,
+        };
+        let part1 = PartRecord {
+            url: "https://h/a.tar.part0001".into(),
+            size: 384 * 1024,
+            etag: Some("\"p1\"".into()),
+            last_modified: Some("Sun, 01 Jan 2026 00:00:00 GMT".into()),
+            expected_sha256: Some([0x22; crate::hash::sha256::DIGEST_LEN]),
+            volume_role: None,
+        };
+        let part2 = PartRecord {
+            url: "https://h/a.tar.part0002".into(),
+            size: 128 * 1024,
+            etag: None,
+            last_modified: None,
+            expected_sha256: None,
+            volume_role: None,
+        };
+        let total_size = part0.size + part1.size + part2.size;
+        let mut active = crate::hash::sha256::Sha256::new();
+        active.update(b"mid-stream bytes for part 1");
+        Checkpoint {
+            url: part0.url.clone(),
+            etag: part0.etag.clone(),
+            last_modified: part0.last_modified.clone(),
+            parts: vec![part0, part1, part2],
+            total_size,
+            chunk_size: 256 * 1024,
+            decoder_position: ByteOffset::new(256 * 1024 + 1024),
+            bitmap_completed: vec![0xFFu8; 4],
+            created_at: UNIX_EPOCH + Duration::new(1_900_000_000, 0),
+            sink_state: SinkState::Tar {
+                members_completed: vec!["root/a".into()],
+                in_flight: None,
+            },
+            hash_state: Some(HashState {
+                active_part_idx: 1,
+                bytes: active.serialize(),
+            }),
+            chunk_crc32c: None,
+            decoder_state: None,
+            mode: RunMode::Extract,
+            source_mtime: None,
+            cumulative_elapsed: Duration::ZERO,
+        }
+    }
+
+    // ---- magic / framing ---------------------------------------------
+
+    #[test]
+    fn header_layout_starts_with_magic_and_version() {
+        // The on-disk version is `Checkpoint::required_format_version`,
+        // which can dip below `FORMAT_VERSION` when the payload fits
+        // in an older layout (`SinkState::Rar` STORED-only writes
+        // v10 even on a v11-aware build). For a `SinkState::Raw`
+        // sample the required version is the v10 floor; we check
+        // both bounds.
+        let bytes = sample_raw().serialize();
+        assert_eq!(&bytes[0..8], &MAGIC);
+        let version = read_u32(&bytes[8..12]);
+        assert!(
+            (1..=FORMAT_VERSION).contains(&version),
+            "version {version} outside 1..={FORMAT_VERSION}"
+        );
+    }
+
+    #[test]
+    fn header_records_body_length_and_checksum() {
+        let bytes = sample_raw().serialize();
+        let body_len = read_u64(&bytes[12..20]) as usize;
+        let body_checksum = read_u64(&bytes[20..28]);
+        assert_eq!(bytes.len(), HEADER_LEN + body_len);
+        assert_eq!(fnv1a64(&bytes[HEADER_LEN..]), body_checksum);
+    }
+
+    // ---- round-trip --------------------------------------------------
+
+    #[test]
+    fn round_trip_raw_sink() {
+        let original = sample_raw();
+        let bytes = original.serialize();
+        let parsed = Checkpoint::deserialize(&bytes).expect("decode");
+        assert_eq!(parsed, original);
+    }
+
+    #[test]
+    fn round_trip_tar_sink() {
+        let original = sample_tar();
+        let bytes = original.serialize();
+        let parsed = Checkpoint::deserialize(&bytes).expect("decode");
+        assert_eq!(parsed, original);
+    }
+
+    fn sample_zip(current: Option<u32>, current_offset: u64) -> Checkpoint {
+        let url = "https://example.com/archive.zip".to_string();
+        let etag = Some("\"v9\"".to_string());
+        let last_modified = None;
+        let total_size = 9_876_543u64;
+        Checkpoint {
+            url: url.clone(),
+            etag: etag.clone(),
+            last_modified: last_modified.clone(),
+            parts: vec![PartRecord {
+                url,
+                size: total_size,
+                etag,
+                last_modified,
+                expected_sha256: None,
+                volume_role: None,
+            }],
+            total_size,
+            chunk_size: 4 * 1024 * 1024,
+            decoder_position: ByteOffset::new(0),
+            bitmap_completed: vec![0xCC; 8],
+            created_at: UNIX_EPOCH + Duration::new(1_700_000_000, 0),
+            sink_state: SinkState::Zip {
+                entries_completed: vec![0, 1, 2, 5, 7],
+                current_entry: current,
+                current_entry_offset: current_offset,
+                current_entry_decoder_state: None,
+            },
+            hash_state: None,
+            chunk_crc32c: None,
+            decoder_state: None,
+            mode: RunMode::Extract,
+            source_mtime: None,
+            cumulative_elapsed: Duration::ZERO,
+        }
+    }
+
+    #[test]
+    fn round_trip_zip_sink_quiescent() {
+        let original = sample_zip(None, 0);
+        let bytes = original.serialize();
+        let parsed = Checkpoint::deserialize(&bytes).expect("decode");
+        assert_eq!(parsed, original);
+    }
+
+    #[test]
+    fn round_trip_zip_sink_mid_entry() {
+        let original = sample_zip(Some(8), 1_234_567);
+        let bytes = original.serialize();
+        let parsed = Checkpoint::deserialize(&bytes).expect("decode");
+        assert_eq!(parsed, original);
+    }
+
+    #[test]
+    fn round_trip_zip_sink_no_completed_entries() {
+        // Edge case: zero completed entries with a current_entry
+        // mid-flight. Exercises the empty-vec encoding.
+        let mut ckpt = sample_zip(Some(0), 100);
+        if let SinkState::Zip {
+            entries_completed, ..
+        } = &mut ckpt.sink_state
+        {
+            entries_completed.clear();
+        }
+        let parsed = Checkpoint::deserialize(&ckpt.serialize()).expect("decode");
+        assert_eq!(parsed, ckpt);
+    }
+
+    #[test]
+    fn checkpoint_format_version_is_fifteen() {
+        // Sanity: PLAN_v2 §10 step 4 (v3), §11 step 1 (v4),
+        // OPTIMIZATIONS.md §O.7b (v5), the tar mid-member resume
+        // work (v6), `internal/PLAN_deflate_block_decoder.md` Phase 9b's
+        // zip per-entry decoder-state field (v7),
+        // `internal/PLAN_multi_url_source.md` §5's parts vec +
+        // active-part-aware hash state (v8),
+        // `internal/PLAN_7z_support.md` §9's `SinkState::Sevenz`
+        // variant (v9), `internal/PLAN_rar.md` §3's
+        // `SinkState::Rar` variant (v10),
+        // `internal/PLAN_rar5_decoder.md` §F1's
+        // `current_entry_decoder_state` blob (v11),
+        // `internal/PLAN_download_modes.md` §5's [`RunMode`] tag (v12),
+        // `internal/old/PLAN_local_file_extract.md` §5's
+        // [`RunMode::LocalDestructive`] + `source_mtime` trailer
+        // (v13), `internal/PLAN_multivolume_archives.md` §5's
+        // per-`PartRecord` [`VolumeRole`] tag (v14), the v15
+        // `cumulative_elapsed` trailer, and the v16 tar
+        // `pending_linkpath` override each bumped this when an
+        // optional field landed. If a future change resets it,
+        // this guards against silently dropping the
+        // upgrade-required signal older readers depend on.
+        assert_eq!(FORMAT_VERSION, 16);
+    }
+
+    // ---- §5: RunMode round-trip + forward-compat -----------------------
+
+    /// Build a minimal raw-sink checkpoint with the given mode for
+    /// the v12 round-trip / forward-compat tests below.
+    fn sample_mode_checkpoint(mode: RunMode) -> Checkpoint {
+        Checkpoint {
+            url: "https://example.com/blob.bin".to_string(),
+            etag: Some("\"v12-mode\"".to_string()),
+            last_modified: None,
+            parts: vec![PartRecord {
+                url: "https://example.com/blob.bin".to_string(),
+                size: 4096,
+                etag: Some("\"v12-mode\"".to_string()),
+                last_modified: None,
+                expected_sha256: None,
+                volume_role: None,
+            }],
+            total_size: 4096,
+            chunk_size: 1024,
+            decoder_position: ByteOffset::new(0),
+            bitmap_completed: vec![0xFF; 1],
+            created_at: UNIX_EPOCH + Duration::new(1_700_000_000, 0),
+            sink_state: SinkState::Raw { bytes_written: 0 },
+            hash_state: None,
+            chunk_crc32c: None,
+            decoder_state: None,
+            mode,
+            source_mtime: None,
+            cumulative_elapsed: Duration::ZERO,
+        }
+    }
+
+    #[test]
+    fn round_trip_run_mode_no_extract() {
+        let ckpt = sample_mode_checkpoint(RunMode::NoExtract);
+        let parsed = Checkpoint::deserialize(&ckpt.serialize()).expect("decode");
+        assert_eq!(parsed, ckpt);
+        assert_eq!(parsed.mode, RunMode::NoExtract);
+    }
+
+    #[test]
+    fn round_trip_run_mode_keep_archive() {
+        let ckpt = sample_mode_checkpoint(RunMode::KeepArchive);
+        let parsed = Checkpoint::deserialize(&ckpt.serialize()).expect("decode");
+        assert_eq!(parsed, ckpt);
+        assert_eq!(parsed.mode, RunMode::KeepArchive);
+    }
+
+    #[test]
+    fn default_mode_writes_pre_v12_format_byte_identical() {
+        // Byte-identical guarantee: a default-mode (Extract) Raw
+        // checkpoint must serialize to the pre-§5 v10 layout so
+        // unrelated regression tests that observe the on-disk
+        // size (or compare bytes) stay stable across the bump.
+        let ckpt = sample_mode_checkpoint(RunMode::Extract);
+        let bytes = ckpt.serialize();
+        // The header records the declared version. Default-mode +
+        // Raw sink ⇒ v10 (no later layout extension required).
+        let format_version = read_u32(&bytes[8..12]);
+        assert_eq!(
+            format_version, FORMAT_VERSION_RAR_STORED_ONLY,
+            "Extract-mode checkpoint should write v{FORMAT_VERSION_RAR_STORED_ONLY}, got v{format_version}",
+        );
+    }
+
+    #[test]
+    fn non_default_mode_bumps_format_version_to_twelve() {
+        // HTTP non-default modes (NoExtract, KeepArchive) still
+        // write v12 byte-identically; only the
+        // [`RunMode::LocalDestructive`] tail (v13) drives the
+        // header past v12.
+        for mode in [RunMode::NoExtract, RunMode::KeepArchive] {
+            let ckpt = sample_mode_checkpoint(mode);
+            let bytes = ckpt.serialize();
+            let format_version = read_u32(&bytes[8..12]);
+            assert_eq!(
+                format_version, FORMAT_VERSION_RUN_MODE,
+                "{mode:?} mode should write v{FORMAT_VERSION_RUN_MODE}, got v{format_version}",
+            );
+        }
+    }
+
+    #[test]
+    fn local_destructive_mode_bumps_format_version_to_thirteen() {
+        // §5 (`internal/old/PLAN_local_file_extract.md`): a
+        // [`RunMode::LocalDestructive`] checkpoint carries the
+        // `source_mtime` trailer and the writer upgrades the
+        // header to v13 so older readers refuse it cleanly.
+        let mut ckpt = sample_mode_checkpoint(RunMode::LocalDestructive);
+        ckpt.source_mtime = Some(UNIX_EPOCH + Duration::new(1_700_000_001, 42));
+        let bytes = ckpt.serialize();
+        let format_version = read_u32(&bytes[8..12]);
+        assert_eq!(
+            format_version, FORMAT_VERSION_LOCAL_DESTRUCTIVE,
+            "LocalDestructive should write v{FORMAT_VERSION_LOCAL_DESTRUCTIVE}, got v{format_version}",
+        );
+        let parsed = Checkpoint::deserialize(&bytes).expect("round-trip");
+        assert_eq!(parsed.mode, RunMode::LocalDestructive);
+        assert_eq!(parsed.source_mtime, ckpt.source_mtime);
+    }
+
+    #[test]
+    fn local_destructive_without_mtime_round_trips_with_none() {
+        // The presence byte is `0` when source_mtime is None; the
+        // deserializer must recover None and not synthesize an
+        // mtime.
+        let ckpt = sample_mode_checkpoint(RunMode::LocalDestructive);
+        assert_eq!(ckpt.source_mtime, None);
+        let bytes = ckpt.serialize();
+        let parsed = Checkpoint::deserialize(&bytes).expect("round-trip");
+        assert_eq!(parsed.mode, RunMode::LocalDestructive);
+        assert_eq!(parsed.source_mtime, None);
+    }
+
+    // ---- v15: cumulative_elapsed round-trip + forward-compat ---------
+
+    #[test]
+    fn zero_cumulative_elapsed_does_not_bump_to_v15() {
+        // Byte-identical guarantee: a ZERO-valued cumulative_elapsed
+        // keeps the v8..=v14 layout so existing regression tests
+        // that observe checkpoint bytes (or sizes) stay stable.
+        let ckpt = sample_raw();
+        assert_eq!(ckpt.cumulative_elapsed, Duration::ZERO);
+        let bytes = ckpt.serialize();
+        let format_version = read_u32(&bytes[8..12]);
+        assert!(
+            format_version < FORMAT_VERSION_CUMULATIVE_ELAPSED,
+            "zero cumulative_elapsed should not bump to v{FORMAT_VERSION_CUMULATIVE_ELAPSED}; got v{format_version}",
+        );
+        // And reading it back must round-trip with ZERO.
+        let parsed = Checkpoint::deserialize(&bytes).expect("decode");
+        assert_eq!(parsed.cumulative_elapsed, Duration::ZERO);
+    }
+
+    #[test]
+    fn nonzero_cumulative_elapsed_bumps_format_version_to_fifteen() {
+        // A populated value forces the v15 header so older binaries
+        // refuse the file cleanly instead of skipping the trailer.
+        let mut ckpt = sample_raw();
+        ckpt.cumulative_elapsed = Duration::from_millis(123_456);
+        let bytes = ckpt.serialize();
+        let format_version = read_u32(&bytes[8..12]);
+        assert_eq!(
+            format_version, FORMAT_VERSION_CUMULATIVE_ELAPSED,
+            "non-zero cumulative_elapsed should write v{FORMAT_VERSION_CUMULATIVE_ELAPSED}, got v{format_version}",
+        );
+        let parsed = Checkpoint::deserialize(&bytes).expect("decode");
+        assert_eq!(parsed.cumulative_elapsed, Duration::from_millis(123_456));
+    }
+
+    #[test]
+    fn cumulative_elapsed_round_trips_subsecond_precision() {
+        // The trailer is u64 secs + u32 nanos; verify both halves
+        // survive a write/read cycle.
+        let mut ckpt = sample_raw();
+        ckpt.cumulative_elapsed = Duration::new(7_200, 987_654_321);
+        let bytes = ckpt.serialize();
+        let parsed = Checkpoint::deserialize(&bytes).expect("decode");
+        assert_eq!(parsed.cumulative_elapsed, Duration::new(7_200, 987_654_321),);
+    }
+
+    // ---- §5: multi-volume VolumeRole round-trip + forward-compat -----
+
+    /// Build a multi-part checkpoint whose `parts` carry the
+    /// supplied volume roles. Used for the v14 round-trip and
+    /// version-bump assertions below.
+    fn sample_volume_role_checkpoint(roles: &[Option<VolumeRole>]) -> Checkpoint {
+        assert!(!roles.is_empty(), "at least one part required");
+        let parts: Vec<PartRecord> = roles
+            .iter()
+            .enumerate()
+            .map(|(i, role)| PartRecord {
+                url: format!("https://h/multi.part{:04}.rar", i + 1),
+                size: 1024 * 1024,
+                etag: Some(format!("\"p{i}\"")),
+                last_modified: None,
+                expected_sha256: None,
+                volume_role: *role,
+            })
+            .collect();
+        let total_size: u64 = parts.iter().map(|p| p.size).sum();
+        Checkpoint {
+            url: parts[0].url.clone(),
+            etag: parts[0].etag.clone(),
+            last_modified: None,
+            parts,
+            total_size,
+            chunk_size: 256 * 1024,
+            decoder_position: ByteOffset::new(0),
+            bitmap_completed: vec![0xFFu8; 16],
+            created_at: UNIX_EPOCH + Duration::new(1_900_000_000, 0),
+            sink_state: SinkState::Raw { bytes_written: 0 },
+            hash_state: None,
+            chunk_crc32c: None,
+            decoder_state: None,
+            mode: RunMode::Extract,
+            source_mtime: None,
+            cumulative_elapsed: Duration::ZERO,
+        }
+    }
+
+    #[test]
+    fn round_trip_volume_role_rar5() {
+        let ckpt = sample_volume_role_checkpoint(&[
+            Some(VolumeRole::Rar5Volume),
+            Some(VolumeRole::Rar5Volume),
+            Some(VolumeRole::Rar5Volume),
+        ]);
+        let parsed = Checkpoint::deserialize(&ckpt.serialize()).expect("decode");
+        assert_eq!(parsed, ckpt);
+        for part in &parsed.parts {
+            assert_eq!(part.volume_role, Some(VolumeRole::Rar5Volume));
+        }
+    }
+
+    #[test]
+    fn round_trip_volume_role_sevenz_and_zip() {
+        // Each format gets at least one round-trip so all three
+        // tag values are exercised by the encode/decode loop.
+        for role in [VolumeRole::SevenZVolume, VolumeRole::ZipSpannedVolume] {
+            let ckpt = sample_volume_role_checkpoint(&[Some(role), Some(role)]);
+            let parsed = Checkpoint::deserialize(&ckpt.serialize()).expect("decode");
+            assert_eq!(parsed, ckpt);
+            assert!(parsed.parts.iter().all(|p| p.volume_role == Some(role)));
+        }
+    }
+
+    #[test]
+    fn volume_role_bumps_format_version_to_fourteen() {
+        // At least one Some(role) → the writer must declare v14
+        // in the header so older binaries refuse cleanly with
+        // UnsupportedVersion rather than silently dropping the
+        // per-part trailer.
+        let ckpt = sample_volume_role_checkpoint(&[Some(VolumeRole::Rar5Volume)]);
+        let bytes = ckpt.serialize();
+        let format_version = read_u32(&bytes[8..12]);
+        assert_eq!(
+            format_version, FORMAT_VERSION_MULTIVOLUME,
+            "a populated volume_role should write v{FORMAT_VERSION_MULTIVOLUME}, got v{format_version}",
+        );
+    }
+
+    #[test]
+    fn all_none_volume_role_does_not_bump_to_v14() {
+        // Byte-identical guarantee: a multi-URL or single-source
+        // checkpoint whose parts all have `volume_role: None`
+        // serializes to the pre-v14 layout. The actual on-disk
+        // version is `required_format_version`, which dips below
+        // v14 for payloads that fit older layouts (a Raw-sink
+        // Extract-mode all-None checkpoint sits at v10).
+        let ckpt = sample_volume_role_checkpoint(&[None, None, None]);
+        let bytes = ckpt.serialize();
+        let format_version = read_u32(&bytes[8..12]);
+        assert!(
+            format_version < FORMAT_VERSION_MULTIVOLUME,
+            "all-None volume_role should not bump to v{FORMAT_VERSION_MULTIVOLUME}; got v{format_version}",
+        );
+        // And reading it back must round-trip with every part's
+        // volume_role decoded as None.
+        let parsed = Checkpoint::deserialize(&bytes).expect("decode");
+        assert_eq!(parsed, ckpt);
+        for part in &parsed.parts {
+            assert_eq!(part.volume_role, None);
+        }
+    }
+
+    #[test]
+    fn mixed_volume_role_writes_full_v14_trailer_for_every_part() {
+        // The writer's per-part trailer is unconditional once any
+        // part carries `Some(role)` — the read loop has a fixed
+        // shape at v14. Verify a mixed vec round-trips by reading
+        // back each part's role exactly.
+        let ckpt = sample_volume_role_checkpoint(&[
+            Some(VolumeRole::Rar5Volume),
+            None,
+            Some(VolumeRole::Rar5Volume),
+        ]);
+        let bytes = ckpt.serialize();
+        let format_version = read_u32(&bytes[8..12]);
+        assert_eq!(format_version, FORMAT_VERSION_MULTIVOLUME);
+        let parsed = Checkpoint::deserialize(&bytes).expect("decode");
+        assert_eq!(parsed, ckpt);
+        let roles: Vec<Option<VolumeRole>> = parsed.parts.iter().map(|p| p.volume_role).collect();
+        assert_eq!(
+            roles,
+            vec![
+                Some(VolumeRole::Rar5Volume),
+                None,
+                Some(VolumeRole::Rar5Volume)
+            ],
+        );
+    }
+
+    #[test]
+    fn rejects_invalid_volume_role_tag() {
+        // Hand-build a v14 body with parts.len()=1 carrying a
+        // volume_role presence byte = 1 (Some) and an unknown tag
+        // value. Reader must surface InvalidEnumTag for
+        // `parts[].volume_role` rather than silently mapping to a
+        // default variant.
+        let mut body = Vec::new();
+        write_u32(&mut body, 1); // parts.len = 1
+        write_string(&mut body, "u");
+        write_u64(&mut body, 0); // size
+        write_optional_string(&mut body, None); // etag
+        write_optional_string(&mut body, None); // last_modified
+        body.push(0); // expected_sha256 absent
+        body.push(1); // volume_role presence
+        body.push(0xEE); // unknown volume_role tag
+
+        let body_len = body.len() as u64;
+        let body_checksum = fnv1a64(&body);
+        let mut buf = Vec::with_capacity(HEADER_LEN + body.len());
+        buf.extend_from_slice(&MAGIC);
+        write_u32(&mut buf, FORMAT_VERSION_MULTIVOLUME);
+        write_u64(&mut buf, body_len);
+        write_u64(&mut buf, body_checksum);
+        buf.extend_from_slice(&body);
+
+        match Checkpoint::deserialize(&buf).unwrap_err() {
+            CheckpointError::InvalidEnumTag { field, tag } => {
+                assert_eq!(tag, 0xEE);
+                assert_eq!(field, "parts[].volume_role");
+            }
+            other => panic!("expected InvalidEnumTag(volume_role), got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn rejects_invalid_volume_role_presence_byte() {
+        // Same shape as above but with the presence byte itself
+        // out of range. Reader must surface InvalidPresence rather
+        // than the InvalidEnumTag arm.
+        let mut body = Vec::new();
+        write_u32(&mut body, 1);
+        write_string(&mut body, "u");
+        write_u64(&mut body, 0);
+        write_optional_string(&mut body, None);
+        write_optional_string(&mut body, None);
+        body.push(0); // expected_sha256 absent
+        body.push(7); // bogus volume_role presence
+
+        let body_len = body.len() as u64;
+        let body_checksum = fnv1a64(&body);
+        let mut buf = Vec::with_capacity(HEADER_LEN + body.len());
+        buf.extend_from_slice(&MAGIC);
+        write_u32(&mut buf, FORMAT_VERSION_MULTIVOLUME);
+        write_u64(&mut buf, body_len);
+        write_u64(&mut buf, body_checksum);
+        buf.extend_from_slice(&body);
+
+        match Checkpoint::deserialize(&buf).unwrap_err() {
+            CheckpointError::InvalidPresence { field, value } => {
+                assert_eq!(value, 7);
+                assert_eq!(field, "parts[].volume_role");
+            }
+            other => panic!("expected InvalidPresence(volume_role), got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn v13_checkpoint_bytes_decode_with_volume_role_none() {
+        // Forward-compat: a v13 body (multi-URL, Raw sink, no
+        // mode trailer) read by the v14 reader must surface every
+        // part's volume_role as None — the reader's `format_version
+        // >= 14` dispatch must NOT consume any bytes for v13
+        // checkpoints. Build the body by hand at v8 layout (which
+        // every version up to and including v13 inherits for the
+        // parts loop), frame at v13.
+        let mut body = Vec::new();
+        write_u32(&mut body, 2); // parts.len = 2
+                                 // parts[0]
+        write_string(&mut body, "https://h/a");
+        write_u64(&mut body, 1024);
+        write_optional_string(&mut body, Some("\"e0\""));
+        write_optional_string(&mut body, None);
+        body.push(0); // expected_sha256 absent
+                      // parts[1]
+        write_string(&mut body, "https://h/b");
+        write_u64(&mut body, 2048);
+        write_optional_string(&mut body, None);
+        write_optional_string(&mut body, None);
+        body.push(0); // expected_sha256 absent
+        write_u64(&mut body, 3072); // total_size
+        write_u64(&mut body, 1024); // chunk_size
+        write_u64(&mut body, 0); // decoder_position
+        write_byte_array(&mut body, &[0xFFu8; 1]);
+        write_i64(&mut body, 1_700_000_000);
+        write_u32(&mut body, 0);
+        body.push(SINK_TAG_RAW);
+        write_u64(&mut body, 0);
+        body.push(0); // hash_state absent
+        body.push(0); // chunk_crc32c absent
+        body.push(0); // decoder_state absent
+                      // Skip the v12 mode trailer — Extract is implicit when
+                      // remaining() == 0.
+
+        let bytes = frame_legacy_body(&body, 13);
+        let parsed = Checkpoint::deserialize(&bytes).expect("v13 still parses");
+        assert_eq!(parsed.parts.len(), 2);
+        for part in &parsed.parts {
+            assert_eq!(
+                part.volume_role, None,
+                "v13 readers should not conjure a volume_role",
+            );
+        }
+    }
+
+    #[test]
+    fn pre_v12_checkpoints_decode_as_extract_mode() {
+        // Forward-compat: take a v12 Extract checkpoint (which
+        // writes the v10 layout byte-identically) and confirm the
+        // deserializer synthesizes `mode: Extract` for it. The
+        // serialized bytes are equivalent to what a pre-v12 writer
+        // would have produced.
+        let ckpt = sample_mode_checkpoint(RunMode::Extract);
+        let bytes = ckpt.serialize();
+        let parsed = Checkpoint::deserialize(&bytes).expect("decode");
+        assert_eq!(parsed.mode, RunMode::Extract);
+    }
+
+    fn sample_sevenz(folders_completed: Vec<u32>, current_folder: Option<u32>) -> Checkpoint {
+        Checkpoint {
+            url: "https://example.com/dataset.7z".to_string(),
+            etag: Some("\"v1\"".to_string()),
+            last_modified: None,
+            parts: vec![PartRecord {
+                url: "https://example.com/dataset.7z".to_string(),
+                size: 4_096_000,
+                etag: Some("\"v1\"".to_string()),
+                last_modified: None,
+                expected_sha256: None,
+                volume_role: None,
+            }],
+            total_size: 4_096_000,
+            chunk_size: 65_536,
+            decoder_position: ByteOffset::new(123_456),
+            bitmap_completed: vec![0xFFu8; 16],
+            created_at: SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(1_700_000_000),
+            sink_state: SinkState::Sevenz {
+                folders_completed,
+                current_folder,
+            },
+            hash_state: None,
+            chunk_crc32c: None,
+            decoder_state: None,
+            mode: RunMode::Extract,
+            source_mtime: None,
+            cumulative_elapsed: Duration::ZERO,
+        }
+    }
+
+    #[test]
+    fn round_trip_sevenz_sink_quiescent() {
+        let original = sample_sevenz(vec![0, 1, 2], None);
+        let bytes = original.serialize();
+        let parsed = Checkpoint::deserialize(&bytes).expect("decode");
+        assert_eq!(parsed, original);
+    }
+
+    #[test]
+    fn round_trip_sevenz_sink_mid_folder() {
+        let original = sample_sevenz(vec![0, 1], Some(2));
+        let bytes = original.serialize();
+        let parsed = Checkpoint::deserialize(&bytes).expect("decode");
+        assert_eq!(parsed, original);
+    }
+
+    #[test]
+    fn round_trip_sevenz_sink_empty_folders_completed() {
+        let original = sample_sevenz(vec![], Some(0));
+        let bytes = original.serialize();
+        let parsed = Checkpoint::deserialize(&bytes).expect("decode");
+        assert_eq!(parsed, original);
+    }
+
+    fn sample_rar(
+        entries_completed: Vec<u32>,
+        current_entry: Option<u32>,
+        current_entry_offset: u64,
+    ) -> Checkpoint {
+        Checkpoint {
+            url: "https://example.com/dataset.rar".to_string(),
+            etag: Some("\"v1\"".to_string()),
+            last_modified: None,
+            parts: vec![PartRecord {
+                url: "https://example.com/dataset.rar".to_string(),
+                size: 8_192_000,
+                etag: Some("\"v1\"".to_string()),
+                last_modified: None,
+                expected_sha256: None,
+                volume_role: None,
+            }],
+            total_size: 8_192_000,
+            chunk_size: 65_536,
+            decoder_position: ByteOffset::new(123_456),
+            bitmap_completed: vec![0xFFu8; 16],
+            created_at: SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(1_700_000_000),
+            sink_state: SinkState::Rar {
+                entries_completed,
+                current_entry,
+                current_entry_offset,
+                current_entry_decoder_state: None,
+            },
+            hash_state: None,
+            chunk_crc32c: None,
+            decoder_state: None,
+            mode: RunMode::Extract,
+            source_mtime: None,
+            cumulative_elapsed: Duration::ZERO,
+        }
+    }
+
+    #[test]
+    fn round_trip_rar_sink_quiescent() {
+        let original = sample_rar(vec![0, 1, 2], None, 0);
+        let bytes = original.serialize();
+        let parsed = Checkpoint::deserialize(&bytes).expect("decode");
+        assert_eq!(parsed, original);
+    }
+
+    #[test]
+    fn round_trip_rar_sink_mid_entry() {
+        let original = sample_rar(vec![0, 1], Some(2), 12_345);
+        let bytes = original.serialize();
+        let parsed = Checkpoint::deserialize(&bytes).expect("decode");
+        assert_eq!(parsed, original);
+    }
+
+    #[test]
+    fn round_trip_rar_sink_empty_entries_completed() {
+        let original = sample_rar(vec![], Some(0), 0);
+        let bytes = original.serialize();
+        let parsed = Checkpoint::deserialize(&bytes).expect("decode");
+        assert_eq!(parsed, original);
+    }
+
+    fn build_legacy_body_raw_sink() -> Vec<u8> {
+        // Hand-build the v1 / v2 body for a `Raw`-sink checkpoint
+        // — same layout as v3 *minus* the trailing hash_state byte.
+        let mut body = Vec::new();
+        write_string(&mut body, "https://example.com/file.zst");
+        write_optional_string(&mut body, Some("\"v1\""));
+        write_optional_string(&mut body, None);
+        write_u64(&mut body, 1_048_576);
+        write_u64(&mut body, 65_536);
+        write_u64(&mut body, 32_768);
+        write_byte_array(&mut body, &[0xFFu8; 16]);
+        write_i64(&mut body, 1_700_000_000);
+        write_u32(&mut body, 12_345);
+        body.push(SINK_TAG_RAW);
+        write_u64(&mut body, 4096);
+        body
+    }
+
+    fn frame_legacy_body(body: &[u8], version: u32) -> Vec<u8> {
+        let body_len = body.len() as u64;
+        let body_checksum = fnv1a64(body);
+        let mut buf = Vec::with_capacity(HEADER_LEN + body.len());
+        buf.extend_from_slice(&MAGIC);
+        write_u32(&mut buf, version);
+        write_u64(&mut buf, body_len);
+        write_u64(&mut buf, body_checksum);
+        buf.extend_from_slice(body);
+        buf
+    }
+
+    #[test]
+    fn v1_checkpoint_bytes_still_parse_after_version_bump() {
+        // Construct a literal v1 wire image and verify the v3 reader
+        // parses it transparently (with `hash_state = None`).
+        let body = build_legacy_body_raw_sink();
+        let bytes = frame_legacy_body(&body, 1);
+        let parsed = Checkpoint::deserialize(&bytes).expect("v1 still parses");
+        assert_eq!(parsed.url, "https://example.com/file.zst");
+        assert_eq!(parsed.etag.as_deref(), Some("\"v1\""));
+        assert_eq!(parsed.total_size, 1_048_576);
+        assert!(parsed.hash_state.is_none());
+    }
+
+    #[test]
+    fn v2_checkpoint_bytes_still_parse_after_version_bump() {
+        // Same shape — a v2 file that predates the hash_state
+        // trailer must still load with `hash_state = None`.
+        let body = build_legacy_body_raw_sink();
+        let bytes = frame_legacy_body(&body, 2);
+        let parsed = Checkpoint::deserialize(&bytes).expect("v2 still parses");
+        assert!(parsed.hash_state.is_none());
+    }
+
+    #[test]
+    fn v3_checkpoint_bytes_still_parse_after_v5_bump() {
+        // A v3 file (raw sink, hash_state = None) must still load
+        // under the v5 reader with both `chunk_crc32c` and
+        // `decoder_state` defaulted to `None`.
+        let mut body = build_legacy_body_raw_sink();
+        body.push(0); // hash_state = None
+        let bytes = frame_legacy_body(&body, 3);
+        let parsed = Checkpoint::deserialize(&bytes).expect("v3 still parses");
+        assert!(parsed.hash_state.is_none());
+        assert!(parsed.chunk_crc32c.is_none());
+        assert!(parsed.decoder_state.is_none());
+    }
+
+    #[test]
+    fn v4_checkpoint_bytes_still_parse_after_v5_bump() {
+        // A v4 file (raw sink, hash_state and chunk_crc32c both
+        // None) must still load under the v5 reader with
+        // `decoder_state = None`.
+        let mut body = build_legacy_body_raw_sink();
+        body.push(0); // hash_state = None
+        body.push(0); // chunk_crc32c = None
+        let bytes = frame_legacy_body(&body, 4);
+        let parsed = Checkpoint::deserialize(&bytes).expect("v4 still parses");
+        assert!(parsed.hash_state.is_none());
+        assert!(parsed.chunk_crc32c.is_none());
+        assert!(parsed.decoder_state.is_none());
+    }
+
+    #[test]
+    fn v5_checkpoint_bytes_still_parse_after_v6_bump() {
+        // A v5 file (raw sink, all trailing optionals = None) must
+        // still load under the v6 reader. The Tar in_flight field
+        // is v6-only so a Raw v5 file doesn't exercise it; we test
+        // it separately below with a hand-built v5 Tar body.
+        let mut body = build_legacy_body_raw_sink();
+        body.push(0); // hash_state
+        body.push(0); // chunk_crc32c
+        body.push(0); // decoder_state (v5)
+        let bytes = frame_legacy_body(&body, 5);
+        let parsed = Checkpoint::deserialize(&bytes).expect("v5 still parses");
+        assert!(parsed.decoder_state.is_none());
+    }
+
+    #[test]
+    fn v5_tar_body_parses_with_in_flight_none() {
+        // Hand-build a v5 Tar body (no in_flight trailer) and
+        // verify the v6 reader fills `in_flight: None`.
+        let mut body = Vec::new();
+        write_string(&mut body, "https://example.com/x.tar.zst");
+        write_optional_string(&mut body, None);
+        write_optional_string(&mut body, None);
+        write_u64(&mut body, 1024);
+        write_u64(&mut body, 64);
+        write_u64(&mut body, 0);
+        write_byte_array(&mut body, &[0xFFu8; 4]);
+        write_i64(&mut body, 1_700_000_000);
+        write_u32(&mut body, 0);
+        body.push(SINK_TAG_TAR);
+        write_u32(&mut body, 0); // members_completed empty
+        body.push(0); // hash_state
+        body.push(0); // chunk_crc32c
+        body.push(0); // decoder_state
+
+        let bytes = frame_legacy_body(&body, 5);
+        let parsed = Checkpoint::deserialize(&bytes).expect("v5 tar parses");
+        match parsed.sink_state {
+            SinkState::Tar { in_flight, .. } => assert!(in_flight.is_none()),
+            other => panic!("expected Tar, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn v6_zip_body_parses_with_decoder_state_none() {
+        // Hand-build a v6 Zip body (with current_entry mid-flight,
+        // no v7 decoder-state trailer) and verify the v7 reader
+        // fills `current_entry_decoder_state: None`. Pins
+        // backward-compat for the Phase-9b format bump.
+        let mut body = Vec::new();
+        write_string(&mut body, "https://example.com/x.zip");
+        write_optional_string(&mut body, None);
+        write_optional_string(&mut body, None);
+        write_u64(&mut body, 1024);
+        write_u64(&mut body, 64);
+        write_u64(&mut body, 0);
+        write_byte_array(&mut body, &[0xFFu8; 4]);
+        write_i64(&mut body, 1_700_000_000);
+        write_u32(&mut body, 0);
+        body.push(SINK_TAG_ZIP);
+        // entries_completed = [0, 1]
+        write_u32(&mut body, 2);
+        write_u32(&mut body, 0);
+        write_u32(&mut body, 1);
+        // current_entry = Some(2)
+        body.push(1);
+        write_u32(&mut body, 2);
+        // current_entry_offset = 12_345
+        write_u64(&mut body, 12_345);
+        // v6 ends here for Zip (no v7 decoder_state trailer).
+        // Trailing v3 / v4 / v5 optionals.
+        body.push(0); // hash_state
+        body.push(0); // chunk_crc32c
+        body.push(0); // checkpoint-level decoder_state
+
+        let bytes = frame_legacy_body(&body, 6);
+        let parsed = Checkpoint::deserialize(&bytes).expect("v6 zip parses under v7 reader");
+        match parsed.sink_state {
+            SinkState::Zip {
+                current_entry,
+                current_entry_offset,
+                current_entry_decoder_state,
+                ..
+            } => {
+                assert_eq!(current_entry, Some(2));
+                assert_eq!(current_entry_offset, 12_345);
+                assert!(
+                    current_entry_decoder_state.is_none(),
+                    "v6 readers shouldn't conjure a decoder-state blob"
+                );
+            }
+            other => panic!("expected Zip, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn round_trip_tar_in_flight_file_state() {
+        // Capture-mid-file is the load-bearing v6 case. The
+        // resumed sink reopens the path at offset
+        // `total_size - remaining` and continues; the on-disk
+        // serialization round-trips exactly.
+        let mut ckpt = sample_tar();
+        match &mut ckpt.sink_state {
+            SinkState::Tar { in_flight, .. } => {
+                *in_flight = Some(TarSinkState {
+                    archive_offset: 1_234_567,
+                    zero_blocks_seen: 0,
+                    pending_path: Some("pax-overrides-this-name".into()),
+                    pending_size: Some(987_654_321),
+                    pending_linkpath: None,
+                    state: TarMemberState::File {
+                        remaining: 100_000,
+                        padding: 384,
+                        path: "deep/nested/file.bin".into(),
+                        total_size: 500_000,
+                    },
+                });
+            }
+            _ => panic!("sample_tar should produce Tar"),
+        }
+        let parsed = Checkpoint::deserialize(&ckpt.serialize()).expect("decode");
+        assert_eq!(parsed, ckpt);
+    }
+
+    #[test]
+    fn round_trip_tar_in_flight_pax_state() {
+        let mut ckpt = sample_tar();
+        match &mut ckpt.sink_state {
+            SinkState::Tar { in_flight, .. } => {
+                *in_flight = Some(TarSinkState {
+                    archive_offset: 42,
+                    zero_blocks_seen: 0,
+                    pending_path: None,
+                    pending_size: None,
+                    pending_linkpath: None,
+                    state: TarMemberState::PaxData {
+                        remaining: 256,
+                        padding: 256,
+                        buf: b"path=overlong/path.bin\nsize=12345\n".to_vec(),
+                    },
+                });
+            }
+            _ => panic!("sample_tar should produce Tar"),
+        }
+        let parsed = Checkpoint::deserialize(&ckpt.serialize()).expect("decode");
+        assert_eq!(parsed, ckpt);
+    }
+
+    /// v16: a buffered symlink / hard-link target override
+    /// (`pending_linkpath`) — captured between a `K` / PAX `linkpath`
+    /// header and the link entry it applies to — bumps the on-disk
+    /// version to 16 and round-trips through serialize/deserialize.
+    #[test]
+    fn round_trip_tar_in_flight_pending_linkpath() {
+        let mut ckpt = sample_tar();
+        match &mut ckpt.sink_state {
+            SinkState::Tar { in_flight, .. } => {
+                *in_flight = Some(TarSinkState {
+                    archive_offset: 1024,
+                    zero_blocks_seen: 0,
+                    pending_path: None,
+                    pending_size: None,
+                    pending_linkpath: Some("nested/long/symlink/target.bin".into()),
+                    state: TarMemberState::Header {
+                        filled: 0,
+                        buf: Vec::new(),
+                    },
+                });
+            }
+            _ => panic!("sample_tar should produce Tar"),
+        }
+        let bytes = ckpt.serialize();
+        // The presence of pending_linkpath forces the v16 on-disk
+        // version (read straight from the header at bytes 8..12).
+        assert_eq!(read_u32(&bytes[8..12]), FORMAT_VERSION_TAR_LINKPATH);
+        let parsed = Checkpoint::deserialize(&bytes).expect("decode");
+        assert_eq!(parsed, ckpt);
+    }
+
+    /// A tar checkpoint *without* a buffered link target keeps the
+    /// pre-v16 on-disk layout — the field must not silently bump the
+    /// version (older readers depend on that).
+    #[test]
+    fn tar_without_pending_linkpath_stays_pre_v16() {
+        let mut ckpt = sample_tar();
+        match &mut ckpt.sink_state {
+            SinkState::Tar { in_flight, .. } => {
+                *in_flight = Some(TarSinkState {
+                    archive_offset: 1024,
+                    zero_blocks_seen: 0,
+                    pending_path: None,
+                    pending_size: None,
+                    pending_linkpath: None,
+                    state: TarMemberState::Header {
+                        filled: 0,
+                        buf: Vec::new(),
+                    },
+                });
+            }
+            _ => panic!("sample_tar should produce Tar"),
+        }
+        let bytes = ckpt.serialize();
+        assert!(
+            read_u32(&bytes[8..12]) < FORMAT_VERSION_TAR_LINKPATH,
+            "a None pending_linkpath must not bump the on-disk version",
+        );
+        let parsed = Checkpoint::deserialize(&bytes).expect("decode");
+        assert_eq!(parsed, ckpt);
+    }
+
+    #[test]
+    fn deserialize_rejects_tar_header_filled_over_512() {
+        let mut ckpt = sample_tar();
+        match &mut ckpt.sink_state {
+            SinkState::Tar { in_flight, .. } => {
+                *in_flight = Some(TarSinkState {
+                    archive_offset: 0,
+                    zero_blocks_seen: 0,
+                    pending_path: None,
+                    pending_size: None,
+                    pending_linkpath: None,
+                    state: TarMemberState::Header {
+                        filled: 0,
+                        buf: Vec::new(),
+                    },
+                });
+            }
+            _ => panic!(),
+        }
+        let mut bytes = ckpt.serialize();
+        // Find the `filled` field: it is the u32 immediately after
+        // the in-flight presence byte. Trick is finding that byte —
+        // serialize layout is deterministic but long; cheaper to
+        // re-serialize with filled = 1024 directly. Construct a
+        // poisoned blob via deserialize → mutate → reserialize is
+        // also OK; do it inline.
+        // We poke the SinkState::Tar::in_flight `filled` field by
+        // searching for the magic 0u32 that should be `filled` = 0.
+        // Since the body precedes it with a Header tag (0x00) and
+        // the serialized layout has many zero bytes, just use a
+        // structured re-serialization instead.
+        let _ = &mut bytes;
+        // Simpler: directly serialize a poisoned blob via the
+        // helper with filled = 1024 (out of range).
+        let mut body = Vec::new();
+        write_tar_member_state(
+            &mut body,
+            &TarMemberState::Header {
+                filled: 1024, // > 512: must be rejected
+                buf: vec![0u8; 0],
+            },
+        );
+        // Try to deserialize that one-off blob.
+        let mut cursor = Cursor::new(&body);
+        match read_tar_member_state(&mut cursor) {
+            Err(CheckpointError::Truncated { reason }) => {
+                assert!(reason.contains("filled"), "reason: {reason}");
+            }
+            other => panic!("expected Truncated, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn round_trip_with_hash_state_present() {
+        let mut state = crate::hash::sha256::Sha256::new();
+        state.update(b"hello world");
+        let serialized = state.serialize();
+        let mut ckpt = sample_raw();
+        ckpt.hash_state = Some(HashState {
+            active_part_idx: 0,
+            bytes: serialized,
+        });
+
+        let parsed = Checkpoint::deserialize(&ckpt.serialize()).expect("decode");
+        assert_eq!(parsed, ckpt);
+        let saved = parsed.hash_state.expect("present");
+        assert_eq!(saved.bytes, serialized);
+        assert_eq!(saved.active_part_idx, 0);
+    }
+
+    #[test]
+    fn rejects_invalid_hash_state_presence_byte() {
+        // Build a valid v5 body with all trailing flags absent
+        // (hash_state at -3, chunk_crc32c at -2, decoder_state at
+        // -1) and poke the hash_state byte specifically.
+        let mut bytes = sample_raw().serialize();
+        let hash_state_byte = bytes.len() - 3;
+        bytes[hash_state_byte] = 7;
+        // Recompute the body checksum so the integrity check
+        // doesn't fire first.
+        let body_start = HEADER_LEN;
+        let new_checksum = fnv1a64(&bytes[body_start..]);
+        bytes[20..28].copy_from_slice(&new_checksum.to_le_bytes());
+
+        match Checkpoint::deserialize(&bytes).unwrap_err() {
+            CheckpointError::InvalidPresence { value, field } => {
+                assert_eq!(value, 7);
+                assert_eq!(field, "hash_state");
+            }
+            other => panic!("expected InvalidPresence(hash_state), got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn rejects_invalid_chunk_crc32c_presence_byte() {
+        // Build a valid v5 body and poke the chunk_crc32c presence
+        // byte (offset -2; decoder_state lives at -1) to an
+        // out-of-range value.
+        let mut bytes = sample_raw().serialize();
+        let crc_byte = bytes.len() - 2;
+        bytes[crc_byte] = 5;
+        let body_start = HEADER_LEN;
+        let new_checksum = fnv1a64(&bytes[body_start..]);
+        bytes[20..28].copy_from_slice(&new_checksum.to_le_bytes());
+
+        match Checkpoint::deserialize(&bytes).unwrap_err() {
+            CheckpointError::InvalidPresence { value, field } => {
+                assert_eq!(value, 5);
+                assert_eq!(field, "chunk_crc32c");
+            }
+            other => panic!("expected InvalidPresence(chunk_crc32c), got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn rejects_oversized_parts_count() {
+        // Regression for cargo-fuzz target `checkpoint_deserialize`
+        // OOM (artifact oom-0b10b89f...): a v8 body that declares
+        // `parts.len = 0xFFFFFF24` previously reached
+        // `Vec::with_capacity(~4.29e9)` and tried to allocate ~515 GB
+        // before failing inside the read loop. The bounded-count
+        // helper must reject the count up front.
+        let mut body = Vec::new();
+        write_u32(&mut body, 0xFFFF_FF24); // parts.len — far beyond what could fit
+                                           // Append a few trailing bytes; their content does not matter
+                                           // because the count check fires first.
+        body.extend_from_slice(&[0u8; 16]);
+        let bytes = frame_legacy_body(&body, 8);
+
+        match Checkpoint::deserialize(&bytes).unwrap_err() {
+            CheckpointError::Truncated { reason } => {
+                assert!(
+                    reason.contains("parts.len"),
+                    "reason should name the offending field, got {reason:?}",
+                );
+            }
+            other => panic!("expected Truncated(parts.len), got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn rejects_invalid_decoder_state_presence_byte() {
+        // Poke the trailing decoder_state presence byte (offset -1)
+        // to an out-of-range value; recompute the checksum so
+        // integrity doesn't fire first.
+        let mut bytes = sample_raw().serialize();
+        let last = bytes.len() - 1;
+        bytes[last] = 9;
+        let body_start = HEADER_LEN;
+        let new_checksum = fnv1a64(&bytes[body_start..]);
+        bytes[20..28].copy_from_slice(&new_checksum.to_le_bytes());
+
+        match Checkpoint::deserialize(&bytes).unwrap_err() {
+            CheckpointError::InvalidPresence { value, field } => {
+                assert_eq!(value, 9);
+                assert_eq!(field, "decoder_state");
+            }
+            other => panic!("expected InvalidPresence(decoder_state), got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn round_trip_with_decoder_state_present() {
+        let mut ckpt = sample_raw();
+        ckpt.decoder_state = Some(vec![0xDE, 0xAD, 0xBE, 0xEF, 0x42, 0x00, 0x01]);
+        let parsed = Checkpoint::deserialize(&ckpt.serialize()).expect("decode");
+        assert_eq!(parsed, ckpt);
+    }
+
+    #[test]
+    fn rejects_decoder_state_blob_over_cap() {
+        // Hand-build a v5 body that declares a decoder_state length
+        // exceeding MAX_DECODER_STATE_LEN. The deserializer must
+        // surface a Truncated error before allocating the blob.
+        let mut bytes = sample_raw().serialize();
+        // Strip the trailing `decoder_state = None` byte (0x00) and
+        // replace it with `presence = 1` + `len = MAX + 1`.
+        bytes.truncate(bytes.len() - 1);
+        bytes.push(1u8);
+        let len = MAX_DECODER_STATE_LEN + 1;
+        bytes.extend_from_slice(&len.to_le_bytes());
+        // Update body_len in the header; recompute the checksum.
+        let new_body_len = (bytes.len() - HEADER_LEN) as u64;
+        bytes[12..20].copy_from_slice(&new_body_len.to_le_bytes());
+        let body_start = HEADER_LEN;
+        let new_checksum = fnv1a64(&bytes[body_start..]);
+        bytes[20..28].copy_from_slice(&new_checksum.to_le_bytes());
+
+        match Checkpoint::deserialize(&bytes).unwrap_err() {
+            CheckpointError::Truncated { reason } => {
+                assert!(
+                    reason.contains("decoder_state length"),
+                    "unexpected reason: {reason}",
+                );
+            }
+            other => panic!("expected Truncated, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn round_trip_with_chunk_crc32c_present() {
+        let mut ckpt = sample_raw();
+        ckpt.chunk_crc32c = Some(vec![0xDEAD_BEEF, 0xCAFE_F00D, 0x1234_5678]);
+        let parsed = Checkpoint::deserialize(&ckpt.serialize()).expect("decode");
+        assert_eq!(parsed, ckpt);
+    }
+
+    // ---- v8 multi-URL round-trip (PLAN_multi_url_source.md §5) ----
+
+    #[test]
+    fn round_trip_multi_part_with_active_part_idx() {
+        let original = sample_multi_part();
+        let bytes = original.serialize();
+        // The header must record at least v8 (the multi-URL
+        // floor) and at most the current `FORMAT_VERSION`. The
+        // exact value is `Checkpoint::required_format_version`,
+        // which dips below the global ceiling for payloads that
+        // fit in older layouts (e.g. STORED-only `SinkState::Rar`
+        // writes v10 even on v11-aware builds).
+        let version = read_u32(&bytes[8..12]);
+        assert!(
+            (8..=FORMAT_VERSION).contains(&version),
+            "version {version} outside 8..={FORMAT_VERSION}"
+        );
+        let parsed = Checkpoint::deserialize(&bytes).expect("decode");
+        assert_eq!(parsed, original);
+        // Sanity on the recovered parts vec.
+        assert_eq!(parsed.parts.len(), 3);
+        assert_eq!(parsed.parts[0].url, "https://h/a.tar.part0000");
+        assert_eq!(
+            parsed.parts[0].expected_sha256,
+            Some([0x11; crate::hash::sha256::DIGEST_LEN])
+        );
+        assert_eq!(parsed.parts[2].expected_sha256, None);
+        let saved = parsed.hash_state.expect("hash state present");
+        assert_eq!(saved.active_part_idx, 1);
+    }
+
+    #[test]
+    fn v7_checkpoint_lifts_legacy_url_into_synthesized_parts() {
+        // Hand-build a valid v7 body: legacy `(url, etag,
+        // last_modified)` trio at the top, with a `hash_state`
+        // present (no active_part_idx field — that's v8). The v8
+        // reader must lift those into a one-element `parts[0]` and
+        // treat the saved hash as `active_part_idx = 0`.
+        let url = "https://example.com/legacy.tar.zst";
+        let etag = "\"v7-etag\"";
+        let total_size = 4096u64;
+        let mut active = crate::hash::sha256::Sha256::new();
+        active.update(b"hello v7");
+        let active_bytes = active.serialize();
+
+        let mut body = Vec::new();
+        write_string(&mut body, url);
+        write_optional_string(&mut body, Some(etag));
+        write_optional_string(&mut body, None);
+        write_u64(&mut body, total_size);
+        write_u64(&mut body, 256);
+        write_u64(&mut body, 0);
+        write_byte_array(&mut body, &[]);
+        write_i64(&mut body, 1_700_000_000);
+        write_u32(&mut body, 0);
+        body.push(SINK_TAG_RAW);
+        write_u64(&mut body, 0);
+        // hash_state: present (v7 has no active_part_idx; just bytes).
+        body.push(1);
+        body.extend_from_slice(&active_bytes);
+        // chunk_crc32c absent, decoder_state absent.
+        body.push(0);
+        body.push(0);
+
+        let body_len = body.len() as u64;
+        let checksum = fnv1a64(&body);
+        let mut buf = Vec::with_capacity(HEADER_LEN + body.len());
+        buf.extend_from_slice(&MAGIC);
+        write_u32(&mut buf, 7); // legacy v7 header
+        write_u64(&mut buf, body_len);
+        write_u64(&mut buf, checksum);
+        buf.extend_from_slice(&body);
+
+        let parsed = Checkpoint::deserialize(&buf).expect("decode v7");
+        assert_eq!(parsed.url, url);
+        assert_eq!(parsed.etag.as_deref(), Some(etag));
+        assert_eq!(parsed.parts.len(), 1, "v7 lifts into one synthesized part");
+        assert_eq!(parsed.parts[0].url, url);
+        assert_eq!(parsed.parts[0].size, total_size);
+        assert_eq!(parsed.parts[0].etag.as_deref(), Some(etag));
+        let saved = parsed.hash_state.expect("hash state present");
+        assert_eq!(
+            saved.active_part_idx, 0,
+            "v7 hash_state implies active_part_idx = 0"
+        );
+        assert_eq!(saved.bytes, active_bytes);
+    }
+
+    #[test]
+    fn v8_with_zero_parts_is_rejected() {
+        // A v8 checkpoint that declares `parts.len() == 0` is
+        // malformed; the reader rejects it via a Truncated error
+        // path rather than silently producing an empty parts vec.
+        let mut body = Vec::new();
+        write_u32(&mut body, 0); // parts.len() = 0
+        write_u64(&mut body, 0); // total_size
+        write_u64(&mut body, 0); // chunk_size
+        write_u64(&mut body, 0); // decoder_position
+        write_byte_array(&mut body, &[]); // bitmap
+        write_i64(&mut body, 0);
+        write_u32(&mut body, 0);
+        body.push(SINK_TAG_RAW);
+        write_u64(&mut body, 0);
+        body.push(0); // hash_state absent
+        body.push(0); // chunk_crc32c absent
+        body.push(0); // decoder_state absent
+
+        let body_len = body.len() as u64;
+        let checksum = fnv1a64(&body);
+        let mut buf = Vec::with_capacity(HEADER_LEN + body.len());
+        buf.extend_from_slice(&MAGIC);
+        write_u32(&mut buf, FORMAT_VERSION);
+        write_u64(&mut buf, body_len);
+        write_u64(&mut buf, checksum);
+        buf.extend_from_slice(&body);
+
+        match Checkpoint::deserialize(&buf).unwrap_err() {
+            CheckpointError::Truncated { reason } => {
+                assert!(reason.contains("zero parts"), "reason was {reason:?}");
+            }
+            other => panic!("expected Truncated, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn round_trip_with_unicode_strings() {
+        let mut ckpt = sample_raw();
+        ckpt.url = "https://例え.test/データ.zst".into();
+        ckpt.etag = Some("\"日本語✓\"".into());
+        // The legacy `url` / `etag` fields mirror `parts[0]`; mutate
+        // both sides so the in-memory state matches what the v8
+        // wire format will round-trip back into.
+        ckpt.parts[0].url = ckpt.url.clone();
+        ckpt.parts[0].etag = ckpt.etag.clone();
+        let parsed = Checkpoint::deserialize(&ckpt.serialize()).expect("decode");
+        assert_eq!(parsed, ckpt);
+    }
+
+    #[test]
+    fn round_trip_empty_strings_and_bitmap() {
+        let ckpt = Checkpoint {
+            url: String::new(),
+            etag: Some(String::new()),
+            last_modified: Some(String::new()),
+            parts: vec![PartRecord {
+                url: String::new(),
+                size: 0,
+                etag: Some(String::new()),
+                last_modified: Some(String::new()),
+                expected_sha256: None,
+                volume_role: None,
+            }],
+            total_size: 0,
+            chunk_size: 0,
+            decoder_position: ByteOffset::ZERO,
+            bitmap_completed: Vec::new(),
+            created_at: UNIX_EPOCH,
+            sink_state: SinkState::Tar {
+                members_completed: Vec::new(),
+                in_flight: None,
+            },
+            hash_state: None,
+            chunk_crc32c: None,
+            decoder_state: None,
+            mode: RunMode::Extract,
+            source_mtime: None,
+            cumulative_elapsed: Duration::ZERO,
+        };
+        let parsed = Checkpoint::deserialize(&ckpt.serialize()).expect("decode");
+        assert_eq!(parsed, ckpt);
+    }
+
+    // ---- error paths -------------------------------------------------
+
+    #[test]
+    fn rejects_short_buffer() {
+        match Checkpoint::deserialize(&[]).unwrap_err() {
+            CheckpointError::Truncated { .. } => {}
+            other => panic!("expected Truncated, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn rejects_bad_magic() {
+        let mut bytes = sample_raw().serialize();
+        bytes[0..8].copy_from_slice(b"notpeel!");
+        match Checkpoint::deserialize(&bytes).unwrap_err() {
+            CheckpointError::BadMagic { found } => assert_eq!(&found, b"notpeel!"),
+            other => panic!("expected BadMagic, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn rejects_newer_format_version() {
+        let mut bytes = sample_raw().serialize();
+        // Bump the version field to one beyond what we support.
+        let newer = (FORMAT_VERSION + 7).to_le_bytes();
+        bytes[8..12].copy_from_slice(&newer);
+        // The body checksum is now over a body that no longer matches
+        // the version, but the version check fires first.
+        match Checkpoint::deserialize(&bytes).unwrap_err() {
+            CheckpointError::UnsupportedVersion {
+                found,
+                supported_max,
+            } => {
+                assert_eq!(found, FORMAT_VERSION + 7);
+                assert_eq!(supported_max, FORMAT_VERSION);
+            }
+            other => panic!("expected UnsupportedVersion, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn rejects_corrupted_body_via_checksum() {
+        let mut bytes = sample_raw().serialize();
+        let last = bytes.len() - 1;
+        bytes[last] ^= 0x01;
+        match Checkpoint::deserialize(&bytes).unwrap_err() {
+            CheckpointError::BodyChecksumMismatch { .. } => {}
+            other => panic!("expected BodyChecksumMismatch, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn rejects_truncated_body() {
+        let bytes = sample_raw().serialize();
+        // Drop the last few bytes; deserialize must report the body
+        // is shorter than the header claimed.
+        let truncated = &bytes[..bytes.len() - 4];
+        match Checkpoint::deserialize(truncated).unwrap_err() {
+            CheckpointError::Truncated { .. } => {}
+            other => panic!("expected Truncated, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn rejects_oversize_body_length_field() {
+        // Synthesize a header that claims an absurd body length.
+        let mut bytes = vec![0u8; HEADER_LEN];
+        bytes[0..8].copy_from_slice(&MAGIC);
+        bytes[8..12].copy_from_slice(&FORMAT_VERSION.to_le_bytes());
+        bytes[12..20].copy_from_slice(&(MAX_BODY_LEN + 1).to_le_bytes());
+        // checksum field can be anything; the cap check fires first.
+        match Checkpoint::deserialize(&bytes).unwrap_err() {
+            CheckpointError::BodyTooLarge { found, cap } => {
+                assert_eq!(found, MAX_BODY_LEN + 1);
+                assert_eq!(cap, MAX_BODY_LEN);
+            }
+            other => panic!("expected BodyTooLarge, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn rejects_invalid_sink_tag() {
+        // Build a v14-shaped body that has every field up to a
+        // bogus sink tag, then re-frame at FORMAT_VERSION. Framing
+        // tracks the current `FORMAT_VERSION` so the test exercises
+        // the latest reader's dispatch — every per-part field
+        // (including the v14 volume_role trailer when at v14+) must
+        // be supplied for the read to reach the sink-tag check.
+        let mut body = Vec::new();
+        // parts: 1 element, url="u", size=0, no etag, no last_modified,
+        // no expected_sha256, no volume_role.
+        write_u32(&mut body, 1);
+        write_string(&mut body, "u");
+        write_u64(&mut body, 0);
+        write_optional_string(&mut body, None);
+        write_optional_string(&mut body, None);
+        body.push(0); // expected_sha256 absent
+        body.push(0); // v14: volume_role absent
+        write_u64(&mut body, 0); // total_size
+        write_u64(&mut body, 0); // chunk_size
+        write_u64(&mut body, 0); // decoder_position
+        write_byte_array(&mut body, &[]); // bitmap_completed
+        write_i64(&mut body, 0); // created_at secs
+        write_u32(&mut body, 0); // created_at nanos
+        body.push(0xFE); // unknown sink tag
+
+        let body_len = body.len() as u64;
+        let body_checksum = fnv1a64(&body);
+
+        let mut buf = Vec::with_capacity(HEADER_LEN + body.len());
+        buf.extend_from_slice(&MAGIC);
+        write_u32(&mut buf, FORMAT_VERSION);
+        write_u64(&mut buf, body_len);
+        write_u64(&mut buf, body_checksum);
+        buf.extend_from_slice(&body);
+
+        match Checkpoint::deserialize(&buf).unwrap_err() {
+            CheckpointError::InvalidEnumTag { tag, .. } => assert_eq!(tag, 0xFE),
+            other => panic!("expected InvalidEnumTag, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn rejects_invalid_presence_byte() {
+        // v8 body: parts count = 1, url = "u", size = 0, then an
+        // invalid etag presence byte (5) inside parts[0].
+        let mut body = Vec::new();
+        write_u32(&mut body, 1);
+        write_string(&mut body, "u");
+        write_u64(&mut body, 0);
+        body.push(5);
+
+        let body_len = body.len() as u64;
+        let body_checksum = fnv1a64(&body);
+
+        let mut buf = Vec::with_capacity(HEADER_LEN + body.len());
+        buf.extend_from_slice(&MAGIC);
+        write_u32(&mut buf, FORMAT_VERSION);
+        write_u64(&mut buf, body_len);
+        write_u64(&mut buf, body_checksum);
+        buf.extend_from_slice(&body);
+
+        match Checkpoint::deserialize(&buf).unwrap_err() {
+            CheckpointError::InvalidPresence { value, .. } => assert_eq!(value, 5),
+            other => panic!("expected InvalidPresence, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn rejects_trailing_bytes_in_body() {
+        let mut bytes = sample_raw().serialize();
+        // Append one extra byte in the body and update length+checksum
+        // so that only the trailing-bytes guard fires.
+        let body_start = HEADER_LEN;
+        let mut body = bytes[body_start..].to_vec();
+        body.push(0xAA);
+        let new_len = body.len() as u64;
+        let new_checksum = fnv1a64(&body);
+        bytes.truncate(body_start);
+        bytes.extend_from_slice(&body);
+        bytes[12..20].copy_from_slice(&new_len.to_le_bytes());
+        bytes[20..28].copy_from_slice(&new_checksum.to_le_bytes());
+
+        match Checkpoint::deserialize(&bytes).unwrap_err() {
+            CheckpointError::Truncated { reason } => {
+                assert!(reason.contains("trailing"), "unexpected reason: {reason}");
+            }
+            other => panic!("expected Truncated, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn rejects_invalid_utf8() {
+        // v8 body: parts.len()=1, parts[0].url declared as 2 bytes of
+        // invalid UTF-8 (0xFF 0xFF), rest of body padded with zero
+        // defaults. The `parts[0].url` deserialize uses the
+        // `read_string_dyn` path which leaks a label; the field name
+        // we assert on is the leaked label.
+        let mut body = Vec::new();
+        write_u32(&mut body, 1); // parts count
+        write_u32(&mut body, 2); // parts[0].url length
+        body.extend_from_slice(&[0xFF, 0xFF]);
+        write_u64(&mut body, 0); // parts[0].size
+        write_optional_string(&mut body, None); // parts[0].etag
+        write_optional_string(&mut body, None); // parts[0].last_modified
+        body.push(0); // parts[0].expected_sha256 absent
+        write_u64(&mut body, 0); // total_size
+        write_u64(&mut body, 0); // chunk_size
+        write_u64(&mut body, 0); // decoder_position
+        write_byte_array(&mut body, &[]); // bitmap
+        write_i64(&mut body, 0); // created_at secs
+        write_u32(&mut body, 0); // created_at nanos
+        body.push(SINK_TAG_RAW);
+        write_u64(&mut body, 0); // bytes_written
+
+        let body_len = body.len() as u64;
+        let body_checksum = fnv1a64(&body);
+
+        let mut buf = Vec::with_capacity(HEADER_LEN + body.len());
+        buf.extend_from_slice(&MAGIC);
+        write_u32(&mut buf, FORMAT_VERSION);
+        write_u64(&mut buf, body_len);
+        write_u64(&mut buf, body_checksum);
+        buf.extend_from_slice(&body);
+
+        match Checkpoint::deserialize(&buf).unwrap_err() {
+            CheckpointError::InvalidUtf8 { field, .. } => {
+                assert!(field.starts_with("parts["), "field was {field:?}");
+            }
+            other => panic!("expected InvalidUtf8, got {other:?}"),
+        }
+    }
+
+    // ---- atomic write/read ------------------------------------------
+
+    #[test]
+    fn write_then_read_round_trips_via_disk() {
+        let path = unique_temp("roundtrip");
+        let _g = CleanupOnDrop(path.clone());
+        let original = sample_tar();
+
+        original.write(&path).expect("write");
+        let parsed = Checkpoint::read(&path).expect("read").expect("present");
+        assert_eq!(parsed, original);
+
+        // Tmp file must not linger after a successful rename.
+        assert!(!tmp_path_for(&path).exists(), "tmp file lingered");
+    }
+
+    #[test]
+    fn read_returns_none_when_path_missing() {
+        let path = unique_temp("missing");
+        // No CleanupOnDrop — file does not exist.
+        let parsed = Checkpoint::read(&path).expect("read");
+        assert!(parsed.is_none());
+    }
+
+    #[test]
+    fn write_overwrites_existing_checkpoint_atomically() {
+        let path = unique_temp("overwrite");
+        let _g = CleanupOnDrop(path.clone());
+        let first = sample_raw();
+        first.write(&path).expect("first write");
+
+        let second = sample_tar();
+        second.write(&path).expect("second write");
+
+        let parsed = Checkpoint::read(&path).expect("read").expect("present");
+        assert_eq!(parsed, second);
+    }
+
+    // Windows has no `open(parent_dir).sync_all()` equivalent — the
+    // implementation comment in `write_timed_with` ("On platforms
+    // where opening a directory for fsync is unsupported (Windows)
+    // the open silently fails and we skip") makes the assertion
+    // below Unix-specific by design. `MoveFileExW(WRITE_THROUGH)`
+    // gives the equivalent durability guarantee on the Windows
+    // rename path (see `PLAN_v3_windows.md` §9).
+    #[cfg(unix)]
+    #[test]
+    fn write_timed_fsyncs_parent_dir_only_on_first_write() {
+        // `PLAN_checkpoint_cadence_throughput.md` Phase 1: the
+        // parent-directory `fsync` is only required when the rename
+        // creates a new directory entry. Subsequent writes promote a
+        // `.tmp` over an existing entry; the directory inode is
+        // already durable. This test pins that contract.
+        let path = unique_temp("dir_fsync_first_only");
+        let _g = CleanupOnDrop(path.clone());
+
+        let first = sample_raw();
+        let t1 = first.write_timed(&path).expect("first write");
+        assert!(
+            t1.dir_fsync_called,
+            "first write should fsync the parent dir to make the new entry durable"
+        );
+
+        let second = sample_tar();
+        let t2 = second.write_timed(&path).expect("second write");
+        assert!(
+            !t2.dir_fsync_called,
+            "subsequent writes target an existing entry; parent-dir fsync skipped"
+        );
+        assert_eq!(t2.dir_fsync_time, std::time::Duration::ZERO);
+
+        // And a third write to confirm the skip is permanent for
+        // this path, not a one-shot toggle.
+        let third = sample_raw();
+        let t3 = third.write_timed(&path).expect("third write");
+        assert!(!t3.dir_fsync_called);
+    }
+
+    #[test]
+    fn stale_tmp_file_is_overwritten_by_next_write() {
+        // Simulate a crashed previous run: a partial .tmp on disk and
+        // no .ckpt yet. The next write must succeed.
+        let path = unique_temp("stale-tmp");
+        let _g = CleanupOnDrop(path.clone());
+        let tmp = tmp_path_for(&path);
+        std::fs::write(&tmp, b"\xDE\xAD\xBE\xEF garbage from crashed run").unwrap();
+
+        let ckpt = sample_raw();
+        ckpt.write(&path).expect("write");
+        let parsed = Checkpoint::read(&path).expect("read").expect("present");
+        assert_eq!(parsed, ckpt);
+        assert!(!tmp.exists(), "tmp survived overwrite");
+    }
+
+    #[test]
+    fn read_propagates_corrupt_files_as_typed_error() {
+        let path = unique_temp("corrupt");
+        let _g = CleanupOnDrop(path.clone());
+        // Write a valid-looking but corrupted checkpoint: flip one byte
+        // in the body.
+        let mut bytes = sample_raw().serialize();
+        let last = bytes.len() - 1;
+        bytes[last] ^= 0x80;
+        std::fs::write(&path, &bytes).unwrap();
+
+        match Checkpoint::read(&path).unwrap_err() {
+            CheckpointError::BodyChecksumMismatch { .. } => {}
+            other => panic!("expected BodyChecksumMismatch, got {other:?}"),
+        }
+    }
+
+    // ---- property-style: random round-trips --------------------------
+
+    /// Tiny LCG (matches the pattern used elsewhere in the crate; keeps
+    /// the dependency tree free of a PRNG crate).
+    struct Lcg(u64);
+
+    impl Lcg {
+        fn seeded(seed: u64) -> Self {
+            Self(seed ^ 0x9E37_79B9_7F4A_7C15)
+        }
+        fn next_u64(&mut self) -> u64 {
+            self.0 = self
+                .0
+                .wrapping_mul(6_364_136_223_846_793_005)
+                .wrapping_add(1_442_695_040_888_963_407);
+            self.0
+        }
+        fn next_u32(&mut self) -> u32 {
+            (self.next_u64() >> 32) as u32
+        }
+        fn next_bool(&mut self) -> bool {
+            self.next_u64() & 1 == 1
+        }
+    }
+
+    fn random_string(rng: &mut Lcg, max_len: usize) -> String {
+        let len = (rng.next_u32() as usize) % (max_len + 1);
+        let mut s = String::with_capacity(len);
+        while s.len() < len {
+            // Stay inside ASCII to keep the generator simple; we have a
+            // dedicated unicode test for non-ASCII.
+            let c = (rng.next_u64() % 94 + 33) as u8 as char;
+            s.push(c);
+        }
+        s
+    }
+
+    fn random_bytes(rng: &mut Lcg, max_len: usize) -> Vec<u8> {
+        let len = (rng.next_u32() as usize) % (max_len + 1);
+        let mut out = Vec::with_capacity(len);
+        while out.len() < len {
+            out.extend_from_slice(&rng.next_u64().to_le_bytes());
+        }
+        out.truncate(len);
+        out
+    }
+
+    #[test]
+    fn property_round_trip_random_checkpoints() {
+        let mut rng = Lcg::seeded(0xC0DE_C0DE);
+        for _ in 0..256 {
+            let url = random_string(&mut rng, 128);
+            let etag = if rng.next_bool() {
+                Some(random_string(&mut rng, 32))
+            } else {
+                None
+            };
+            let last_modified = if rng.next_bool() {
+                Some(random_string(&mut rng, 32))
+            } else {
+                None
+            };
+            let total_size = rng.next_u64();
+            let chunk_size = rng.next_u64();
+            let decoder_position = ByteOffset::new(rng.next_u64());
+            let bitmap_completed = random_bytes(&mut rng, 1024);
+            let created_at = UNIX_EPOCH + Duration::new(rng.next_u64() % 4_000_000_000, 12_345);
+
+            let sink_state = match rng.next_u32() % 3 {
+                0 => SinkState::Raw {
+                    bytes_written: rng.next_u64(),
+                },
+                1 => {
+                    let n = (rng.next_u32() as usize) % 8;
+                    let members = (0..n).map(|_| random_string(&mut rng, 64)).collect();
+                    // Property test exercises both `in_flight =
+                    // None` (the v6 quiescent path) and a few
+                    // hand-built non-trivial states; structured
+                    // round-trip tests below cover File / PaxData /
+                    // LongName variants directly.
+                    let in_flight = if rng.next_bool() {
+                        let archive_offset = rng.next_u64();
+                        let zero_blocks_seen = (rng.next_u32() & 0xFF) as u8;
+                        let pending_path = if rng.next_bool() {
+                            Some(random_string(&mut rng, 32))
+                        } else {
+                            None
+                        };
+                        let pending_size = if rng.next_bool() {
+                            Some(rng.next_u64())
+                        } else {
+                            None
+                        };
+                        // v16 field: exercise both the `Some` path
+                        // (which forces the on-disk version to 16) and
+                        // the `None` path (v6..=v15 layout) so the
+                        // round-trip covers the version-gated read.
+                        let pending_linkpath = if rng.next_bool() {
+                            Some(random_string(&mut rng, 32))
+                        } else {
+                            None
+                        };
+                        let header_buf = random_bytes(&mut rng, 512);
+                        // `filled == buf.len()` is the deserialize
+                        // invariant; bind them together here.
+                        Some(TarSinkState {
+                            archive_offset,
+                            zero_blocks_seen,
+                            pending_path,
+                            pending_size,
+                            pending_linkpath,
+                            state: TarMemberState::Header {
+                                filled: header_buf.len() as u32,
+                                buf: header_buf,
+                            },
+                        })
+                    } else {
+                        None
+                    };
+                    SinkState::Tar {
+                        members_completed: members,
+                        in_flight,
+                    }
+                }
+                _ => {
+                    let count = (rng.next_u32() as usize) % 16;
+                    let entries = (0..count).map(|_| rng.next_u32()).collect();
+                    let current = if rng.next_bool() {
+                        Some(rng.next_u32())
+                    } else {
+                        None
+                    };
+                    let blob_present = rng.next_u32() & 1 == 0;
+                    let current_entry_decoder_state = if blob_present {
+                        let len = (rng.next_u32() % 64) as usize;
+                        let mut blob = Vec::with_capacity(len);
+                        for _ in 0..len {
+                            blob.push((rng.next_u32() & 0xFF) as u8);
+                        }
+                        Some(blob)
+                    } else {
+                        None
+                    };
+                    SinkState::Zip {
+                        entries_completed: entries,
+                        current_entry: current,
+                        current_entry_offset: rng.next_u64(),
+                        current_entry_decoder_state,
+                    }
+                }
+            };
+
+            // Half the trials carry a populated hash_state to
+            // exercise the v3 trailer; the other half exercise the
+            // hash_state=None path that v1 / v2 also produce. v8
+            // pairs the bytes with a u32 active_part_idx; we
+            // randomise that within `parts.len()` so multi-part
+            // round-trips are exercised too.
+            let hash_state = if rng.next_bool() {
+                let mut state = crate::hash::sha256::Sha256::new();
+                state.update(&random_bytes(&mut rng, 256));
+                Some(HashState {
+                    active_part_idx: 0,
+                    bytes: state.serialize(),
+                })
+            } else {
+                None
+            };
+
+            // Half the trials carry a §11 chunk-CRC32C vector to
+            // exercise the v4 trailer; the other half leave it
+            // unset so v3-shape inputs round-trip too.
+            let chunk_crc32c = if rng.next_bool() {
+                let n = (rng.next_u32() as usize) % 16;
+                Some((0..n).map(|_| rng.next_u32()).collect())
+            } else {
+                None
+            };
+
+            // Half the trials carry an opaque v5 `decoder_state`
+            // blob (size up to 64 bytes) to exercise the trailer;
+            // the other half leave it unset.
+            let decoder_state = if rng.next_bool() {
+                let n = (rng.next_u32() as usize) % 64;
+                Some(random_bytes(&mut rng, n))
+            } else {
+                None
+            };
+
+            // Half the trials carry a v15 `cumulative_elapsed`
+            // trailer (random duration up to 1 hour, sub-second
+            // precision) to exercise the new field; the other
+            // half leave it at ZERO so v8..=v14 byte-identical
+            // layouts round-trip too.
+            let cumulative_elapsed = if rng.next_bool() {
+                let secs = u64::from(rng.next_u32() % 3600);
+                let nanos = rng.next_u32() % 1_000_000_000;
+                Duration::new(secs, nanos)
+            } else {
+                Duration::ZERO
+            };
+
+            let ckpt = Checkpoint {
+                url: url.clone(),
+                etag: etag.clone(),
+                last_modified: last_modified.clone(),
+                parts: vec![PartRecord {
+                    url,
+                    size: total_size,
+                    etag,
+                    last_modified,
+                    expected_sha256: None,
+                    volume_role: None,
+                }],
+                total_size,
+                chunk_size,
+                decoder_position,
+                bitmap_completed,
+                created_at,
+                sink_state,
+                hash_state,
+                chunk_crc32c,
+                decoder_state,
+                mode: RunMode::Extract,
+                source_mtime: None,
+                cumulative_elapsed,
+            };
+            let parsed = Checkpoint::deserialize(&ckpt.serialize()).expect("decode");
+            assert_eq!(parsed, ckpt);
+        }
+    }
+
+    // ---- helpers ----------------------------------------------------
+
+    #[test]
+    fn fnv1a64_known_vector() {
+        // Reference: 64-bit FNV-1a of the empty string is the offset
+        // basis itself, and of "foobar" matches the canonical vector.
+        assert_eq!(fnv1a64(b""), 0xCBF2_9CE4_8422_2325);
+        assert_eq!(fnv1a64(b"foobar"), 0x85944171_F73967E8);
+    }
+
+    #[test]
+    fn tmp_path_for_appends_dot_tmp() {
+        assert_eq!(
+            tmp_path_for(Path::new("/var/tmp/foo.ckpt")),
+            PathBuf::from("/var/tmp/foo.ckpt.tmp"),
+        );
+        assert_eq!(
+            tmp_path_for(Path::new("relative/name")),
+            PathBuf::from("relative/name.tmp"),
+        );
+    }
+
+    #[test]
+    fn encode_decode_system_time_round_trips_post_epoch() {
+        let original = UNIX_EPOCH + Duration::new(1_700_000_000, 654_321);
+        let (s, n) = encode_system_time(original);
+        assert_eq!(decode_system_time(s, n), original);
+    }
+
+    #[test]
+    fn encode_decode_system_time_handles_epoch_boundary() {
+        let (s, n) = encode_system_time(UNIX_EPOCH);
+        assert_eq!(s, 0);
+        assert_eq!(n, 0);
+        assert_eq!(decode_system_time(0, 0), UNIX_EPOCH);
+    }
+}

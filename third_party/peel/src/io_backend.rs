@@ -1,0 +1,809 @@
+//! File-IO backend abstraction (PLAN_v2.md §7).
+//!
+//! `peel`'s download workers and the [`crate::download::SparseFile`]
+//! land bytes on disk through `pwrite(2)` / `pread(2)` syscalls. At
+//! high parallelism (the §7 demo runs N=64 workers) every chunk
+//! completion costs at least one trip into the kernel for the write
+//! and one for the metadata sync; that pile of independent syscalls
+//! is what `io_uring` exists to batch.
+//!
+//! This module introduces [`IoBackend`], the seam every backend
+//! implementation honors, and ships [`BlockingBackend`] — the
+//! always-available implementation that wraps the existing `FileExt`
+//! calls verbatim. The Linux `io_uring` backend lands behind this same
+//! trait in §7.2 and the network-IO half (TCP `connect`/`send`/`recv`)
+//! is the subject of §7b. The trait stays narrow on purpose: file IO
+//! only, no socket primitives, no shape that requires an async runtime.
+//!
+//! # Threading
+//!
+//! Every method takes `&self`, so a single `Arc<dyn IoBackend>` can be
+//! handed to the [`crate::download`] scheduler, the worker pool, and
+//! the extractor without further synchronization. Implementations are
+//! `Send + Sync`; the blocking impl is in fact zero-sized and the
+//! `Arc` is just type-machinery.
+//!
+//! # Why [`OsFd`]
+//!
+//! The trait operates on an [`OsFd`] rather than `&File` so the
+//! io_uring backend can submit SQEs against the kernel-side fd
+//! directly. The blocking backend rebuilds a temporary [`File`] handle
+//! around the borrowed fd via [`ManuallyDrop`] so we get the safe
+//! [`FileExt`] surface without taking ownership of the underlying
+//! descriptor. `OsFd<'_>` is the [`crate::os_fd`] portable alias:
+//! [`std::os::fd::BorrowedFd`] on Unix today and
+//! [`std::os::windows::io::BorrowedHandle`] on Windows once the §2
+//! Windows blocking backend lands (`PLAN_v3_windows.md` §0.2 / §2).
+
+use std::fs::File;
+use std::io::{self, Read, Write};
+use std::mem::ManuallyDrop;
+use std::net::{SocketAddr, TcpStream};
+#[cfg(unix)]
+use std::os::fd::{AsRawFd, FromRawFd};
+#[cfg(unix)]
+use std::os::unix::fs::FileExt as UnixFileExt;
+#[cfg(windows)]
+use std::os::windows::fs::FileExt as WindowsFileExt;
+#[cfg(windows)]
+use std::os::windows::io::{AsRawHandle, FromRawHandle};
+use std::sync::Arc;
+use std::time::Duration;
+
+use crate::os_fd::OsFd;
+
+#[cfg(target_os = "linux")]
+pub mod uring;
+
+#[cfg(target_os = "linux")]
+pub use uring::{UringBackend, UringInitError, DEFAULT_RING_DEPTH, MIN_RING_DEPTH};
+
+/// Per-connection socket configuration handed to [`IoBackend::connect`].
+///
+/// Backends translate these knobs to whatever surface they have:
+/// [`BlockingBackend`] applies `set_read_timeout` /
+/// `set_write_timeout` / `set_nodelay` on the underlying [`TcpStream`];
+/// the §7b uring backend stores the timeouts and applies them as
+/// linked TIMEOUT SQEs around each `recv`/`send`.
+#[derive(Debug, Clone)]
+pub struct SocketConfig {
+    /// Cap on time spent inside `connect(2)` itself.
+    pub connect_timeout: Duration,
+    /// Cap on time spent inside any single `read` call. `None` means
+    /// the backend default (typically: no timeout).
+    pub read_timeout: Option<Duration>,
+    /// Cap on time spent inside any single `write` call. `None` means
+    /// the backend default.
+    pub write_timeout: Option<Duration>,
+    /// Whether to disable Nagle's algorithm on the connected socket.
+    pub nodelay: bool,
+}
+
+impl Default for SocketConfig {
+    fn default() -> Self {
+        Self {
+            connect_timeout: Duration::from_secs(30),
+            read_timeout: Some(Duration::from_secs(30)),
+            write_timeout: Some(Duration::from_secs(30)),
+            nodelay: true,
+        }
+    }
+}
+
+/// Synchronous, byte-oriented network stream returned by
+/// [`IoBackend::connect`].
+///
+/// Both the blocking [`TcpStream`] wrapper and the §7b uring socket
+/// adapter implement this. The trait carries no methods of its own —
+/// it is the supertrait bundle [`Read`] + [`Write`] + [`Send`] that
+/// the rest of [`crate::http::client`] cares about. A blanket impl
+/// makes any `Read + Write + Send` type satisfy it for free, so the
+/// blocking backend can return `Box::new(tcp_stream)` without
+/// boilerplate.
+pub trait NetStream: Read + Write + Send {}
+impl<T: Read + Write + Send + ?Sized> NetStream for T {}
+
+/// File-IO operations performed by the download workers and the
+/// sparse file.
+///
+/// Implementations are object-safe and `Send + Sync`. A single shared
+/// backend (typically held in an [`Arc`]) is cloned into every thread
+/// that touches disk; the worker pool, the scheduler, and the extractor
+/// all route through the same backend so the choice of implementation
+/// is observable end-to-end.
+///
+/// [`std::fmt::Debug`] is required so structs that hold an
+/// `Arc<dyn IoBackend>` (e.g. [`crate::download::SparseFile`]) can
+/// derive `Debug` without manual plumbing.
+pub trait IoBackend: Send + Sync + std::fmt::Debug {
+    /// Diagnostic name (e.g. `"blocking"`, `"uring"`).
+    ///
+    /// Used in `tracing` log lines and surfaced in the `--io-backend`
+    /// CLI flag.
+    fn name(&self) -> &'static str;
+
+    /// Write the entire `buf` at byte offset `offset`.
+    ///
+    /// Loops on partial writes; returns only after every byte has been
+    /// committed (or an error fires). Equivalent in semantics to
+    /// [`FileExt::write_all_at`].
+    ///
+    /// # Errors
+    ///
+    /// Returns the underlying [`io::Error`] for any OS-level failure
+    /// (e.g. `EIO`, `ENOSPC`).
+    fn pwrite_all_at(&self, fd: OsFd<'_>, offset: u64, buf: &[u8]) -> io::Result<()>;
+
+    /// Read up to `buf.len()` bytes starting at `offset` and return
+    /// the number actually read.
+    ///
+    /// Short reads at end-of-file are reported by a return value less
+    /// than `buf.len()`; a return value of `0` is the EOF indicator.
+    /// Equivalent in semantics to [`FileExt::read_at`].
+    ///
+    /// # Errors
+    ///
+    /// Returns the underlying [`io::Error`] for any OS-level failure.
+    fn pread_at(&self, fd: OsFd<'_>, offset: u64, buf: &mut [u8]) -> io::Result<usize>;
+
+    /// Read exactly `buf.len()` bytes starting at `offset`, looping on
+    /// short reads.
+    ///
+    /// Equivalent in semantics to [`FileExt::read_exact_at`].
+    ///
+    /// # Errors
+    ///
+    /// Returns [`io::ErrorKind::UnexpectedEof`] if EOF is reached
+    /// before the buffer is filled, or any other [`io::Error`] for an
+    /// OS-level failure.
+    fn pread_exact_at(&self, fd: OsFd<'_>, offset: u64, buf: &mut [u8]) -> io::Result<()>;
+
+    /// Force the file's data and metadata to durable storage.
+    ///
+    /// Equivalent in semantics to [`File::sync_all`].
+    ///
+    /// # Errors
+    ///
+    /// Returns the underlying [`io::Error`] for any OS-level failure.
+    fn sync_all(&self, fd: OsFd<'_>) -> io::Result<()>;
+
+    /// Order pending writes against a subsequent durability event,
+    /// without forcing a device-level flush.
+    ///
+    /// `PLAN_checkpoint_cadence_throughput.md` Phase 1. The contract:
+    /// when this call returns, every `pwrite` issued before it on the
+    /// same file is guaranteed to hit stable storage *no later than*
+    /// any write issued after it. The pre-barrier writes may not be
+    /// on disk yet — only the *ordering* against post-barrier writes
+    /// is guaranteed.
+    ///
+    /// On macOS (APFS) this is `fcntl(F_BARRIERFSYNC)`. On Linux this
+    /// is `fdatasync(2)`, which omits the metadata flush a full
+    /// `fsync` would issue (safe for our pwrite-only workload where
+    /// file size and mode don't change between syncs). The default
+    /// impl falls through to [`Self::sync_all`] for backends that
+    /// don't have a cheaper ordering primitive.
+    ///
+    /// Callers that need a literal device flush (e.g. a clean-run
+    /// completion sweep) must keep using [`Self::sync_all`].
+    ///
+    /// # Errors
+    ///
+    /// Returns the underlying [`io::Error`] for any OS-level failure.
+    fn order_writes(&self, fd: OsFd<'_>) -> io::Result<()> {
+        self.sync_all(fd)
+    }
+
+    /// Open a TCP connection to `addr` and return a [`NetStream`]
+    /// honoring `config`'s timeouts and `nodelay`.
+    ///
+    /// The returned stream is owned: the caller is responsible for its
+    /// lifetime, which determines when the underlying file descriptor
+    /// is closed. The stream is suitable for use as the inner type of
+    /// `rustls::StreamOwned` for HTTPS, or directly for plaintext
+    /// HTTP.
+    ///
+    /// # Errors
+    ///
+    /// Returns the underlying [`io::Error`] for connect failures
+    /// (`ECONNREFUSED`, `ETIMEDOUT`, `ENETUNREACH`, …) or for socket
+    /// configuration failures (`set_read_timeout`, `set_nodelay`).
+    fn connect(&self, addr: SocketAddr, config: &SocketConfig) -> io::Result<Box<dyn NetStream>>;
+}
+
+/// Construct the always-available blocking backend.
+///
+/// Equivalent to `Arc::new(BlockingBackend::new())`. Useful as a
+/// fallback or when a caller knows it does not want `io_uring`.
+#[must_use]
+pub fn default_backend() -> Arc<dyn IoBackend> {
+    Arc::new(BlockingBackend::new())
+}
+
+/// CLI-facing choice of file-IO backend (PLAN_v2.md §7 + §9).
+///
+/// `Auto` is the default and resolves on Linux to:
+///
+/// * **sockets** — try `io_uring`; fall back to blocking with a
+///   `tracing::info!` line when the kernel rejects ring construction
+///   (e.g. cri-o's default seccomp profile blocks `io_uring_setup`).
+/// * **sparse file** — `mmap` of the sparse part file with
+///   `madvise(MADV_REMOVE)` for hole-punching. Empirically (see
+///   `tests/test_bench_streaming.rs::diag_plain_tar_io_backends`)
+///   mmap saves ~20% wall-clock vs the pwrite/pread path on a
+///   representative cluster, with no measured downside when the
+///   underlying FS doesn't support `MADV_REMOVE` (the puncher
+///   silently degrades to noop, same as the pwrite path would).
+///
+/// On non-Linux platforms `Auto` is the blocking backend for both
+/// sockets and file IO.
+///
+/// `Blocking` forces the pre-§7 pwrite/pread path (used for A/B
+/// comparison and on platforms without `io_uring`). `Uring` *requires*
+/// `io_uring`; selection fails if the kernel does not support it,
+/// surfaced as an [`io::Error`] for the CLI boundary to format.
+/// `Mmap` selects the §9 memory-mapped sparse file explicitly: workers
+/// `memcpy` into a `MAP_SHARED` region and the coordinator's puncher
+/// uses `madvise(MADV_REMOVE)`. `Mmap` is Linux-only; on other
+/// platforms selection fails the same way `Uring` does.
+///
+/// `Mmap` only changes the *file-IO* path. The HTTP client's network
+/// IO continues to go through the always-available blocking backend
+/// (no `connect`/`recv`/`send` analog of `mmap` exists). The
+/// coordinator sources both halves separately.
+#[derive(Debug, Clone, Copy, Eq, PartialEq, Default)]
+pub enum IoBackendChoice {
+    /// Pick the best available backend at runtime.
+    #[default]
+    Auto,
+    /// Force the blocking `pwrite`/`pread` backend.
+    Blocking,
+    /// Force the Linux `io_uring` backend.
+    Uring,
+    /// Memory-map the sparse file; release blocks via
+    /// `madvise(MADV_REMOVE)`. Linux-only.
+    Mmap,
+}
+
+/// Resolve the user's [`IoBackendChoice`] into a concrete
+/// [`IoBackend`] for the current platform and kernel.
+///
+/// Returns a `(backend, label)` pair: `label` is the short human-readable
+/// summary (e.g. `"io_backend=uring depth=64"`) that selection emits via
+/// `tracing::info!` and that callers may also surface elsewhere (the
+/// `peel` binary forwards it to the TTY progress renderer's banner so
+/// the configuration is visible even with INFO suppressed).
+///
+/// `Auto` may downgrade silently to the blocking backend (the label
+/// records that explicitly); `Uring` errors out cleanly when the kernel
+/// does not support it. `Mmap` is a *file-IO-only* path: the returned
+/// [`IoBackend`] is always the blocking implementation (for the HTTP
+/// client's sockets); the coordinator handles the actual mmap of the
+/// sparse file separately via
+/// [`crate::download::SparseFile::open_or_create_mmap`].
+/// `Mmap` is Linux-only and errors out on other platforms.
+///
+/// # Errors
+///
+/// Returns an [`io::Error`] when [`IoBackendChoice::Uring`] or
+/// [`IoBackendChoice::Mmap`] is selected on a platform that does not
+/// support it.
+pub fn select_backend(
+    choice: IoBackendChoice,
+    workers: u32,
+) -> io::Result<(Arc<dyn IoBackend>, String)> {
+    match choice {
+        IoBackendChoice::Blocking => {
+            let label = "io_backend=blocking (forced)".to_string();
+            tracing::info!("{label}");
+            Ok((default_backend(), label))
+        }
+        IoBackendChoice::Auto => Ok(select_auto(workers)),
+        IoBackendChoice::Uring => select_uring(),
+        IoBackendChoice::Mmap => select_mmap_socket(),
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn select_mmap_socket() -> io::Result<(Arc<dyn IoBackend>, String)> {
+    // The mmap storage backend changes the *file* IO path only. The
+    // HTTP client still needs an `IoBackend` for `connect`/`recv`/
+    // `send`; the §7b uring backend is overkill for that on its own,
+    // so we deliberately pair `mmap` with the always-available
+    // blocking socket backend.
+    let label = "io_backend=mmap (file IO via mmap, sockets via blocking)".to_string();
+    tracing::info!("{label}");
+    Ok((default_backend(), label))
+}
+
+#[cfg(not(target_os = "linux"))]
+fn select_mmap_socket() -> io::Result<(Arc<dyn IoBackend>, String)> {
+    Err(io::Error::other(
+        "--io-backend mmap is only supported on Linux \
+         (madvise(MADV_REMOVE) is Linux-specific); \
+         use --io-backend blocking or remove the flag",
+    ))
+}
+
+#[cfg(target_os = "linux")]
+fn select_auto(workers: u32) -> (Arc<dyn IoBackend>, String) {
+    if let Some(b) = uring::UringBackend::probe(workers) {
+        let label = format!("io_backend=uring depth={}", b.ring_depth());
+        tracing::info!("{label}");
+        return (Arc::new(b), label);
+    }
+    let label = "io_backend=blocking (uring unavailable, downgraded)".to_string();
+    tracing::info!("{label}");
+    (default_backend(), label)
+}
+
+#[cfg(not(target_os = "linux"))]
+fn select_auto(_workers: u32) -> (Arc<dyn IoBackend>, String) {
+    let label = "io_backend=blocking (uring is Linux-only)".to_string();
+    tracing::info!("{label}");
+    (default_backend(), label)
+}
+
+#[cfg(target_os = "linux")]
+fn select_uring() -> io::Result<(Arc<dyn IoBackend>, String)> {
+    match uring::UringBackend::try_new(uring::DEFAULT_RING_DEPTH) {
+        Ok(b) => {
+            let label = format!("io_backend=uring depth={} (forced)", b.ring_depth());
+            tracing::info!("{label}");
+            Ok((Arc::new(b), label))
+        }
+        Err(e) => Err(io::Error::other(format!(
+            "--io-backend uring requested but the kernel does not support it: {}",
+            e.source
+        ))),
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
+fn select_uring() -> io::Result<(Arc<dyn IoBackend>, String)> {
+    Err(io::Error::other(
+        "--io-backend uring is only supported on Linux; \
+         use --io-backend blocking or remove the flag",
+    ))
+}
+
+/// The always-available blocking backend.
+///
+/// Wraps the existing `FileExt::{write_all_at, read_at, read_exact_at}`
+/// calls and `File::sync_all`. Behaviorally indistinguishable from the
+/// pre-§7 code; the indirection only matters for the `io_uring` backend
+/// added in §7.2.
+#[derive(Debug, Default, Clone, Copy)]
+pub struct BlockingBackend;
+
+impl BlockingBackend {
+    /// Construct a fresh [`BlockingBackend`].
+    #[must_use]
+    pub const fn new() -> Self {
+        Self
+    }
+}
+
+impl IoBackend for BlockingBackend {
+    fn name(&self) -> &'static str {
+        "blocking"
+    }
+
+    fn pwrite_all_at(&self, fd: OsFd<'_>, offset: u64, buf: &[u8]) -> io::Result<()> {
+        with_file(fd, |f| f.pwrite_all_at(buf, offset))
+    }
+
+    fn pread_at(&self, fd: OsFd<'_>, offset: u64, buf: &mut [u8]) -> io::Result<usize> {
+        with_file(fd, |f| f.pread_at(buf, offset))
+    }
+
+    fn pread_exact_at(&self, fd: OsFd<'_>, offset: u64, buf: &mut [u8]) -> io::Result<()> {
+        with_file(fd, |f| f.pread_exact_at(buf, offset))
+    }
+
+    fn sync_all(&self, fd: OsFd<'_>) -> io::Result<()> {
+        with_file(fd, File::sync_all)
+    }
+
+    fn order_writes(&self, fd: OsFd<'_>) -> io::Result<()> {
+        order_writes_blocking(fd)
+    }
+
+    fn connect(&self, addr: SocketAddr, config: &SocketConfig) -> io::Result<Box<dyn NetStream>> {
+        let tcp = TcpStream::connect_timeout(&addr, config.connect_timeout)?;
+        tcp.set_read_timeout(config.read_timeout)?;
+        tcp.set_write_timeout(config.write_timeout)?;
+        tcp.set_nodelay(config.nodelay)?;
+        Ok(Box::new(tcp))
+    }
+}
+
+/// Run `f` against a [`File`] view of `fd` without taking ownership.
+///
+/// `OsFd<'_>` only carries the lifetime invariant that the underlying
+/// OS handle is open for the borrow's duration. To call the safe
+/// [`File::sync_all`] / [`FileOps`] surface we need a `&File`, which
+/// would normally own the handle. We construct one via the
+/// platform-specific `From*Raw*` route and wrap it in [`ManuallyDrop`]
+/// so the destructor — which would close the handle — never fires.
+/// The borrowed fd's lifetime governs the whole call.
+fn with_file<R>(fd: OsFd<'_>, f: impl FnOnce(&File) -> R) -> R {
+    // SAFETY: `OsFd<'_>` guarantees the underlying raw fd (Unix) /
+    // handle (Windows) is valid and open for the duration of the
+    // borrow. `File::from_raw_fd` / `from_raw_handle` would normally
+    // take ownership and close the handle on drop; wrapping the
+    // result in `ManuallyDrop` suppresses the destructor so the
+    // handle stays open and the borrow is honored. The closure
+    // receives only `&File`, never an owned `File`, so it cannot
+    // escape the wrapper.
+    #[cfg(unix)]
+    let file = ManuallyDrop::new(unsafe { File::from_raw_fd(fd.as_raw_fd()) });
+    #[cfg(windows)]
+    let file = ManuallyDrop::new(unsafe { File::from_raw_handle(fd.as_raw_handle()) });
+    f(&file)
+}
+
+/// Portable positional file IO mirroring POSIX `pread`/`pwrite` on
+/// both platforms.
+///
+/// Unix `std::os::unix::fs::FileExt::{write_all_at, read_at,
+/// read_exact_at}` already provides the right shape. Windows
+/// `std::os::windows::fs::FileExt::{seek_write, seek_read}` provides
+/// the equivalent `WriteFile`/`ReadFile` with explicit `OVERLAPPED.Offset`,
+/// but only the single-call form — looping until the buffer is
+/// drained is the caller's job. This trait hides the difference so
+/// the `BlockingBackend` impl looks the same on every platform.
+///
+/// **Windows file-pointer side effect.** `seek_read` /
+/// `seek_write` use `OVERLAPPED.Offset`, so the bytes land at the
+/// requested absolute offset regardless of any concurrent call;
+/// but Windows then updates the file pointer to
+/// `offset + bytes_transferred`. peel's workers always pass an
+/// explicit offset on every call (the sparse file is never read
+/// or written via the file pointer), so the post-call cursor
+/// position is unobserved and races between threads are harmless.
+/// This matches the way the Unix path already worked.
+trait FileOps {
+    fn pwrite_all_at(&self, buf: &[u8], offset: u64) -> io::Result<()>;
+    fn pread_at(&self, buf: &mut [u8], offset: u64) -> io::Result<usize>;
+    fn pread_exact_at(&self, buf: &mut [u8], offset: u64) -> io::Result<()>;
+}
+
+#[cfg(unix)]
+impl FileOps for File {
+    fn pwrite_all_at(&self, buf: &[u8], offset: u64) -> io::Result<()> {
+        self.write_all_at(buf, offset)
+    }
+
+    fn pread_at(&self, buf: &mut [u8], offset: u64) -> io::Result<usize> {
+        self.read_at(buf, offset)
+    }
+
+    fn pread_exact_at(&self, buf: &mut [u8], offset: u64) -> io::Result<()> {
+        self.read_exact_at(buf, offset)
+    }
+}
+
+#[cfg(windows)]
+impl FileOps for File {
+    fn pwrite_all_at(&self, mut buf: &[u8], mut offset: u64) -> io::Result<()> {
+        while !buf.is_empty() {
+            // `seek_write` may write fewer bytes than requested
+            // (matching POSIX `pwrite` semantics). A short write of
+            // zero — possible on a write to a disk that just went
+            // read-only — is reported as `ErrorKind::WriteZero`,
+            // mirroring `std::io::Write::write_all`'s contract.
+            let n = self.seek_write(buf, offset)?;
+            if n == 0 {
+                return Err(io::Error::new(
+                    io::ErrorKind::WriteZero,
+                    "seek_write returned 0 with bytes remaining",
+                ));
+            }
+            buf = &buf[n..];
+            // INVARIANT: `n <= buf.len() <= usize::MAX <= u64::MAX`,
+            // and the offset arithmetic is bounded by the file size
+            // the caller validated. `as u64` is therefore lossless.
+            offset = offset.saturating_add(n as u64);
+        }
+        Ok(())
+    }
+
+    fn pread_at(&self, buf: &mut [u8], offset: u64) -> io::Result<usize> {
+        self.seek_read(buf, offset)
+    }
+
+    fn pread_exact_at(&self, mut buf: &mut [u8], mut offset: u64) -> io::Result<()> {
+        while !buf.is_empty() {
+            let n = self.seek_read(buf, offset)?;
+            if n == 0 {
+                return Err(io::ErrorKind::UnexpectedEof.into());
+            }
+            let split = buf;
+            buf = &mut split[n..];
+            offset = offset.saturating_add(n as u64);
+        }
+        Ok(())
+    }
+}
+
+/// Platform-specific implementation of the
+/// [`IoBackend::order_writes`] contract for the blocking backend.
+///
+/// macOS: `fcntl(fd, F_BARRIERFSYNC)`. APFS guarantees that pre-barrier
+/// writes hit stable storage before post-barrier writes; the call
+/// returns without waiting for the pre-barrier writes to finish, so it
+/// is dramatically cheaper than `F_FULLFSYNC` (the syscall `File::sync_all`
+/// issues on Darwin).
+///
+/// Linux: `fdatasync(fd)`. We never change file size or mode between
+/// publication points (workers `pwrite_all_at` into a pre-fallocated
+/// sparse region; the checkpoint `.tmp` is opened, written, then
+/// renamed without truncation), so dropping the metadata flush a full
+/// `fsync` would do is safe.
+///
+/// Other Unix: full `sync_all`.
+pub(crate) fn order_writes_blocking(fd: OsFd<'_>) -> io::Result<()> {
+    #[cfg(target_os = "macos")]
+    {
+        // Darwin: F_BARRIERFSYNC = 85. Defined in
+        // <sys/fcntl.h>; we declare the constant locally rather than
+        // pulling in `libc`, matching the same pattern
+        // `src/punch.rs::macos::F_PUNCHHOLE` uses.
+        const F_BARRIERFSYNC: i32 = 85;
+        // SAFETY: `fcntl` is variadic at the C level. Darwin's
+        // F_BARRIERFSYNC takes no extra arguments, so the variadic
+        // slot is unused. `BorrowedFd<'_>` guarantees the descriptor
+        // is open for the duration of the call.
+        extern "C" {
+            fn fcntl(fd: i32, cmd: i32, ...) -> i32;
+        }
+        let rc = unsafe { fcntl(fd.as_raw_fd(), F_BARRIERFSYNC) };
+        if rc < 0 {
+            let err = io::Error::last_os_error();
+            // EINVAL on filesystems that don't implement the barrier
+            // (some non-APFS volumes, network mounts). Fall back to a
+            // full sync so the publication contract still holds.
+            if err.raw_os_error() == Some(22) {
+                return with_file(fd, File::sync_all);
+            }
+            return Err(err);
+        }
+        Ok(())
+    }
+    #[cfg(target_os = "linux")]
+    {
+        extern "C" {
+            fn fdatasync(fd: i32) -> i32;
+        }
+        // SAFETY: `BorrowedFd<'_>` guarantees the descriptor is open
+        // for the duration of the call. `fdatasync` takes only the
+        // fd; on success it returns 0, on failure -1 with errno set.
+        let rc = unsafe { fdatasync(fd.as_raw_fd()) };
+        if rc < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(())
+    }
+    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+    {
+        with_file(fd, File::sync_all)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    use std::io::{Read, Seek, SeekFrom, Write};
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    use crate::os_fd::AsOsFd;
+
+    /// Process-unique counter so concurrent test threads do not collide
+    /// on temp filenames.
+    static UNIQ: AtomicU64 = AtomicU64::new(0);
+
+    fn unique_temp_path(label: &str) -> std::path::PathBuf {
+        let pid = std::process::id();
+        let n = UNIQ.fetch_add(1, Ordering::Relaxed);
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+        std::env::temp_dir().join(format!("peel_iobackend_{label}_{pid}_{nanos}_{n}.bin"))
+    }
+
+    struct CleanupOnDrop(std::path::PathBuf);
+    impl Drop for CleanupOnDrop {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_file(&self.0);
+        }
+    }
+
+    fn open_temp(label: &str, len: u64) -> (File, CleanupOnDrop) {
+        let path = unique_temp_path(label);
+        let cleanup = CleanupOnDrop(path.clone());
+        let file = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .open(&path)
+            .expect("open temp");
+        file.set_len(len).expect("set_len");
+        (file, cleanup)
+    }
+
+    #[test]
+    fn blocking_name_is_blocking() {
+        let b = BlockingBackend::new();
+        assert_eq!(b.name(), "blocking");
+    }
+
+    #[test]
+    fn default_backend_is_blocking() {
+        let b = default_backend();
+        assert_eq!(b.name(), "blocking");
+    }
+
+    #[test]
+    fn pwrite_all_at_writes_full_buffer() {
+        let (mut file, _cleanup) = open_temp("pwrite_full", 1024);
+        let backend = BlockingBackend::new();
+        let payload: Vec<u8> = (0u8..32).collect();
+        backend
+            .pwrite_all_at(file.as_os_fd(), 64, &payload)
+            .expect("pwrite");
+        file.seek(SeekFrom::Start(64)).expect("seek");
+        let mut got = vec![0u8; 32];
+        file.read_exact(&mut got).expect("read");
+        assert_eq!(got, payload);
+    }
+
+    #[test]
+    fn pread_at_returns_bytes_read() {
+        let (mut file, _cleanup) = open_temp("pread", 1024);
+        let payload: [u8; 16] = [0xAA; 16];
+        file.seek(SeekFrom::Start(100)).expect("seek");
+        file.write_all(&payload).expect("write");
+        let backend = BlockingBackend::new();
+        let mut got = [0u8; 16];
+        let n = backend
+            .pread_at(file.as_os_fd(), 100, &mut got)
+            .expect("pread");
+        assert_eq!(n, 16);
+        assert_eq!(got, payload);
+    }
+
+    #[test]
+    fn pread_at_short_reads_at_eof() {
+        let (file, _cleanup) = open_temp("pread_eof", 32);
+        let backend = BlockingBackend::new();
+        let mut got = vec![0u8; 64];
+        let n = backend
+            .pread_at(file.as_os_fd(), 16, &mut got)
+            .expect("pread");
+        assert_eq!(n, 16);
+    }
+
+    #[test]
+    fn pread_exact_at_errors_at_eof() {
+        let (file, _cleanup) = open_temp("pread_exact_eof", 32);
+        let backend = BlockingBackend::new();
+        let mut got = vec![0u8; 64];
+        let err = backend
+            .pread_exact_at(file.as_os_fd(), 16, &mut got)
+            .expect_err("expected EOF");
+        assert_eq!(err.kind(), io::ErrorKind::UnexpectedEof);
+    }
+
+    #[test]
+    fn sync_all_succeeds_on_regular_file() {
+        let (file, _cleanup) = open_temp("sync_all", 32);
+        let backend = BlockingBackend::new();
+        backend.sync_all(file.as_os_fd()).expect("sync_all");
+    }
+
+    #[test]
+    fn order_writes_succeeds_on_regular_file() {
+        // `PLAN_checkpoint_cadence_throughput.md` Phase 1: the
+        // blocking backend's `order_writes` resolves to
+        // `F_BARRIERFSYNC` on macOS, `fdatasync` on Linux, and a
+        // full `sync_all` elsewhere. All three paths must succeed
+        // on a freshly-truncated regular file.
+        let (file, _cleanup) = open_temp("order_writes", 32);
+        let backend = BlockingBackend::new();
+        backend.order_writes(file.as_os_fd()).expect("order_writes");
+    }
+
+    #[test]
+    fn order_writes_succeeds_after_pwrite() {
+        // Same as `order_writes_succeeds_on_regular_file` but with a
+        // pwrite first, exercising the realistic "publish recent
+        // writes" code path.
+        let (file, _cleanup) = open_temp("order_writes_after_pwrite", 64);
+        let backend = BlockingBackend::new();
+        backend
+            .pwrite_all_at(file.as_os_fd(), 0, b"hello world\n")
+            .expect("pwrite");
+        backend.order_writes(file.as_os_fd()).expect("order_writes");
+    }
+
+    #[test]
+    fn select_blocking_returns_blocking() {
+        let (b, label) =
+            select_backend(IoBackendChoice::Blocking, 4).expect("blocking always works");
+        assert_eq!(b.name(), "blocking");
+        assert!(label.starts_with("io_backend=blocking"), "{label}");
+    }
+
+    #[test]
+    fn select_auto_yields_a_backend() {
+        // Whatever we get back must be functional; on darwin / non-uring
+        // Linux we get blocking, on uring-capable Linux we get uring.
+        let (b, label) =
+            select_backend(IoBackendChoice::Auto, 4).expect("auto always picks something");
+        let name = b.name();
+        assert!(matches!(name, "blocking" | "uring"));
+        assert!(label.starts_with("io_backend="), "{label}");
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    #[test]
+    fn select_uring_errors_on_non_linux() {
+        let err =
+            select_backend(IoBackendChoice::Uring, 4).expect_err("uring must error on non-Linux");
+        let msg = err.to_string();
+        assert!(msg.contains("Linux"), "{msg}");
+    }
+
+    #[test]
+    fn round_trip_through_arc_dyn() {
+        // Smoke test: object-safety + Send + Sync + thread sharing.
+        let (file, _cleanup) = open_temp("arc_dyn", 4096);
+        let backend: Arc<dyn IoBackend> = default_backend();
+        let payload: Vec<u8> = (0u8..64).collect();
+        let backend2 = Arc::clone(&backend);
+        let fd = file.as_os_fd();
+        backend.pwrite_all_at(fd, 0, &payload).expect("write");
+        let mut got = vec![0u8; payload.len()];
+        backend2.pread_exact_at(fd, 0, &mut got).expect("read");
+        assert_eq!(got, payload);
+    }
+
+    #[test]
+    fn blocking_connect_round_trips_against_loopback() {
+        use std::io::{Read as _, Write as _};
+        use std::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+        let addr = listener.local_addr().expect("local_addr");
+
+        let server = std::thread::spawn(move || {
+            let (mut s, _) = listener.accept().expect("accept");
+            let mut buf = [0u8; 5];
+            s.read_exact(&mut buf).expect("read");
+            assert_eq!(&buf, b"hello");
+            s.write_all(b"world").expect("write");
+        });
+
+        let backend = BlockingBackend::new();
+        let cfg = SocketConfig::default();
+        let mut stream = backend.connect(addr, &cfg).expect("connect");
+        stream.write_all(b"hello").expect("write");
+        let mut got = [0u8; 5];
+        stream.read_exact(&mut got).expect("read");
+        assert_eq!(&got, b"world");
+        server.join().expect("server thread");
+    }
+
+    #[test]
+    fn socket_config_defaults_have_nodelay_and_timeouts() {
+        let cfg = SocketConfig::default();
+        assert!(cfg.nodelay);
+        assert!(cfg.read_timeout.is_some());
+        assert!(cfg.write_timeout.is_some());
+        assert_eq!(cfg.connect_timeout, Duration::from_secs(30));
+    }
+}

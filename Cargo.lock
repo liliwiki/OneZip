@@ -4036,7 +4036,6 @@ dependencies = [
 [[package]]
 name = "peel-rs"
 version = "0.8.0"
-source = "git+https://github.com/agouin/peel?rev=77d2e34b6138cc6279a5e0d1a64271b07faa0219#77d2e34b6138cc6279a5e0d1a64271b07faa0219"
 dependencies = [
  "anyhow",
  "bytes",

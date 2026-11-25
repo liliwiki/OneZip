@@ -1,0 +1,6211 @@
+//! The §10 coordinator: ties the download scheduler, the extractor, and
+//! the checkpoint module together into one resumable pipeline.
+//!
+//! [`run`] is the single public entry point. It opens (or reuses) the
+//! sparse `<output>.peel.part` and `<output>.peel.ckpt` files alongside
+//! the user's chosen output, issues a `HEAD` to discover the source's
+//! size and identity, and either starts a fresh extraction or resumes an
+//! existing one off the on-disk checkpoint.
+//!
+//! # Threading
+//!
+//! The download scheduler runs on a background thread. The extractor
+//! runs on the calling thread. They communicate through three pieces of
+//! shared state:
+//!
+//! - the [`SparseFile`] — workers write chunks at offset, the extractor
+//!   reads sequentially from the front;
+//! - the [`ChunkBitmap`] — workers mark complete chunks, the extractor
+//!   blocks on the bit for the chunk it needs next;
+//! - the cursor [`AtomicU64`] — the extractor advances it as it reads,
+//!   the scheduler biases dispatch toward chunks at or past the cursor.
+//!
+//! When the download thread exits (success or error) it sets a shared
+//! `download_done` flag and stashes its result in a mutex; the extractor's
+//! [`BlockingSparseReader`] checks both whenever it is about to block on
+//! a missing chunk.
+//!
+//! # Checkpoint cadence
+//!
+//! Quiescent advances fire many times a second on a fast pipeline.
+//! Writing a checkpoint on every one would be wasteful. The coordinator
+//! throttles: it writes a new checkpoint when *either* (a) at least
+//! [`CoordinatorConfig::checkpoint_min_bytes`] bytes of source progress
+//! have been made since the last write, or (b) at least
+//! [`CoordinatorConfig::checkpoint_min_interval`] of wall-clock time has
+//! elapsed since the last write. Either floor catches the slow case
+//! (small archive, fast network) and the fast case (large archive,
+//! slow disk).
+//!
+//! # Cleanup on success
+//!
+//! On a clean run the coordinator deletes `.peel.part` and
+//! `.peel.ckpt`. Failures leave them in place so the next invocation
+//! resumes. The output (the extracted directory or the raw output file)
+//! is never deleted on failure — partial extraction state is the user's
+//! to inspect.
+//!
+//! # Integrity invariants
+//!
+//! These are the durable facts every other module in the pipeline
+//! relies on. They are stated here, in one place, because no single
+//! file enforces all of them and the `PLAN_responsiveness.md` §3
+//! audit was made harder by their being scattered across comments.
+//!
+//! ### What "chunk N is in the bitmap" means
+//!
+//! When [`ChunkBitmap::is_complete`] returns `true` for chunk `N`,
+//! every byte covered by `[N * chunk_size, min((N+1) * chunk_size,
+//! total_size))` is durable on disk *as of the most recent
+//! [`SparseFile::sync_all`]*, and matches the CRC-32C recorded at
+//! [`ChunkFingerprints::get(N)`] (when fingerprints are enabled).
+//!
+//! The happens-before edge is: a worker's
+//! [`SparseFile::pwrite_at`] returns successfully → the scheduler
+//! records [`ChunkFingerprints::record(N, crc)`] → the scheduler
+//! calls [`ChunkBitmap::complete_range`] (this ordering is enforced
+//! at [`crate::download::scheduler`]). Readers do the inverse: they
+//! `Acquire`-load the bitmap bit, and only after observing it set
+//! do they trust the matching fingerprint. The §11 source-drift
+//! probe and the §3.1 cursor audit (see [`run_cursor_chunk_audit`])
+//! both depend on this ordering.
+//!
+//! Bytes are *not* durable across a SIGKILL until either
+//! [`SparseFile::order_writes`] runs (the checkpoint observer calls
+//! it before persisting the `.peel.ckpt`; on macOS this is
+//! `F_BARRIERFSYNC`, on Linux `fdatasync(2)`) or the OS flushes the
+//! page cache asynchronously. The barrier guarantees ordering: any
+//! page the bitmap claims durable in a checkpoint is on stable
+//! storage no later than the rename that publishes the checkpoint.
+//! Pre-Phase 1 of `PLAN_checkpoint_cadence_throughput.md` this was a
+//! full `sync_all`; the contract resume relies on (rename-observable
+//! ⇒ pages durable) is identical. The next run's resume loads only
+//! the **persisted** checkpoint's bitmap, which is barrier-clean by
+//! construction; any chunk that was complete in memory but missed
+//! the barrier reverts to "not complete" on resume and is re-fetched
+//! cleanly. The `.peel.part` file's bytes for those chunks are
+//! either the genuine bytes (if they raced past the cache before the
+//! crash) or zero (if not) — and the §11 chunk CRC-32C check on
+//! resume catches any corruption either way; the fresh fetch
+//! overwrites the cells.
+//!
+//! ### What `decoder_position` guarantees
+//!
+//! The [`Checkpoint::decoder_position`] is the source-byte offset
+//! the streaming decoder will read first on resume. Two things
+//! must be true at that offset:
+//!
+//! - Chunk `decoder_position / chunk_size` is in the resumed
+//!   bitmap with bytes matching its fingerprint (the §3.1 cursor
+//!   audit re-CRCs to confirm before letting the decoder run).
+//! - Either (a) the decoder is mid-frame and the saved
+//!   [`Checkpoint::decoder_state`] blob captures every piece of
+//!   in-frame state needed to continue, with
+//!   `bytes_consumed_at_capture == decoder_position` (V2 zstd blobs
+//!   assert this; the typed
+//!   [`crate::decode::DecodeError::ResumeMismatch`] is what fires
+//!   if it doesn't hold); or (b) the decoder is at a frame
+//!   boundary and `decoder_state` is `None`, in which case a
+//!   freshly-constructed decoder reading from `decoder_position`
+//!   onward produces byte-identical output.
+//!
+//! ### What `max_disk_buffer` measures
+//!
+//! `bytes_downloaded - bytes_decoded_input` is the on-disk
+//! footprint of bytes downloaded but not yet read by the decoder
+//! (= the lookahead). The scheduler's disk-buffer throttle stops
+//! dispatching when this gap reaches `max_disk_buffer`, so under
+//! steady state the gap oscillates around the cap. Two
+//! transients break that intuition:
+//!
+//! - On resume, [`run`] pre-credits `bytes_downloaded` with the
+//!   bytes for already-complete chunks (so the renderer doesn't
+//!   snap from 0%) but `bytes_decoded_input` starts at the
+//!   resumed `decoder_position`. The lookahead therefore reads
+//!   `(resumed_dl_bytes − decoder_position)` immediately at
+//!   startup, which can briefly exceed the cap until the decoder
+//!   draws it down. This is benign and handled by the throttle's
+//!   "stop dispatching" rule (= already at cap, nothing further
+//!   to do).
+//! - When the decoder hits source bytes it can't make progress on
+//!   (the §3 corruption hypothesis), `bytes_decoded_input`
+//!   freezes while `bytes_downloaded` continues until the cap is
+//!   hit; the pipeline then deadlocks. The §1.2 stall heartbeat
+//!   surfaces this within `STALL_WARN_INTERVAL`.
+//!
+//! ### Behavior under SIGKILL
+//!
+//! After a `kill -9`, the most recently-persisted `.peel.ckpt`
+//! and `.peel.part` are durable. The next invocation re-loads
+//! the checkpoint, runs the §11 server-side drift probe and the
+//! §3.1 cursor-chunk local audit, and proceeds from
+//! `decoder_position`. There is no "garbage collection" of the
+//! sparse file: bytes for chunks that *were* written before the
+//! kill but never persisted into the bitmap stay on disk and are
+//! either overwritten by the resumed download (if the resumed
+//! bitmap doesn't have them) or harmlessly ignored.
+
+pub mod local;
+
+use std::fs;
+use std::io::{self, Read};
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
+use std::thread;
+use std::time::{Duration, Instant, SystemTime};
+
+use thiserror::Error;
+
+use crate::bitmap::{BitmapDecodeError, ChunkBitmap};
+use crate::checkpoint::{Checkpoint, CheckpointError, RunMode, SinkState};
+use crate::decode::{DecodeError, DecoderFactory, DecoderRegistry, FormatShape, StreamingDecoder};
+#[cfg(feature = "sevenz")]
+use crate::download::sevenz_pipeline::{
+    SevenzExtractionStats, SevenzPipeline, SevenzPipelineConfig, SevenzPipelineError,
+    SevenzPipelineEvent, SevenzResumeState,
+};
+use crate::download::{
+    chunk_count, discover_with_mirrors, run as run_scheduler, ChunkFingerprints, DownloadInfo,
+    DownloadStats, MirrorSet, MultiSparse, ProbeConfig, RetryConfig, SchedulerConfig,
+    SchedulerError, SourceFingerprint, SparseFile, SparseFileError, DEFAULT_CHUNK_SIZE,
+    DEFAULT_WORKERS,
+};
+#[cfg(feature = "zip")]
+use crate::download::{
+    ZipPipeline, ZipPipelineConfig, ZipPipelineError, ZipPipelineEvent, ZipResumeState,
+};
+use crate::extractor::{
+    CheckpointInfo, ExtractionStats, Extractor, ExtractorConfig, ExtractorError,
+    DEFAULT_PUNCH_THRESHOLD,
+};
+use crate::http::{Client, ClientError, Url, UrlError};
+use crate::progress::ProgressState;
+use crate::punch::{default_puncher, NoopPuncher, PunchHole};
+#[cfg(feature = "rar")]
+use crate::rar::FORMAT_NAME as RAR_FORMAT_NAME;
+#[cfg(feature = "sevenz")]
+use crate::sevenz::FORMAT_NAME as SEVENZ_FORMAT_NAME;
+#[cfg(feature = "sevenz")]
+use crate::sink::SevenzSink;
+#[cfg(feature = "zip")]
+use crate::sink::ZipSink;
+use crate::sink::{RawSink, Sink, SinkError, TarSink};
+use crate::types::{ByteOffset, ChunkIndex};
+#[cfg(feature = "zip")]
+use crate::zip::FORMAT_NAME as ZIP_FORMAT_NAME;
+
+/// Sentinel `io::Error` message used to thread kill-switch trips
+/// through a layer (decoder, extractor observer, ZIP pipeline) that
+/// only speaks `io::Error`. The outer `run_one` / `run_zip` matchers
+/// recognize this string and translate it into a typed
+/// [`CoordinatorError::Aborted`]; everything else surfaces as an
+/// extractor / pipeline failure.
+pub(crate) const KILL_SENTINEL: &str = "peel:kill-switch-tripped";
+
+/// What kind of output the coordinator should produce.
+#[derive(Debug, Clone)]
+pub enum OutputTarget {
+    /// Stream the decoded bytes verbatim into a single file.
+    File(PathBuf),
+    /// Extract the decoded archive (tar) into the given directory.
+    /// The directory must exist (the coordinator will create it if
+    /// missing).
+    Dir(PathBuf),
+}
+
+impl OutputTarget {
+    /// Path the .peel.part / .peel.ckpt sidecars are placed alongside.
+    fn anchor(&self) -> &Path {
+        match self {
+            Self::File(p) | Self::Dir(p) => p.as_path(),
+        }
+    }
+}
+
+/// Tunable knobs for [`run`].
+#[derive(Debug, Clone)]
+pub struct CoordinatorConfig {
+    /// HTTP-side: chunk size used when slicing the source for parallel
+    /// ranged downloads. This is the **bitmap chunk size** — the
+    /// unit of completion tracked in the bitmap and persisted in
+    /// checkpoints. With adaptive sizing on (the default), the
+    /// scheduler may coalesce several consecutive bitmap chunks into
+    /// a single ranged GET; the bitmap unit itself stays fixed for
+    /// the lifetime of the run (`PLAN_v2.md` §8).
+    pub chunk_size: u64,
+    /// Adaptive chunk-size policy (`PLAN_v2.md` §8). When `true`
+    /// (default), the scheduler observes per-dispatch latency / retry
+    /// rate and grows or shrinks the dispatch size accordingly,
+    /// bounded below by `chunk_size` and above by 64 MiB. When
+    /// `false`, the dispatch size stays equal to `chunk_size` for the
+    /// whole run (matches the pre-§8 behaviour).
+    pub adaptive_chunk_size: bool,
+    /// HTTP-side: number of parallel download workers.
+    pub workers: u32,
+    /// Per-chunk retry policy (forwarded to the scheduler).
+    pub retry: RetryConfig,
+    /// Extractor-side: minimum gap between in-loop punch syscalls.
+    pub punch_threshold: u64,
+    /// Minimum source-byte progress between checkpoint writes. Acts
+    /// as a floor: at high realized download rates the live floor
+    /// scales up (see [`Self::checkpoint_target_interval`]) so the
+    /// cadence does not spam checkpoints faster than the OS can
+    /// durably publish them.
+    pub checkpoint_min_bytes: u64,
+    /// Minimum wall-clock time between checkpoint writes.
+    pub checkpoint_min_interval: Duration,
+    /// Target wall-clock interval between checkpoints, used to scale
+    /// the byte floor at high download rates
+    /// (`PLAN_checkpoint_cadence_throughput.md` Phase 2).
+    ///
+    /// On every observer call the live byte floor is recomputed as
+    /// `max(checkpoint_min_bytes, realized_bps * checkpoint_target_interval)`
+    /// where `realized_bps` is the EWMA of recently downloaded bytes.
+    /// At low rates the configured byte floor wins (cadence is
+    /// rate-invariant); at high rates the realized term wins so each
+    /// checkpoint represents at least this much wall-clock progress.
+    /// [`Self::checkpoint_min_interval`] still bounds resume
+    /// granularity from above regardless of rate.
+    ///
+    /// `Duration::ZERO` disables rate-aware scaling entirely (the
+    /// pre-Phase-2 behaviour: only the configured byte floor and
+    /// time floor are used).
+    pub checkpoint_target_interval: Duration,
+    /// Override the .peel.part / .peel.ckpt anchor (defaults to the
+    /// output path itself). Set this for tests that point inputs and
+    /// outputs at different temp directories.
+    pub workdir: Option<PathBuf>,
+    /// Sleep between polls when the [`BlockingSparseReader`] is waiting
+    /// on a chunk that hasn't been downloaded yet. Tests use a small
+    /// value; production is fine with the default.
+    pub reader_poll_interval: Duration,
+    /// Force a specific decoder, looked up by name in the
+    /// [`DecoderRegistry`], bypassing both suffix and magic-byte
+    /// detection. Mirrors the `--format <name>` CLI flag.
+    ///
+    /// Useful for URLs like
+    /// `https://example.com/download?id=42` where the suffix is
+    /// uninformative.
+    pub forced_format: Option<String>,
+    /// When set, a suffix/magic disagreement is resolved in favor of
+    /// the magic-byte signature (with a warning) instead of returning
+    /// [`CoordinatorError::FormatMismatch`]. Mirrors the
+    /// `--force-format-from-magic` CLI flag.
+    ///
+    /// Mutually exclusive with [`Self::forced_format`] at the CLI
+    /// boundary; left to coexist here so library callers can
+    /// configure either independently.
+    pub force_format_from_magic: bool,
+    /// Choice of file-IO backend (PLAN_v2.md §7). `Auto` (default)
+    /// tries `io_uring` on Linux and falls back to blocking on
+    /// failure; `Blocking` forces the pre-§7 path; `Uring` requires
+    /// `io_uring` and surfaces a clean error if the kernel does not
+    /// support it. Mirrors the `--io-backend` CLI flag.
+    pub io_backend: crate::io_backend::IoBackendChoice,
+    /// SHA-256 of the expected source bytes (`internal/PLAN_v2.md` §10).
+    /// When `Some(_)`, the coordinator interposes a
+    /// [`crate::hash::HashingReader`] in front of the streaming
+    /// decoder, snapshots the in-flight state into every checkpoint,
+    /// and verifies the finalized digest at clean completion.
+    /// Mismatches are surfaced as
+    /// [`CoordinatorError::Integrity`] with a friendly explanation.
+    /// Mirrors the `--sha256 <hex>` CLI flag.
+    ///
+    /// Streaming pipeline only: ZIP archives extract per-entry and
+    /// the integrity check does not extend to that path in round-one
+    /// of `PLAN_v2.md`.
+    pub expected_sha256: Option<[u8; crate::hash::sha256::DIGEST_LEN]>,
+    /// Per-part SHA-256 digests for multi-URL runs
+    /// (`internal/PLAN_multi_url_source.md` §3 step 2). Empty for
+    /// single-URL runs (which use [`Self::expected_sha256`]) or
+    /// when no `--sha256` flags were supplied. Otherwise carries
+    /// exactly `1 + additional_urls.len()` digests, paired by URL
+    /// order — verified per-part as the decoder advances past each
+    /// boundary. Phase 3 of that plan accepts and validates the CLI
+    /// shape; phase 4 wires the runtime verification, until then
+    /// the coordinator errors at startup when this vec is non-empty.
+    pub expected_sha256s: Vec<[u8; crate::hash::sha256::DIGEST_LEN]>,
+    /// Additional mirror URLs (`PLAN_v2.md` §13). Each mirror is
+    /// expected to serve byte-identical copies of the source. The
+    /// coordinator runs `HEAD` against the primary plus every mirror
+    /// in parallel, drops disagreeing mirrors with a
+    /// `tracing::warn!`, and routes ranged GETs across the surviving
+    /// set. Empty for single-URL runs (the historical default).
+    /// Mirrors the repeatable `--mirror <URL>` CLI flag.
+    pub mirror_urls: Vec<String>,
+    /// Aggregate bandwidth cap, in bytes/sec
+    /// (`PLAN_v2.md` §14). When `Some`, the coordinator builds a
+    /// shared [`crate::download::RateLimiter`] and feeds every
+    /// download worker (and every mirror) through it. The cap is
+    /// aggregate across mirrors per the §14 step-5 contract. Mirrors
+    /// the `--max-bandwidth <RATE>` CLI flag.
+    pub max_bandwidth_bps: Option<u64>,
+    /// Cap on bytes downloaded but not yet consumed by the decoder.
+    /// When `Some`, the scheduler stops dispatching new chunks once
+    /// `bytes_downloaded - bytes_decoded_input` hits this value,
+    /// resuming when the decoder catches up. This bounds the on-disk
+    /// `.peel.part` footprint when the network is faster than the
+    /// disk / decoder. `None` disables the throttle. Mirrors the
+    /// `--max-disk-buffer <SIZE>` CLI flag (default `1 GiB`,
+    /// `none` to disable).
+    pub max_disk_buffer: Option<u64>,
+
+    /// Download-only mode (`internal/PLAN_download_modes.md` §2). When
+    /// `true`, the coordinator runs the parallel-ranged-HTTP
+    /// scheduler, fills `<output>.peel.part`, then renames it to
+    /// `<output>` on clean completion. No decoder runs; no holes are
+    /// punched; the `.peel.ckpt` is cleared at the end. Mirrors the
+    /// `--no-extract` / `--download-only` CLI flag.
+    pub no_extract: bool,
+
+    /// Preserve the source archive on disk after extraction
+    /// (`internal/PLAN_download_modes.md` §3). When `Some(path)`, the
+    /// extractor pipeline runs as usual but the puncher is forced
+    /// to no-op (so the archive stays at its full
+    /// `Content-Length`), and the `.peel.part` file is renamed to
+    /// `path` on clean completion instead of being deleted.
+    /// Redundant when [`Self::no_extract`] is set (the `.peel.part`
+    /// is already preserved as the final output); the CLI logs an
+    /// info-level note rather than erroring on that combination.
+    pub keep_archive: Option<PathBuf>,
+
+    /// Treat unrecognized formats as a hard error
+    /// (`internal/PLAN_download_modes.md` §4). When `false` (default),
+    /// a [`CoordinatorError::NoDecoder`] surfaced by format
+    /// detection is downgraded to a warning and the run completes
+    /// as if `--no-extract` had been passed (the `.peel.part` file
+    /// is renamed to a stream-shaped output path derived from the
+    /// URL basename). When `true` the error is rethrown unchanged.
+    pub strict_format: bool,
+
+    /// Password source for encrypted archives
+    /// (`internal/PLAN_archive_encryption.md` §1). `None` (the default)
+    /// means peel has no password to offer; encrypted entries
+    /// surface a `PasswordMissing`-style error from the format-
+    /// specific pipeline. `Some(source)` is the parsed
+    /// `--password-from` argument; the format pipeline calls
+    /// [`PasswordSource::load`] when it discovers an encrypted
+    /// entry and re-prompts on
+    /// [`PasswordSource::is_interactive`] sources for up to 3
+    /// attempts (per the plan).
+    ///
+    /// [`PasswordSource::load`]: crate::secret::source::PasswordSource::load
+    /// [`PasswordSource::is_interactive`]: crate::secret::source::PasswordSource::is_interactive
+    pub password_source: Option<crate::secret::source::PasswordSource>,
+
+    /// Land each source part in its own `.peel.part.NNN` sidecar
+    /// rather than concatenating every part's bytes into a single
+    /// `.peel.part` file (`internal/PLAN_multivolume_archives.md` §7).
+    ///
+    /// Default `false`: every existing single-URL and multi-URL
+    /// byte-concat run keeps the one-sparse-file layout. The
+    /// multi-volume code path (lit up by `peel name.partN.rar`
+    /// auto-discovery in §6 / §7 Phase 5) flips this to `true` so
+    /// hole-punching can release blocks of each volume's `.peel.part`
+    /// independently and a fully-extracted volume's sidecar can be
+    /// deleted without touching the rest of the set.
+    ///
+    /// When `true` and the run resolves a single-part source, the
+    /// coordinator silently falls back to the one-sparse-file layout
+    /// — the flag is a permissive opt-in, not a hard requirement.
+    pub multi_part_storage: bool,
+}
+
+impl Default for CoordinatorConfig {
+    fn default() -> Self {
+        Self {
+            chunk_size: DEFAULT_CHUNK_SIZE,
+            adaptive_chunk_size: true,
+            workers: DEFAULT_WORKERS,
+            retry: RetryConfig::default(),
+            punch_threshold: DEFAULT_PUNCH_THRESHOLD,
+            checkpoint_min_bytes: 8 * 1024 * 1024,
+            checkpoint_min_interval: Duration::from_secs(2),
+            checkpoint_target_interval: Duration::from_millis(200),
+            workdir: None,
+            reader_poll_interval: Duration::from_millis(5),
+            forced_format: None,
+            force_format_from_magic: false,
+            io_backend: crate::io_backend::IoBackendChoice::default(),
+            expected_sha256: None,
+            expected_sha256s: Vec::new(),
+            mirror_urls: Vec::new(),
+            max_bandwidth_bps: None,
+            max_disk_buffer: Some(DEFAULT_MAX_DISK_BUFFER),
+            no_extract: false,
+            keep_archive: None,
+            strict_format: false,
+            password_source: None,
+            multi_part_storage: false,
+        }
+    }
+}
+
+/// Default cap for [`CoordinatorConfig::max_disk_buffer`]: 1 GiB. Big
+/// enough that a decently-fast disk+decoder will rarely throttle, small
+/// enough that a slow disk doesn't fill /tmp on a multi-GiB archive.
+pub const DEFAULT_MAX_DISK_BUFFER: u64 = 1 << 30;
+
+/// Caller-supplied progress callback fired periodically while [`run`]
+/// is running. Errors returned here surface as
+/// [`CoordinatorError::Progress`] and abort the run.
+pub type ProgressFn = Box<dyn FnMut(ProgressEvent<'_>) + Send>;
+
+/// Diagnostic events the coordinator emits during a run.
+///
+/// The trait-object indirection keeps the public API ergonomic for
+/// callers that just want to print progress; tests pass a counting
+/// closure to verify cadence.
+#[derive(Debug, Clone)]
+pub enum ProgressEvent<'a> {
+    /// Discovery completed; the run is starting.
+    Started {
+        /// The source URL after redirects.
+        url: &'a Url,
+        /// Total source size in bytes.
+        total_size: u64,
+        /// True if a prior checkpoint was found and is being resumed.
+        resuming: bool,
+        /// Total chunks the source was sliced into.
+        total_chunks: u32,
+        /// Chunks already complete on entry (resume case).
+        chunks_resumed: u32,
+    },
+    /// A checkpoint was written.
+    CheckpointWritten {
+        /// Source byte offset the checkpoint refers to.
+        source_position: u64,
+        /// Bytes the decoder has consumed so far.
+        bytes_in: u64,
+        /// Bytes the sink has accepted so far.
+        bytes_out: u64,
+    },
+    /// The run finished cleanly.
+    Finished {
+        /// Aggregated download statistics.
+        download: &'a DownloadStats,
+        /// Aggregated extraction statistics.
+        extraction: &'a ExtractionStats,
+    },
+}
+
+/// Knobs the [`run`] entry point asks the caller to supply.
+pub struct RunArgs {
+    /// Primary source URL (the first positional argument). Holds
+    /// the entire archive in single-URL mode and part 0 in multi-URL
+    /// mode — see [`Self::additional_urls`].
+    pub url: String,
+    /// Additional source URLs for multi-part split archives
+    /// (`internal/PLAN_multi_url_source.md`). When empty, this is a
+    /// single-URL run and behaves exactly as before. When non-empty,
+    /// the coordinator runs N parallel HEADs across `[url] ++
+    /// additional_urls` via [`crate::download::discover_multi`] and
+    /// treats the byte-concatenation as one logical archive stream.
+    /// `--mirror` is mutually exclusive with this list (rejected at
+    /// CLI parse time).
+    pub additional_urls: Vec<String>,
+    /// Where extracted output goes.
+    pub output: OutputTarget,
+    /// Tunables. Pass [`CoordinatorConfig::default`] for production.
+    pub config: CoordinatorConfig,
+    /// HTTP client. Tests inject one configured against the mock
+    /// server; the default binary just calls [`Client::new`].
+    pub client: Client,
+    /// Decoder registry. The default is
+    /// [`DecoderRegistry::with_defaults`].
+    pub registry: DecoderRegistry,
+    /// Optional progress callback.
+    pub progress: Option<ProgressFn>,
+    /// Optional shared progress state (`PLAN_v2.md` §6). When set, the
+    /// coordinator passes it down to the scheduler (workers) and
+    /// extractor (sink writes) so byte-level counters update
+    /// continuously. The binary's renderer thread reads from this
+    /// state on its own cadence; library callers may construct one
+    /// for tests or programmatic monitoring.
+    pub progress_state: Option<Arc<ProgressState>>,
+    /// Optional shared atomic flag. When the flag transitions to
+    /// `true` between checkpoint writes, the coordinator aborts with
+    /// [`CoordinatorError::Aborted`], leaving the most recently
+    /// written `.peel.part` and `.peel.ckpt` durable on disk so the
+    /// next invocation can resume.
+    ///
+    /// This is the test-side hook the §10.3 crash-test harness uses
+    /// to simulate `kill -9` at random points; production callers
+    /// leave it `None`.
+    pub kill_switch: Option<Arc<AtomicBool>>,
+    /// Optional pre-resolved IO backend. When `Some`, [`run`] uses it
+    /// directly and skips its own [`crate::io_backend::select_backend`]
+    /// call; when `None`, [`run`] resolves the backend from
+    /// [`CoordinatorConfig::io_backend`].
+    ///
+    /// The `peel` binary pre-resolves in `main` so it can print the
+    /// `io_backend=…` banner as plain stderr scrollback BEFORE the
+    /// TTY progress renderer starts redrawing. Library callers and
+    /// tests typically leave this `None`.
+    pub io_backend: Option<Arc<dyn crate::io_backend::IoBackend>>,
+}
+
+/// Aggregate result of a successful [`run`].
+#[derive(Debug, Clone)]
+pub struct RunStats {
+    /// Source URL after redirects.
+    pub final_url: Url,
+    /// Total source size in bytes.
+    pub total_size: u64,
+    /// Whether the run resumed an existing checkpoint.
+    pub resumed: bool,
+    /// Source byte offset the *decoder* picked up at on resume.
+    /// `None` for fresh runs; `Some(offset)` when [`Self::resumed`]
+    /// is `true`. `Some(0)` is possible (and harmless) if the
+    /// prior run aborted before the first frame-boundary advance.
+    /// Crash-resume tests use this to confirm the resume actually
+    /// picked up mid-stream rather than re-running from byte 0.
+    pub resume_decoder_position: Option<u64>,
+    /// Whether the resume path used the format's
+    /// [`crate::decode::DecoderResumeFactory`] — i.e. the prior
+    /// checkpoint captured a `decoder_state` blob and the
+    /// registry knows a resume hook for the format. `false` for
+    /// fresh runs and for resumes from coarser frame boundaries
+    /// where `decoder_state` was not captured (e.g. gzip, identity
+    /// tar, zip). Crash-resume tests use this to confirm the
+    /// per-block / per-chunk mid-frame restart path actually
+    /// fired for formats that depend on it (lz4, zstd, xz).
+    pub resume_used_decoder_state: bool,
+    /// Aggregated download statistics.
+    pub download: DownloadStats,
+    /// Aggregated extraction statistics.
+    pub extraction: ExtractionStats,
+    /// Wall-clock time accumulated across every run that
+    /// contributed to this operation. Fresh runs report
+    /// `started.elapsed()`; resumed runs report `prior_elapsed +
+    /// started.elapsed()`, where `prior_elapsed` is sourced from
+    /// the checkpoint's v15 `cumulative_elapsed` trailer. The
+    /// `[done]` line in `peel` renders this with [`format_eta`]
+    /// so a long-running operation killed and resumed many times
+    /// still reports a coherent "total time to complete."
+    ///
+    /// [`format_eta`]: crate::progress::format_eta
+    pub elapsed: Duration,
+}
+
+/// Errors produced by [`run`].
+#[derive(Debug, Error)]
+pub enum CoordinatorError {
+    /// The user-supplied URL did not parse.
+    #[error("invalid URL {url:?}")]
+    InvalidUrl {
+        /// The URL the user passed.
+        url: String,
+        /// Underlying parse error.
+        #[source]
+        source: UrlError,
+    },
+
+    /// Building the HTTP client failed.
+    #[error("HTTP client setup failed")]
+    Client(#[source] ClientError),
+
+    /// Two configuration options conflict and cannot be satisfied
+    /// together (for example, `--no-extract` plus multi-part
+    /// storage, where there is no single rename target for the N
+    /// source-part files; see
+    /// `internal/PLAN_multivolume_archives.md` §7 cleanup notes).
+    #[error("conflicting options: {detail}")]
+    ConflictingOptions {
+        /// Operator-facing description of which combination
+        /// conflicted and why peel refused.
+        detail: String,
+    },
+
+    /// The download scheduler failed.
+    #[error("download failed")]
+    Scheduler(#[source] SchedulerError),
+
+    /// The extractor failed.
+    #[error("extraction failed")]
+    Extractor(#[source] ExtractorError),
+
+    /// A sink error surfaced before extraction started (e.g. building
+    /// the resume sink failed).
+    #[error("sink setup failed")]
+    Sink(#[source] SinkError),
+
+    /// Decoder factory rejected the source on construction.
+    #[error("decoder construction failed")]
+    Decode(#[source] DecodeError),
+
+    /// No decoder is registered for the resolved URL's filename.
+    #[error("no decoder registered for {filename:?}")]
+    NoDecoder {
+        /// Filename component the registry was looked up against.
+        filename: String,
+    },
+
+    /// The URL's suffix and the source's magic-byte signature point at
+    /// different formats. The user must disambiguate with
+    /// `--format <name>` or `--force-format-from-magic`.
+    #[error(
+        "format detection conflict: URL suffix indicates {suffix_format:?}, magic bytes \
+         indicate {magic_format:?}. Pass --format <name> to force a specific decoder \
+         or --force-format-from-magic to trust the magic"
+    )]
+    FormatMismatch {
+        /// Format name resolved from the URL's filename suffix, if any.
+        suffix_format: Option<String>,
+        /// Format name resolved from the magic-byte signature, if any.
+        magic_format: Option<String>,
+    },
+
+    /// The user passed `--format <name>` but no decoder is registered
+    /// under that name.
+    #[error("unknown format {name:?}; known formats: {available:?}")]
+    UnknownFormatName {
+        /// The name the user passed.
+        name: String,
+        /// Format names the registry knows about, for the error message.
+        available: Vec<String>,
+    },
+
+    /// The output URL has no usable filename component to look up a
+    /// decoder by suffix.
+    #[error("URL {url:?} has no filename to derive a decoder from")]
+    NoFilename {
+        /// The URL being inspected.
+        url: String,
+    },
+
+    /// IO setting up or tearing down a coordinator-owned file.
+    #[error("io error operating on {path}")]
+    Io {
+        /// File involved.
+        path: PathBuf,
+        /// Underlying OS error.
+        #[source]
+        source: io::Error,
+    },
+
+    /// The sparse output file failed an operation.
+    #[error("sparse file operation failed")]
+    SparseFile(#[source] SparseFileError),
+
+    /// Reading or writing a checkpoint failed.
+    #[error("checkpoint operation failed")]
+    Checkpoint(#[source] CheckpointError),
+
+    /// A checkpoint exists but its bitmap could not be deserialized.
+    #[error("checkpoint bitmap is corrupt")]
+    CheckpointBitmap(#[source] BitmapDecodeError),
+
+    /// The recorded checkpoint refers to a different source than the
+    /// one the user asked us to fetch — either the URL changed, the
+    /// total size changed, or the ETag/Last-Modified moved.
+    #[error("source identity changed since the prior checkpoint: {reason}")]
+    SourceChanged {
+        /// Human-readable summary of the discrepancy.
+        reason: String,
+    },
+
+    /// A `.peel.ckpt` checkpoint was loaded successfully but the
+    /// matching `.peel.part` sparse file is missing or smaller than
+    /// the source's total size. The bitmap inside the checkpoint
+    /// claims chunks complete that — without the part file's bytes
+    /// — would silently be replaced with zeros if we proceeded.
+    /// Refuse to resume rather than corrupt the run; the user must
+    /// either restore the part file or delete both sidecars and
+    /// start fresh.
+    ///
+    /// Common cause in container/Kubernetes setups: the `.peel.ckpt`
+    /// is on a persistent volume but the `.peel.part` was on
+    /// ephemeral storage and got wiped on pod restart, or vice
+    /// versa. The fix is to put both sidecars in the same durable
+    /// directory — see `--workdir`.
+    #[error(
+        "checkpoint at {ckpt_path} is present but {reason}; \
+         refusing to resume from an inconsistent state. \
+         Either restore the part file, or delete both sidecars to \
+         start fresh."
+    )]
+    CheckpointPartMismatch {
+        /// Path of the checkpoint file we loaded.
+        ckpt_path: PathBuf,
+        /// Path of the part file we expected to find next to it.
+        part_path: PathBuf,
+        /// Human-readable summary of the inconsistency.
+        reason: String,
+    },
+
+    /// The `PLAN_v2.md` §11 resume probe re-fetched a chunk we
+    /// thought was already complete and observed a CRC-32C that
+    /// disagreed with the value the prior run wrote into the
+    /// checkpoint. The source must have changed between runs;
+    /// the user must either delete the sidecars and start fresh
+    /// or aim peel at the original bytes.
+    #[error(
+        "source changed since the prior checkpoint: chunk {chunk} probe CRC32C \
+         (expected {expected:#010x}, observed {actual:#010x}). \
+         Delete .peel.part / .peel.ckpt and re-run."
+    )]
+    SourceChangedSinceCheckpoint {
+        /// Chunk whose probe failed.
+        chunk: ChunkIndex,
+        /// CRC-32C the prior run recorded.
+        expected: u32,
+        /// CRC-32C this run just computed.
+        actual: u32,
+    },
+
+    /// The on-disk bytes for the chunk holding the resume cursor
+    /// don't match the CRC-32C the prior run recorded for that
+    /// chunk. Distinct from
+    /// [`Self::SourceChangedSinceCheckpoint`]: the upstream source
+    /// is fine, but the bytes in the local `.peel.part` were either
+    /// damaged at rest or were never the bytes the bitmap claimed.
+    /// The decoder was about to read garbage from this region, so
+    /// refusing to start beats producing a malformed-block error
+    /// thousands of bytes later.
+    ///
+    /// Surfaced by the `PLAN_responsiveness.md` §3.1 local re-CRC
+    /// audit: on resume, the chunk containing `decoder_position` is
+    /// re-checksummed against the stored fingerprint. The user must
+    /// either repair the part file or delete both sidecars and
+    /// restart fresh.
+    #[error(
+        "part file corrupted at the resume cursor: chunk {chunk} on-disk CRC32C \
+         (expected {expected:#010x}, observed {actual:#010x}). \
+         Delete .peel.part / .peel.ckpt and re-run."
+    )]
+    PartFileCorrupted {
+        /// Chunk that holds `decoder_position`.
+        chunk: ChunkIndex,
+        /// CRC-32C the prior run recorded into the checkpoint.
+        expected: u32,
+        /// CRC-32C re-computed from the on-disk bytes.
+        actual: u32,
+    },
+
+    /// The configured chunk count overflowed `u32`.
+    #[error("source too large for the configured chunk size: {chunks} chunks")]
+    TooManyChunks {
+        /// How many chunks the source would need.
+        chunks: u64,
+    },
+
+    /// The download thread panicked.
+    #[error("download thread panicked")]
+    DownloadPanicked,
+
+    /// ZIP archives can only extract into a directory; the user
+    /// passed `--output` with a file-shaped path.
+    ///
+    /// Superseded by [`Self::OutputShapeMismatch`] for the post-
+    /// detection generic check (`internal/PLAN_download_modes.md` §1);
+    /// retained because the zip / 7z / rar pipelines still emit it
+    /// from their own per-pipeline guards.
+    #[error(
+        "ZIP archives can only be extracted into a directory; \
+         re-run with `-o <DIR>/` (trailing slash) instead of `-o <FILE>`"
+    )]
+    ZipNeedsDirectory,
+
+    /// The output path's shape and the detected format disagree
+    /// (`internal/PLAN_download_modes.md` §1). Raised after format
+    /// detection completes — covers both URL-suffix conflicts the
+    /// CLI did not catch and magic-detected formats that flip the
+    /// shape away from the user's `-o` path.
+    #[error("{detail}")]
+    OutputShapeMismatch {
+        /// Shape required by the resolved format.
+        shape: FormatShape,
+        /// The user-supplied output path.
+        path: PathBuf,
+        /// Human-readable explanation of the mismatch (includes the
+        /// path and the expected shape).
+        detail: String,
+    },
+
+    /// The ZIP pipeline failed.
+    #[cfg(feature = "zip")]
+    #[error("ZIP extraction failed")]
+    Zip(#[source] ZipPipelineError),
+
+    /// The 7z parser surfaced a wire-format failure.
+    /// Surfaced via [`run_sevenz`] (`internal/PLAN_7z_support.md`
+    /// §10).
+    #[cfg(feature = "sevenz")]
+    #[error("7z format error")]
+    Sevenz(#[source] crate::sevenz::SevenzError),
+
+    /// The 7z pipeline failed for a non-Sevenz reason
+    /// (download / IO / hole punching).
+    #[cfg(feature = "sevenz")]
+    #[error("7z extraction failed")]
+    SevenzPipeline(#[source] SevenzPipelineError),
+
+    /// The RAR pipeline failed (`internal/PLAN_rar.md` §3).
+    /// Wraps any [`crate::download::RarPipelineError`] variant
+    /// (format error, sink failure, sparse / punch IO).
+    #[cfg(feature = "rar")]
+    #[error("RAR extraction failed")]
+    Rar(#[source] crate::download::rar_pipeline::RarPipelineError),
+
+    /// The caller's [`RunArgs::kill_switch`] flipped to `true`
+    /// between checkpoint writes. The .peel.part / .peel.ckpt
+    /// sidecars are intentionally left on disk so the next call
+    /// resumes.
+    #[error("aborted by kill switch after {checkpoints_written} checkpoints")]
+    Aborted {
+        /// How many checkpoint writes had already completed at the
+        /// moment of the abort.
+        checkpoints_written: u64,
+    },
+
+    /// Resolving the configured [`crate::io_backend::IoBackendChoice`]
+    /// into a concrete backend failed (e.g. `--io-backend uring`
+    /// requested on a kernel without `io_uring` support).
+    #[error("io_backend setup failed")]
+    IoBackend(#[source] io::Error),
+
+    /// The `--sha256` integrity check failed: either the digest of
+    /// the bytes we received did not match the user's expected
+    /// digest, or the saved hash state across runs disagreed with
+    /// the current invocation's flags. Per `internal/PLAN_v2.md` §10 we
+    /// surface this as its own variant so the binary can give it a
+    /// distinct exit code.
+    #[error("integrity check failed")]
+    Integrity(#[source] crate::hash::IntegrityError),
+
+    /// The local-file extractor probed the source filesystem for
+    /// `FALLOC_FL_PUNCH_HOLE` support and the kernel/filesystem
+    /// refused (`internal/old/PLAN_local_file_extract.md` §2). Destructive
+    /// mode cannot proceed; the user must either pass
+    /// `-k/--keep-archive` to skip punching or move the archive to
+    /// a supporting filesystem (ext4, xfs, btrfs, tmpfs on Linux;
+    /// APFS on macOS).
+    #[error(
+        "the filesystem holding {} does not support FALLOC_FL_PUNCH_HOLE; \
+         peel cannot run in destructive mode here — re-run with \
+         `-k/--keep-archive` to extract without punching, or move the \
+         archive to a supporting filesystem", path.display()
+    )]
+    LocalPunchUnsupported {
+        /// Path of the source archive whose filesystem rejected
+        /// the probe.
+        path: PathBuf,
+    },
+}
+
+/// Run the full pipeline.
+///
+/// # Errors
+///
+/// Any of the [`CoordinatorError`] variants. On error the `.peel.part`
+/// and `.peel.ckpt` sidecars are left on disk so the next invocation
+/// resumes.
+pub fn run(args: RunArgs) -> Result<RunStats, CoordinatorError> {
+    let started = Instant::now();
+    let RunArgs {
+        url,
+        additional_urls,
+        output,
+        config,
+        client,
+        registry,
+        mut progress,
+        progress_state,
+        kill_switch,
+        io_backend: pre_resolved_io_backend,
+    } = args;
+
+    let parsed_url = Url::parse(&url).map_err(|source| CoordinatorError::InvalidUrl {
+        url: url.clone(),
+        source,
+    })?;
+
+    // Resolve the IO backend up front. With the move to hyper, HTTP
+    // sockets are opened by hyper itself; `io_backend` only governs
+    // filesystem IO from here on (sparse-file writes / hole punches).
+    // The `peel` binary pre-resolves in `main` (so it can banner the
+    // choice as plain stderr scrollback BEFORE the TTY renderer starts
+    // redrawing); library callers leave `args.io_backend` unset and
+    // we fall back to `select_backend` here. Either way,
+    // `select_backend` is the single place the choice is materialized
+    // and where the `io_backend=…` `tracing::info!` fires.
+    let io_backend = match pre_resolved_io_backend {
+        Some(b) => b,
+        None => {
+            crate::io_backend::select_backend(config.io_backend, config.workers)
+                .map_err(CoordinatorError::IoBackend)?
+                .0
+        }
+    };
+
+    // Parse mirror URLs up front so a malformed `--mirror` errors
+    // out before any network traffic.
+    let mirror_urls: Vec<Url> = config
+        .mirror_urls
+        .iter()
+        .map(|s| {
+            Url::parse(s).map_err(|source| CoordinatorError::InvalidUrl {
+                url: s.clone(),
+                source,
+            })
+        })
+        .collect::<Result<_, _>>()?;
+
+    // Multi-URL split-archive (`internal/PLAN_multi_url_source.md` §3
+    // step 1): when extra positional URLs were provided, route
+    // through [`discover_multi`] over `[primary, ...additional]`
+    // instead of the mirror-aware discovery. The CLI already
+    // rejects `--mirror` + multi-URL at parse time (§3 step 3).
+    //
+    // Multi-volume auto-discovery
+    // (`internal/PLAN_multivolume_archives.md` §1 + §6) runs one layer
+    // up in [`crate::cli::Cli::into_run_args`]: a single-URL seed
+    // whose basename matches a multi-volume pattern is expanded
+    // into the resolved volume set via
+    // [`crate::cli::resolve_multi_volume_http`], which sets
+    // `additional_urls` and `multi_part_storage` accordingly. By
+    // the time we reach this dispatcher the user's seed has
+    // already been routed to either the single-URL branch (no
+    // multi-volume / discovery skipped) or the multi-URL branch
+    // (expanded set); no coordinator-side discovery is needed.
+    let (info, mirror_set, dropped_mirrors) = if additional_urls.is_empty() {
+        let (info, ms, dropped) = discover_with_mirrors(
+            &client,
+            &parsed_url,
+            &mirror_urls,
+            config.expected_sha256.is_some(),
+        )
+        .map_err(CoordinatorError::Scheduler)?;
+        (info, ms, dropped)
+    } else {
+        let mut all = Vec::with_capacity(1 + additional_urls.len());
+        all.push(parsed_url.clone());
+        for u in &additional_urls {
+            all.push(
+                Url::parse(u).map_err(|source| CoordinatorError::InvalidUrl {
+                    url: u.clone(),
+                    source,
+                })?,
+            );
+        }
+        let info =
+            crate::download::discover_multi(&client, &all).map_err(CoordinatorError::Scheduler)?;
+        // Multi-URL is mutually exclusive with `--mirror` (CLI
+        // rejects the combination), so the mirror set we build
+        // here exists only to keep the scheduler's existing single-
+        // URL fallback wiring happy. The worker bypasses it
+        // whenever `info.source.len() > 1` (`internal/PLAN_multi_url_source.md`
+        // §1 step 4); see `try_once`.
+        let ms = MirrorSet::single(info.url.clone(), info.fingerprint.clone());
+        (info, ms, Vec::new())
+    };
+    let mirror_set = Arc::new(mirror_set);
+    let _ = dropped_mirrors; // surfaced via tracing::warn! inside discover_with_mirrors
+
+    // Multi-URL runs (`internal/PLAN_multi_url_source.md`) keep the
+    // user's `--chunk-size` even when individual parts are not a
+    // multiple of it. The worker's
+    // [`crate::download::worker::download_multi_segment`] handles
+    // chunks whose nominal range straddles a part boundary by
+    // issuing one ranged GET per part-segment and pwriting each
+    // piece at its global offset. Earlier rounds of this plan
+    // shrank `chunk_size` to the gcd of the part sizes; that
+    // produced bitmaps and per-chunk fingerprint vecs orders of
+    // magnitude larger than the source warranted (a 622 GiB Arb
+    // snapshot whose parts have a 2 KiB gcd would have built a
+    // 1.3 GiB CRC vec). The cross-boundary worker is the right
+    // alternative.
+
+    // Multi-part sidecar layout (`internal/PLAN_multivolume_archives.md`
+    // §7): when `multi_part_storage` is on and the source has more
+    // than one part, each part lands in its own
+    // `<anchor>.peel.part.NNN`. Single-part runs keep the existing
+    // `<anchor>.peel.part` location.
+    let part_count_for_layout = if config.multi_part_storage {
+        info.source.parts().len()
+    } else {
+        1
+    };
+    if part_count_for_layout > 1 {
+        // The cleanup phase renames `.peel.part` to the final output
+        // for `--no-extract` and `--keep-archive`. Multi-part runs
+        // have N source-part files — there's no single byte stream
+        // to rename to a single output path, so refuse the combo
+        // up front rather than silently dropping every part past
+        // the first. (`internal/PLAN_multivolume_archives.md` §7
+        // explicitly scopes multi-volume to "extract the contents";
+        // the keep-archive UX for multi-volume needs its own
+        // round-trip design.)
+        if config.no_extract {
+            return Err(CoordinatorError::ConflictingOptions {
+                detail:
+                    "--no-extract is incompatible with multi-part storage; multi-volume archives \
+                     have N source files and no single byte stream to keep."
+                        .into(),
+            });
+        }
+        if config.keep_archive.is_some() {
+            return Err(CoordinatorError::ConflictingOptions {
+                detail:
+                    "--keep-archive is incompatible with multi-part storage; multi-volume archives \
+                     have N source files and no single rename target."
+                        .into(),
+            });
+        }
+    }
+    let part_paths =
+        multi_part_sidecar_paths(&output, &config, part_count_for_layout, ".peel.part");
+    let part_path = part_paths[0].clone();
+    let ckpt_path = sidecar_path(&output, &config, ".peel.ckpt");
+
+    for p in &part_paths {
+        ensure_parent_dir(p)?;
+    }
+    ensure_parent_dir(&ckpt_path)?;
+    if let OutputTarget::Dir(d) = &output {
+        fs::create_dir_all(d).map_err(|source| CoordinatorError::Io {
+            path: d.clone(),
+            source,
+        })?;
+    }
+
+    let prior = Checkpoint::read(&ckpt_path).map_err(CoordinatorError::Checkpoint)?;
+    // An unknown-size run (range-less server with no Content-Length,
+    // issue #8) can't resume — single-stream has no ranged-read
+    // capability and the size isn't known until EOF — and never writes
+    // a checkpoint, so ignore any stale sidecar and always start fresh.
+    let prior = if info.size_known { prior } else { None };
+    // Wall-clock time accumulated by prior runs that contributed
+    // to this checkpoint. Seeds the v15 `cumulative_elapsed`
+    // trailer so the final `[done]` line reports total time
+    // across crash-resumes rather than just the last attempt.
+    let prior_elapsed = prior
+        .as_ref()
+        .map(|p| p.cumulative_elapsed)
+        .unwrap_or_default();
+    if prior.is_some() {
+        // A checkpoint exists — refuse to silently fall back to a
+        // fresh-zero part file. `open_sparse` would otherwise CREAT
+        // and `set_len` the part to `total_size`, leaving the bitmap's
+        // claim of complete chunks pointing at zero bytes. The §11
+        // probe catches the resulting CRC drift later, but with a
+        // misleading "source changed" message; this earlier check
+        // surfaces the real cause (sidecars out of sync) up front.
+        if part_count_for_layout == 1 {
+            validate_part_file(&ckpt_path, &part_path, info.total_size)?;
+        } else {
+            // Multi-part layout: every `.peel.part.NNN` must be at
+            // its part's exact size. A missing or truncated part
+            // breaks the same invariant the single-part audit
+            // checks (bitmap claims durable for chunks whose bytes
+            // are gone).
+            for (idx, part) in info.source.parts().iter().enumerate() {
+                validate_part_file(&ckpt_path, &part_paths[idx], part.size)?;
+            }
+        }
+    }
+
+    // `internal/PLAN_download_modes.md` §5: detect mode drift between
+    // the prior run and this one before touching the part-file.
+    // Pre-v12 checkpoints decode as [`RunMode::Extract`]; v12
+    // carries the writer's mode explicitly. A mismatch surfaces as
+    // a typed [`CheckpointError::ModeMismatch`] wrapped in
+    // [`CoordinatorError::Checkpoint`] so the binary can render a
+    // clear "rerun with the matching flag, or delete the .ckpt"
+    // recovery message.
+    if let Some(prior) = prior.as_ref() {
+        let prior_mode = prior.mode;
+        let current_mode = current_run_mode(&config);
+        if prior_mode != current_mode {
+            return Err(CoordinatorError::Checkpoint(
+                CheckpointError::ModeMismatch {
+                    old: prior_mode,
+                    new: current_mode,
+                },
+            ));
+        }
+    }
+    let resume_plan = build_resume_plan(prior.as_ref(), &info, &url, &config, &output)?;
+    let resuming = matches!(resume_plan, ResumePlan::Resume { .. });
+    let resume_decoder_position = match &resume_plan {
+        ResumePlan::Fresh => None,
+        ResumePlan::Resume {
+            decoder_position, ..
+        } => Some(*decoder_position),
+    };
+
+    let total_chunks = chunk_count(info.total_size, config.chunk_size).map_err(|e| match e {
+        SchedulerError::TooManyChunks { chunks, .. } => CoordinatorError::TooManyChunks { chunks },
+        other => CoordinatorError::Scheduler(other),
+    })?;
+
+    // Build the bitmap. If we're resuming, repopulate it from the
+    // checkpoint's serialized form; otherwise start empty.
+    let bitmap = match &resume_plan {
+        ResumePlan::Fresh => Arc::new(ChunkBitmap::new(total_chunks)),
+        ResumePlan::Resume { bitmap_bytes, .. } => Arc::new(
+            ChunkBitmap::from_bytes(total_chunks, bitmap_bytes)
+                .map_err(CoordinatorError::CheckpointBitmap)?,
+        ),
+    };
+
+    let chunks_resumed = u32::try_from(bitmap.count_complete()).unwrap_or(u32::MAX);
+
+    // Startup banner: log what peel decided about the sidecars and
+    // where it's reading them from. Visible in `kubectl logs` and
+    // any other non-TTY environment so operators can confirm at a
+    // glance whether resume is engaging — the symptom of a wiped PV
+    // or a path mismatch is "[fresh]" appearing on every run.
+    match resume_decoder_position {
+        Some(pos) => tracing::info!(
+            "[resume] checkpoint at {} part={} decoder_position={} chunks={}/{}",
+            ckpt_path.display(),
+            part_path.display(),
+            pos,
+            chunks_resumed,
+            total_chunks,
+        ),
+        None => tracing::info!(
+            "[fresh] no checkpoint at {} — starting from byte 0",
+            ckpt_path.display(),
+        ),
+    }
+
+    // §11 per-chunk CRC-32C fingerprint store. Pre-populated from
+    // the prior checkpoint when resuming a v4 run; an empty store
+    // when starting fresh or resuming a pre-§11 checkpoint.
+    let fingerprints = Arc::new(build_fingerprints(total_chunks, &resume_plan)?);
+
+    let (sparse_value, _per_part_paths) = open_sources(&info, &output, &config, &io_backend)?;
+    let sparse = Arc::new(sparse_value);
+
+    // §11 resume verification: when resuming with non-empty
+    // per-chunk fingerprints, pick a random already-complete chunk
+    // and re-fetch it. Mismatch ⇒ `SourceChangedSinceCheckpoint`.
+    if matches!(resume_plan, ResumePlan::Resume { .. }) && bitmap.count_complete() > 0 {
+        run_resume_probe(
+            &client,
+            &info,
+            &sparse,
+            &bitmap,
+            &fingerprints,
+            config.chunk_size,
+            &config.retry,
+        )?;
+    }
+
+    // §3.1 (PLAN_responsiveness.md): local re-CRC audit of the chunk
+    // holding the resume cursor. Distinct from the §11 server-side
+    // probe above: this catches *on-disk* corruption (bit flips at
+    // rest, a stray write that landed in the part file, an io_uring
+    // reorder hazard) that the server probe would silently miss.
+    // The chunk containing `decoder_position` is the one the decoder
+    // is about to read, so it's the one whose corruption would
+    // manifest as the malformed-block error documented in the plan.
+    if let ResumePlan::Resume {
+        decoder_position, ..
+    } = &resume_plan
+    {
+        run_cursor_chunk_audit(
+            &sparse,
+            &bitmap,
+            &fingerprints,
+            config.chunk_size,
+            info.total_size,
+            *decoder_position,
+        )?;
+    }
+
+    let cursor = Arc::new(AtomicU64::new(match &resume_plan {
+        ResumePlan::Fresh => 0,
+        ResumePlan::Resume {
+            decoder_position, ..
+        } => *decoder_position,
+    }));
+
+    if let Some(state) = progress_state.as_ref() {
+        state.set_total_size(info.total_size);
+        // Per-part labels for the progress UI
+        // (`internal/PLAN_multi_url_source.md`): pull each part's URL
+        // basename and pair it with the discovered size. Single-URL
+        // runs populate a one-element vec; the renderer special-
+        // cases len==1 to skip the per-part section.
+        let parts_for_progress: Vec<(String, u64)> = info
+            .source
+            .parts()
+            .iter()
+            .map(|p| (label_from_url(&p.url), p.size))
+            .collect();
+        state.set_parts(parts_for_progress);
+        // Pre-credit the resumed bytes so the renderer's progress bar
+        // doesn't snap from 0% on the first tick of a resume.
+        let resumed_bytes = u64::from(chunks_resumed).saturating_mul(config.chunk_size);
+        let resumed_bytes = resumed_bytes.min(info.total_size);
+        state.add_downloaded(resumed_bytes);
+        // Distribute the pre-credited resumed bytes across the
+        // per-part counters in source order so a resumed run's
+        // per-part rows match the global counter from tick zero.
+        let mut remaining = resumed_bytes;
+        for (idx, part) in info.source.parts().iter().enumerate() {
+            if remaining == 0 {
+                break;
+            }
+            let credit = remaining.min(part.size);
+            state.add_downloaded_to_part(idx, credit);
+            remaining -= credit;
+        }
+        // Pre-credit the resumed *extracted* count too: the sink's
+        // checkpointed state already records what was written through
+        // it, so the renderer should not rewind to 0 just because the
+        // current process hasn't yet decoded anything. Without this,
+        // a resumed run shows a download counter advancing at full
+        // (cumulative) speed against an extract counter that just
+        // restarted, which looks wrong even when nothing is broken.
+        if let ResumePlan::Resume { sink_state, .. } = &resume_plan {
+            let resumed_extracted = match sink_state {
+                SinkState::Raw { bytes_written } => *bytes_written,
+                SinkState::Tar {
+                    in_flight: Some(s), ..
+                } => s.archive_offset,
+                SinkState::Tar {
+                    in_flight: None, ..
+                } => 0,
+                // ZIP entries are byte-counted by the zip pipeline
+                // separately; pre-crediting from here would require
+                // re-reading entry sizes the resume plan doesn't carry.
+                SinkState::Zip { .. } => 0,
+                // Same shape as Zip: the 7z second-pipeline driver
+                // counts folder bytes itself; pre-crediting here
+                // would require re-reading folder sizes the resume
+                // plan doesn't carry.
+                SinkState::Sevenz { .. } => 0,
+                // Same shape as Zip / Sevenz: the RAR pipeline
+                // counts entry bytes itself; pre-crediting here
+                // would require re-reading entry sizes the resume
+                // plan doesn't carry.
+                SinkState::Rar { .. } => 0,
+            };
+            state.add_extracted(resumed_extracted);
+        }
+        state.mark_started();
+    }
+
+    if let Some(cb) = progress.as_mut() {
+        cb(ProgressEvent::Started {
+            url: &info.url,
+            total_size: info.total_size,
+            resuming,
+            total_chunks,
+            chunks_resumed,
+        });
+    }
+
+    let policy = if config.adaptive_chunk_size {
+        Some(Arc::new(crate::download::ChunkSizePolicy::new(
+            config.chunk_size,
+            crate::download::DEFAULT_INITIAL_DISPATCH_BYTES,
+        )))
+    } else {
+        None
+    };
+
+    // Aggregate bandwidth limiter (`PLAN_v2.md` §14). Constructed once
+    // from the user-provided rate and shared across every worker and
+    // every mirror so the cap is aggregate, not per-mirror. `None`
+    // disables limiting (the historical default).
+    let rate_limiter = config
+        .max_bandwidth_bps
+        .map(|bps| Arc::new(crate::download::RateLimiter::new(bps)));
+
+    // External abort signal handed to the scheduler. Two callers
+    // flip it: (a) the `CancelOnDrop` guard below, when the extraction
+    // closure exits via an error path; (b) the run-wide kill switch
+    // wired by `main` (SIGINT / SIGTERM). Wiring both into the same
+    // `Arc` means a kubelet SIGTERM aborts download workers in
+    // parallel with the extraction unwind — without it, the scheduler
+    // would only stop after the reader returned the kill sentinel,
+    // the extractor propagated it, and `CancelOnDrop` flipped a
+    // separate flag. The previous arrangement turned a "stop now"
+    // signal into a multi-stage relay race that could still leave
+    // workers chugging on in-flight chunks well into the pod's
+    // grace period.
+    //
+    // CancelOnDrop on a non-kill-switch failure path now also flips
+    // the user-supplied kill_switch by virtue of sharing the Arc.
+    // That is harmless: by the time CancelOnDrop fires the run is
+    // already returning Err; the only kill_switch readers
+    // (BlockingSparseReader, sniff_prefix, the extractor inner loop)
+    // have either already returned or will not be called again.
+    let download_abort = kill_switch
+        .clone()
+        .unwrap_or_else(|| Arc::new(AtomicBool::new(false)));
+
+    // Known-size + range-less ⇒ the scheduler runs `run_single_stream`,
+    // which writes the body strictly `0..total` in order. In that mode
+    // we hand the scheduler a sequential write frontier and gate the
+    // reader / format-sniff on it instead of the coarse `chunk_size`
+    // bitmap, so a streaming archive extracts concurrently with the
+    // download rather than only after it finishes
+    // (`internal/PLAN_single_stream_concurrent_extract.md`). Parallel
+    // (ranged) and unknown-size paths keep their existing gating: the
+    // bitmap (chunks complete out of order) and the growable high-water
+    // respectively, so the frontier stays `None` for them.
+    let single_stream_known = info.size_known && !info.accept_ranges;
+    let write_frontier = single_stream_known.then(|| Arc::new(AtomicU64::new(0)));
+
+    let scheduler_cfg = SchedulerConfig {
+        chunk_size: config.chunk_size,
+        workers: config.workers,
+        retry: config.retry.clone(),
+        progress: progress_state.clone(),
+        policy,
+        fingerprints: Some(Arc::clone(&fingerprints)),
+        probe: ProbeConfig::default(),
+        mirrors: Some(Arc::clone(&mirror_set)),
+        rate_limiter: rate_limiter.clone(),
+        max_disk_buffer: config.max_disk_buffer,
+        abort: Some(Arc::clone(&download_abort)),
+        write_frontier: write_frontier.clone(),
+    };
+
+    let download_done = Arc::new(AtomicBool::new(false));
+    let download_outcome: Arc<Mutex<Option<Result<DownloadStats, SchedulerError>>>> =
+        Arc::new(Mutex::new(None));
+
+    let total_size = info.total_size;
+    let chunk_size = config.chunk_size;
+
+    // Set inside the scoped thread when the decoder dispatch
+    // picks the resume_factory branch (a `decoder_state` blob was
+    // captured by the prior run AND a registered format hook
+    // accepts it). Read after the thread joins so
+    // [`RunStats::resume_used_decoder_state`] is populated.
+    let used_decoder_state_flag = Arc::new(AtomicBool::new(false));
+
+    let extraction_outcome =
+        thread::scope(|scope| -> Result<ExtractionOutcome, CoordinatorError> {
+            let used_decoder_state_flag = Arc::clone(&used_decoder_state_flag);
+            // Drop guard: any path out of this closure that does not
+            // explicitly disarm the guard (notably every `?` that
+            // propagates an error from extraction or format detection)
+            // flips the abort flag before scope's implicit join begins,
+            // so the download thread tears down promptly instead of
+            // running to completion. The Ok path calls
+            // `disarm_cancel_guard` just before returning.
+            let cancel_guard = CancelOnDrop::new(&download_abort);
+
+            // Spawn the download thread.
+            let dl_done = Arc::clone(&download_done);
+            let dl_outcome = Arc::clone(&download_outcome);
+            let dl_sparse = Arc::clone(&sparse);
+            let dl_bitmap = Arc::clone(&bitmap);
+            let dl_cursor = Arc::clone(&cursor);
+            let dl_info = info.clone();
+            let dl_client = client.clone();
+            let dl_cfg = scheduler_cfg.clone();
+            let dl_handle = thread::Builder::new()
+                .name("peel-download-scheduler".into())
+                .spawn_scoped(scope, move || {
+                    let result = run_scheduler(
+                        &dl_client, &dl_info, &dl_sparse, &dl_bitmap, &dl_cursor, &dl_cfg,
+                    );
+                    if let Ok(mut slot) = dl_outcome.lock() {
+                        *slot = Some(result);
+                    }
+                    dl_done.store(true, Ordering::Release);
+                })
+                .map_err(|source| CoordinatorError::Io {
+                    path: PathBuf::from("<spawn-download>"),
+                    source,
+                })?;
+
+            // `--no-extract` (`internal/PLAN_download_modes.md` §2):
+            // skip the entire decoder / sink / extractor stack and
+            // just wait for the download thread to finish. The
+            // sparse part-file becomes the final output via a
+            // post-scope rename (see below). Hole-punching is
+            // implicitly disabled (no decoder ⇒ no advancing
+            // cursor); the puncher is never constructed.
+            //
+            // Round-one of §2 emits no checkpoints in this mode
+            // (the existing checkpoint cadence is driven by the
+            // extractor's observer hook, which doesn't run). §5
+            // will add an explicit checkpoint cadence for the
+            // download-only path together with the v12 `mode`
+            // field. Until then, a `kill -9` during a download-only
+            // run discards in-flight progress on resume; a clean
+            // SIGTERM still completes any in-flight chunks before
+            // exiting because the abort flag is honored by the
+            // scheduler.
+            if config.no_extract {
+                dl_handle
+                    .join()
+                    .map_err(|_| CoordinatorError::DownloadPanicked)?;
+                let download_stats = match download_outcome.lock() {
+                    Ok(mut slot) => slot.take(),
+                    Err(_) => None,
+                };
+                let download_stats = match download_stats {
+                    Some(Ok(s)) => s,
+                    Some(Err(e)) => return Err(CoordinatorError::Scheduler(e)),
+                    None => DownloadStats::default(),
+                };
+                cancel_guard.disarm();
+                return Ok(ExtractionOutcome {
+                    extraction: ExtractionStats::default(),
+                    download: download_stats,
+                    used_decoder_state: false,
+                    fallback_no_extract_target: None,
+                });
+            }
+
+            // Resolve the decoder factory before constructing the
+            // reader. Detection may need to wait for chunk 0 to land
+            // so the magic-byte sniff has bytes to look at; doing it
+            // here keeps the BlockingSparseReader from owning that
+            // wait.
+            //
+            // The returned `FormatShape` is the second line of
+            // shape-validation defence (`internal/PLAN_download_modes.md`
+            // §1): the CLI resolver pre-validates against URL suffix
+            // and `--format`, but a `.bin` URL whose first bytes match
+            // zstd magic flips the shape post-CLI. Verify it now,
+            // before any decoder / sink is constructed.
+            let detection = select_decoder_factory(
+                &registry,
+                &info,
+                &config,
+                &sparse,
+                &bitmap,
+                &download_done,
+                &download_outcome,
+                kill_switch.as_ref(),
+                write_frontier.as_ref(),
+            );
+            let (format_shape, factory) = match detection {
+                Ok(ok) => ok,
+                Err(CoordinatorError::NoDecoder { filename }) if !config.strict_format => {
+                    // §4 fallback: no decoder registered for this
+                    // source. Warn and run as `--no-extract` — the
+                    // download thread is already producing bytes
+                    // into `.peel.part`; we just need to join it
+                    // and rename the part-file to a stream-shaped
+                    // path on the way out.
+                    tracing::warn!(
+                        "no decoder registered for {filename}; running as --no-extract. \
+                         Pass --no-extract to silence this warning, or --format <name> \
+                         if you know the format. Pass --strict-format to make this a \
+                         hard error instead."
+                    );
+                    dl_handle
+                        .join()
+                        .map_err(|_| CoordinatorError::DownloadPanicked)?;
+                    let download_stats = match download_outcome.lock() {
+                        Ok(mut slot) => slot.take(),
+                        Err(_) => None,
+                    };
+                    let download_stats = match download_stats {
+                        Some(Ok(s)) => s,
+                        Some(Err(e)) => return Err(CoordinatorError::Scheduler(e)),
+                        None => DownloadStats::default(),
+                    };
+                    cancel_guard.disarm();
+                    let fallback_target = fallback_no_extract_path(&info, &output);
+                    return Ok(ExtractionOutcome {
+                        extraction: ExtractionStats::default(),
+                        download: download_stats,
+                        used_decoder_state: false,
+                        fallback_no_extract_target: Some(fallback_target),
+                    });
+                }
+                Err(e) => return Err(e),
+            };
+            verify_output_shape(format_shape, &output)?;
+
+            // Look up the resolved factory's name to decide which
+            // pipeline to drive. ZIP / 7z / RAR archives go through
+            // their per-entry pipelines; everything else goes
+            // through the streaming decoder loop. The name lookup
+            // is reverse-resolved by fn-pointer identity, which
+            // works for the free-function factories every shipping
+            // format uses.
+            let format_name = registry.name_for_factory(factory).map(String::from);
+            #[cfg(feature = "zip")]
+            let is_zip = format_name.as_deref() == Some(ZIP_FORMAT_NAME);
+            #[cfg(not(feature = "zip"))]
+            let is_zip = false;
+            #[cfg(feature = "sevenz")]
+            let is_sevenz = format_name.as_deref() == Some(SEVENZ_FORMAT_NAME);
+            #[cfg(not(feature = "sevenz"))]
+            let is_sevenz = false;
+            #[cfg(feature = "rar")]
+            let is_rar = format_name.as_deref() == Some(RAR_FORMAT_NAME);
+            #[cfg(not(feature = "rar"))]
+            let is_rar = false;
+
+            let is_random_access = is_zip || is_rar || is_sevenz;
+
+            // Unknown-size random-access archive (issue #8): zip/rar/7z
+            // pipelines need the trailer/central directory, which only
+            // arrives once the whole body has been streamed. Wait for the
+            // single-stream download to finish, resolve the real size
+            // from the growable file's high-water, and rebuild a
+            // fully-complete bitmap so the pipeline's range-waits pass
+            // immediately. (Streaming formats keep the concurrent path
+            // below — they decode front-to-back as bytes arrive.)
+            let (total_size, bitmap) = if !info.size_known && is_random_access {
+                wait_for_download_complete(
+                    &download_done,
+                    &download_outcome,
+                    config.reader_poll_interval,
+                    kill_switch.as_ref(),
+                )?;
+                let resolved = sparse.total_size();
+                let resolved_chunks = chunk_count(resolved, chunk_size).map_err(|e| match e {
+                    SchedulerError::TooManyChunks { chunks, .. } => {
+                        CoordinatorError::TooManyChunks { chunks }
+                    }
+                    other => CoordinatorError::Scheduler(other),
+                })?;
+                let full = Arc::new(ChunkBitmap::new(resolved_chunks));
+                full.complete_range(ChunkIndex::ZERO, ChunkIndex::new(resolved_chunks));
+                (resolved, full)
+            } else {
+                (total_size, Arc::clone(&bitmap))
+            };
+
+            // A random-access container (zip/rar/7z) can only be
+            // extracted once its trailer/central directory has arrived.
+            // On a server without range support the whole archive must
+            // be downloaded sequentially first, so `max_disk_buffer`
+            // cannot be honored: the full compressed archive is resident
+            // before extraction (and the hole-punching it drives) can
+            // begin. Hole-punching still reclaims blocks as entries
+            // extract, so the peak is the archive size, not archive +
+            // extracted — but the buffer cap is silently exceeded, so
+            // warn. (`0` is the "disabled" sentinel for the cap.)
+            let disk_buffer_cap = config.max_disk_buffer.unwrap_or(0);
+            if (is_zip || is_rar || is_sevenz)
+                && !info.accept_ranges
+                && disk_buffer_cap != 0
+                && total_size > disk_buffer_cap
+            {
+                tracing::warn!(
+                    "server does not support range requests, so the full {total_size}-byte \
+                     archive must be downloaded before extraction can begin; the configured \
+                     disk buffer of {disk_buffer_cap} bytes cannot be honored and on-disk \
+                     usage will peak at the full archive size"
+                );
+            }
+
+            // §3 (`internal/PLAN_download_modes.md`): when `-k` is set
+            // the user is asking for the source archive on disk, so
+            // no holes are punched. Force a NoopPuncher regardless
+            // of `--io-backend`; the extractor's `punch_threshold`
+            // is also raised to `u64::MAX` (see the run-arg fixup
+            // below) so the extractor never even attempts a punch
+            // syscall.
+            let puncher: Box<dyn PunchHole> = if config.keep_archive.is_some() {
+                Box::new(NoopPuncher::new())
+            } else {
+                make_puncher(&sparse)
+            };
+
+            let extraction_stats = if is_zip {
+                #[cfg(feature = "zip")]
+                {
+                    let dir = match &output {
+                        OutputTarget::Dir(d) => d.clone(),
+                        OutputTarget::File(_) => {
+                            return Err(CoordinatorError::ZipNeedsDirectory);
+                        }
+                    };
+                    run_zip(
+                        &sparse,
+                        &bitmap,
+                        &fingerprints,
+                        &cursor,
+                        &download_done,
+                        &download_outcome,
+                        puncher.as_ref(),
+                        &ckpt_path,
+                        &info,
+                        &url,
+                        chunk_size,
+                        total_size,
+                        &dir,
+                        &resume_plan,
+                        &config,
+                        progress.as_mut(),
+                        progress_state.as_ref(),
+                        kill_switch.as_ref(),
+                        prior_elapsed,
+                        started,
+                    )?
+                }
+                #[cfg(not(feature = "zip"))]
+                {
+                    unreachable!("is_zip can only be true when the `zip` feature is enabled")
+                }
+            } else if is_rar {
+                #[cfg(feature = "rar")]
+                {
+                    let dir = match &output {
+                        OutputTarget::Dir(d) => d.clone(),
+                        OutputTarget::File(_) => {
+                            return Err(CoordinatorError::ZipNeedsDirectory);
+                        }
+                    };
+                    run_rar(
+                        &sparse,
+                        &bitmap,
+                        &fingerprints,
+                        &cursor,
+                        &download_done,
+                        &download_outcome,
+                        puncher.as_ref(),
+                        &ckpt_path,
+                        &info,
+                        &url,
+                        chunk_size,
+                        total_size,
+                        &dir,
+                        &resume_plan,
+                        &config,
+                        progress.as_mut(),
+                        progress_state.as_ref(),
+                        kill_switch.as_ref(),
+                        prior_elapsed,
+                        started,
+                    )?
+                }
+                #[cfg(not(feature = "rar"))]
+                {
+                    unreachable!("is_rar can only be true when the `rar` feature is enabled")
+                }
+            } else if is_sevenz {
+                #[cfg(feature = "sevenz")]
+                {
+                    let dir = match &output {
+                        OutputTarget::Dir(d) => d.clone(),
+                        OutputTarget::File(_) => {
+                            return Err(CoordinatorError::ZipNeedsDirectory);
+                        }
+                    };
+                    run_sevenz(
+                        &sparse,
+                        &bitmap,
+                        &cursor,
+                        &download_done,
+                        &download_outcome,
+                        puncher.as_ref(),
+                        &ckpt_path,
+                        &info,
+                        &url,
+                        chunk_size,
+                        total_size,
+                        &dir,
+                        &resume_plan,
+                        &config,
+                        progress_state.as_ref(),
+                        kill_switch.as_ref(),
+                        prior_elapsed,
+                        started,
+                    )?
+                }
+                #[cfg(not(feature = "sevenz"))]
+                {
+                    unreachable!("is_sevenz can only be true when the `sevenz` feature is enabled")
+                }
+            } else {
+                // Resolve the integrity-tracking hasher (if any) up
+                // front: if --sha256 is on, build it from prior
+                // hash_state (resume) or fresh, and skip the bytes
+                // that were already hashed past `decoder_position`.
+                // The same hasher is fed by the HashingReader and
+                // snapshot by the checkpoint observer (`PLAN_v2.md`
+                // §10 step 4).
+                let reader_start = cursor.load(Ordering::Acquire);
+                // Build the per-part `expected` vec parallel to
+                // `info.source.parts()`. Single-URL with `--sha256`
+                // populates a 1-element vec; multi-URL with N
+                // `--sha256` flags populates an N-element vec; an
+                // empty Vec from the CLI translates to all-`None`,
+                // which `build_integrity_hasher` treats as "no
+                // integrity tracking."
+                let part_expected: Vec<Option<[u8; crate::hash::sha256::DIGEST_LEN]>> =
+                    if info.source.len() == 1 {
+                        vec![config.expected_sha256]
+                    } else if config.expected_sha256s.is_empty() {
+                        vec![None; info.source.len()]
+                    } else {
+                        debug_assert_eq!(
+                            config.expected_sha256s.len(),
+                            info.source.len(),
+                            "CLI validates per-part hash count"
+                        );
+                        config.expected_sha256s.iter().copied().map(Some).collect()
+                    };
+                let hasher_setup = build_integrity_hasher(
+                    &info.source,
+                    &part_expected,
+                    prior.as_ref(),
+                    &ckpt_path,
+                    reader_start,
+                )?;
+                let source_metrics = Arc::new(SourceReadMetrics::default());
+                let reader = BlockingSparseReader::new(
+                    Arc::clone(&sparse),
+                    Arc::clone(&bitmap),
+                    chunk_size,
+                    total_size,
+                    reader_start,
+                    Arc::clone(&download_done),
+                    Arc::clone(&download_outcome),
+                    config.reader_poll_interval,
+                )
+                .with_source_metrics(Arc::clone(&source_metrics));
+                let reader = match progress_state.clone() {
+                    Some(state) => reader.with_progress(state),
+                    None => reader,
+                };
+                // §2.1: thread the run-wide kill switch into the reader
+                // so a tripped flag short-circuits the source-read poll.
+                let reader = match kill_switch.clone() {
+                    Some(flag) => reader.with_kill_switch(flag),
+                    None => reader,
+                };
+                // Pick the read-availability gate:
+                //   - unknown-size (issue #8): the bitmap is empty and
+                //     `total_size` is 0, so gate on the growable file's
+                //     live high-water;
+                //   - known-size single-stream: gate on the scheduler's
+                //     sequential write frontier so extraction runs
+                //     concurrently with the download
+                //     (`internal/PLAN_single_stream_concurrent_extract.md`);
+                //   - known-size parallel (ranged): gate on the chunk
+                //     bitmap, the only correct signal when chunks land
+                //     out of order.
+                let reader = if !info.size_known {
+                    reader.with_unknown_size()
+                } else if let Some(frontier) = write_frontier.clone() {
+                    reader.with_write_frontier(frontier)
+                } else {
+                    reader
+                };
+
+                // Interpose a HashingReader between the source and
+                // the decoder when integrity tracking is on.
+                let source: Box<dyn std::io::Read + Send> = match &hasher_setup {
+                    Some(setup) => Box::new(crate::hash::HashingReader::with_skip(
+                        Box::new(reader),
+                        Arc::clone(&setup.hasher),
+                        setup.skip_remaining,
+                    )),
+                    None => Box::new(reader),
+                };
+                // O.7b resume path: when the prior checkpoint
+                // captured a decoder-private `decoder_state` blob and
+                // the registry knows a resume factory for the
+                // resolved format, build the decoder pre-seeded from
+                // the blob instead of via the generic `factory`.
+                // Falls through to `factory(source)` for
+                // (a) fresh runs, (b) resume from a coarser
+                // boundary where `decoder_state` is `None`, and
+                // (c) formats with no resume hook registered.
+                let resume_blob = match &resume_plan {
+                    ResumePlan::Resume {
+                        decoder_state: Some(blob),
+                        decoder_position,
+                        ..
+                    } => Some((blob.clone(), *decoder_position)),
+                    _ => None,
+                };
+                let resume_factory = format_name
+                    .as_deref()
+                    .and_then(|n| registry.resume_factory_for_name(n));
+                let (mut decoder, used_decoder_state) = match (resume_factory, resume_blob) {
+                    (Some(rf), Some((blob, start_offset))) => (
+                        rf(source, &blob, start_offset).map_err(CoordinatorError::Decode)?,
+                        true,
+                    ),
+                    _ => (factory(source).map_err(CoordinatorError::Decode)?, false),
+                };
+                // Align the decoder's source-byte counter with the
+                // global stream offset the source reader is positioned
+                // at. Without this, decoders constructed via the
+                // regular `factory` (every fresh run, plus resumes from
+                // a coarse boundary that didn't capture a decoder-state
+                // blob) report run-local `bytes_consumed` /
+                // `frame_boundary`, and the saved `decoder_position`
+                // drifts apart from the sink's `archive_offset` across
+                // kill/restart cycles. Idempotent for the
+                // resume-factory branch above (which pre-seeds at the
+                // same `start_offset`).
+                decoder.set_source_start_offset(reader_start);
+                used_decoder_state_flag.store(used_decoder_state, Ordering::Relaxed);
+
+                // Run the extractor with a checkpoint observer that
+                // writes a durable checkpoint every time the cadence
+                // floor fires.
+                let extractor = {
+                    // §3: with `-k` the puncher is a no-op and any
+                    // punch attempt would be a wasted syscall plus
+                    // the extractor's own per-call accounting.
+                    // Raise the threshold to `u64::MAX` so the
+                    // extractor never reaches the branch in the
+                    // first place.
+                    let effective_punch_threshold = if config.keep_archive.is_some() {
+                        u64::MAX
+                    } else {
+                        config.punch_threshold
+                    };
+                    let base = Extractor::new(ExtractorConfig {
+                        punch_threshold: effective_punch_threshold,
+                        // PLAN_lazy_decoder_state.md Phase 1: throttle
+                        // moved from the observer closure into the
+                        // extractor's run loop so a throttled step
+                        // skips both `decoder.decoder_state()` (8 MiB
+                        // per call on xz_native) and the
+                        // `CheckpointInfo` allocation. The user-facing
+                        // CLI knobs (`--checkpoint-min-bytes` /
+                        // `--checkpoint-min-secs`) keep their names
+                        // and meanings; the coordinator just plumbs
+                        // them through.
+                        checkpoint_min_bytes: config.checkpoint_min_bytes,
+                        checkpoint_min_interval: config.checkpoint_min_interval,
+                    });
+                    let base = match progress_state.clone() {
+                        Some(state) => base.with_progress(state),
+                        None => base,
+                    };
+                    // §2.3: attach the kill switch so the extractor
+                    // polls it once per decode_step iteration even when
+                    // the decoder isn't reading source.
+                    let base = match kill_switch.clone() {
+                        Some(flag) => base.with_kill_switch(flag),
+                        None => base,
+                    };
+                    // PLAN_checkpoint_cadence_throughput.md Phase 2:
+                    // when rate-aware scaling is enabled and a
+                    // ProgressState is available, attach a dynamic
+                    // floor provider so the cadence paces itself by
+                    // realized download throughput. The provider is
+                    // cheap — one atomic load and one division per
+                    // quiescent advance.
+                    if config.checkpoint_target_interval.is_zero() || progress_state.is_none() {
+                        base
+                    } else {
+                        let provider_state = progress_state
+                            .as_ref()
+                            .map(Arc::clone)
+                            .expect("progress_state checked above");
+                        let configured_floor = config.checkpoint_min_bytes;
+                        let target_interval = config.checkpoint_target_interval;
+                        let rate = RealizedRate::new(
+                            Instant::now(),
+                            provider_state.snapshot().bytes_downloaded,
+                        );
+                        base.with_checkpoint_floor_provider(Arc::new({
+                            let provider_state = Arc::clone(&provider_state);
+                            move || {
+                                let bytes = provider_state.snapshot().bytes_downloaded;
+                                let bps = rate.rate(Instant::now(), bytes);
+                                rate_aware_floor(configured_floor, bps, target_interval)
+                            }
+                        }))
+                    }
+                };
+
+                let hasher_handle = hasher_setup.as_ref().map(|s| Arc::clone(&s.hasher));
+                let run_result: Result<ExtractionStats, CoordinatorError> = match &output {
+                    OutputTarget::File(path) => {
+                        let sink = build_raw_sink(path, &resume_plan)?;
+                        run_one(
+                            &extractor,
+                            &sparse,
+                            &mut *decoder,
+                            sink,
+                            puncher.as_ref(),
+                            &ckpt_path,
+                            &part_path,
+                            &info,
+                            &url,
+                            &bitmap,
+                            &fingerprints,
+                            chunk_size,
+                            current_run_mode(&config),
+                            progress.as_mut(),
+                            kill_switch.as_ref(),
+                            hasher_handle.as_ref(),
+                            prior_elapsed,
+                            started,
+                        )
+                    }
+                    OutputTarget::Dir(path) => {
+                        let sink = build_tar_sink(path, &resume_plan)?;
+                        run_one(
+                            &extractor,
+                            &sparse,
+                            &mut *decoder,
+                            sink,
+                            puncher.as_ref(),
+                            &ckpt_path,
+                            &part_path,
+                            &info,
+                            &url,
+                            &bitmap,
+                            &fingerprints,
+                            chunk_size,
+                            current_run_mode(&config),
+                            progress.as_mut(),
+                            kill_switch.as_ref(),
+                            hasher_handle.as_ref(),
+                            prior_elapsed,
+                            started,
+                        )
+                    }
+                };
+                // The HashingReader surfaces a mismatch as a generic
+                // io::Error to the decoder (which then emerges from
+                // `run_one` as an Extractor/Decode error). When that
+                // happens we prefer the typed `IntegrityError`
+                // recorded inside the shared hasher — it carries the
+                // part index and the friendly "the file you got is
+                // not the file you expected" message. Drop the
+                // decoder first to release the HashingReader's Arc
+                // clone of the hasher.
+                drop(decoder);
+                let mut stats = match run_result {
+                    Ok(s) => s,
+                    Err(extractor_err) => {
+                        if let Some(setup) = hasher_handle.as_ref() {
+                            if let Ok(guard) = setup.lock() {
+                                if let Some(integrity) = guard.error() {
+                                    return Err(CoordinatorError::Integrity(integrity));
+                                }
+                            }
+                        }
+                        return Err(extractor_err);
+                    }
+                };
+                let source_snapshot = source_metrics.snapshot();
+                stats.source_sparse_read_bytes = source_snapshot.sparse_read_bytes;
+                stats.source_sparse_read_time = source_snapshot.sparse_read_time;
+                stats.source_wait_time = source_snapshot.wait_time;
+                stats.source_wait_count = source_snapshot.wait_count;
+                stats.source_poll_sleeps = source_snapshot.poll_sleeps;
+
+                // Verification path: the [`crate::hash::IntegrityHasher`]
+                // already verified each part as the stream crossed
+                // its boundary inside `update`, so this block usually
+                // just drains a clean state. We still call
+                // `finalize_remaining` so an early-stopping decoder
+                // (`bytes_processed < total_size`) gets the
+                // partial-digest mismatch surfaced rather than
+                // silently passing — matching the pre-state-machine
+                // behaviour for single-URL.
+                if let Some(setup) = hasher_setup {
+                    let mut guard = setup.hasher.lock().map_err(|_| {
+                        CoordinatorError::IoBackend(io::Error::other(
+                            "hasher mutex poisoned at finalize",
+                        ))
+                    })?;
+                    guard
+                        .finalize_remaining()
+                        .map_err(CoordinatorError::Integrity)?;
+                }
+
+                stats
+            };
+
+            // Wait for the download thread to drain. By the time the
+            // extractor reaches EOF, the bitmap is fully populated and
+            // workers are exiting.
+            dl_handle
+                .join()
+                .map_err(|_| CoordinatorError::DownloadPanicked)?;
+            let download_stats = match download_outcome.lock() {
+                Ok(mut slot) => slot.take(),
+                Err(_) => None,
+            };
+            let download_stats = match download_stats {
+                Some(Ok(s)) => s,
+                Some(Err(e)) => return Err(CoordinatorError::Scheduler(e)),
+                None => DownloadStats::default(),
+            };
+
+            // Extraction completed cleanly. The download thread is
+            // already drained (`dl_handle.join` above); disarm so the
+            // guard's Drop does not flip the abort flag we no longer
+            // need.
+            cancel_guard.disarm();
+
+            Ok(ExtractionOutcome {
+                extraction: extraction_stats,
+                download: download_stats,
+                used_decoder_state: used_decoder_state_flag.load(Ordering::Relaxed),
+                fallback_no_extract_target: None,
+            })
+        })?;
+
+    // Drop the sparse file so the puncher's borrowed fd is no longer
+    // alive. Three cleanup paths apply on clean completion:
+    //
+    //   * `--no-extract` (`internal/PLAN_download_modes.md` §2): the
+    //     part file *is* the final output. Rename it into place.
+    //   * `-k`/`--keep-archive` (§3): the extractor wrote its tree
+    //     through the sink, AND the source archive is preserved.
+    //     Rename `.peel.part` to the user-supplied keep-archive
+    //     path (overwriting an existing regular file with a
+    //     `tracing::warn!`).
+    //   * default extract mode: the decompressed output is already
+    //     in the sink; the part file's contents are redundant and
+    //     are deleted.
+    //
+    // In every case the `.peel.ckpt` and its tmp companion are no
+    // longer needed and are cleared.
+    drop(sparse);
+    if let Some(fallback_path) = extraction_outcome.fallback_no_extract_target.as_ref() {
+        // §4: format detection missed and we ran in download-only
+        // fallback. Remove the (legacy default) empty directory
+        // created at the user's `-o` path up-front, then rename
+        // `.peel.part` to the URL-basename-derived fallback path.
+        // If the fallback target happens to coincide with the
+        // pre-created directory, `fs::remove_dir` succeeds on an
+        // empty dir and the rename takes its place.
+        if let OutputTarget::Dir(d) = &output {
+            // `remove_dir` only succeeds on an empty directory; a
+            // non-empty `-o` dir (rare but legal — e.g. the user
+            // pointed at an existing populated dir) is left in
+            // place. The rename target is a sibling, not the same
+            // path, so no collision either way.
+            let _ = fs::remove_dir(d);
+        }
+        fs::rename(&part_path, fallback_path).map_err(|source| CoordinatorError::Io {
+            path: fallback_path.clone(),
+            source,
+        })?;
+    } else if config.no_extract {
+        // INVARIANT: §1's resolver / `--no-extract` shape forcing
+        // guarantees `output` is a [`OutputTarget::File`] here.
+        // Pattern-matching keeps the error path typed if a future
+        // change adds another variant.
+        let final_path = match &output {
+            OutputTarget::File(p) => p.clone(),
+            OutputTarget::Dir(p) => {
+                return Err(CoordinatorError::OutputShapeMismatch {
+                    shape: FormatShape::Stream,
+                    path: p.clone(),
+                    detail: format!(
+                        "--no-extract requires a file output path; {} is a directory",
+                        p.display(),
+                    ),
+                });
+            }
+        };
+        fs::rename(&part_path, &final_path).map_err(|source| CoordinatorError::Io {
+            path: final_path.clone(),
+            source,
+        })?;
+    } else if let Some(keep_path) = config.keep_archive.as_ref() {
+        // §3.2: existing regular file at the target overwrites
+        // with a warning; an existing directory was rejected at
+        // CLI parse time.
+        if keep_path.metadata().map(|m| m.is_file()).unwrap_or(false) {
+            tracing::warn!(
+                "--keep-archive: overwriting existing file at {}",
+                keep_path.display()
+            );
+        }
+        fs::rename(&part_path, keep_path).map_err(|source| CoordinatorError::Io {
+            path: keep_path.clone(),
+            source,
+        })?;
+    } else {
+        // Single-part runs delete `<anchor>.peel.part`; multi-part
+        // runs delete every `<anchor>.peel.part.NNN`. Either way the
+        // clean-completion sweep frees the source bytes; the
+        // checkpoint goes next.
+        for p in &part_paths {
+            fs::remove_file(p).ok();
+        }
+    }
+    fs::remove_file(&ckpt_path).ok();
+    fs::remove_file(crate::checkpoint::tmp_path_for(&ckpt_path)).ok();
+
+    let outcome = RunStats {
+        final_url: info.url,
+        total_size: info.total_size,
+        resumed: resuming,
+        resume_decoder_position,
+        resume_used_decoder_state: extraction_outcome.used_decoder_state,
+        download: extraction_outcome.download.clone(),
+        extraction: extraction_outcome.extraction,
+        elapsed: prior_elapsed.saturating_add(started.elapsed()),
+    };
+
+    if let Some(cb) = progress.as_mut() {
+        cb(ProgressEvent::Finished {
+            download: &outcome.download,
+            extraction: &outcome.extraction,
+        });
+    }
+
+    Ok(outcome)
+}
+
+/// Internal: ferry the two stats blobs out of the scoped thread block.
+struct ExtractionOutcome {
+    extraction: ExtractionStats,
+    download: DownloadStats,
+    /// `true` if the decoder dispatch picked the resume_factory
+    /// branch (a `decoder_state` blob was both captured by the
+    /// prior run AND consumable by a registered format hook).
+    /// Ferried through so [`RunStats::resume_used_decoder_state`]
+    /// can be populated.
+    used_decoder_state: bool,
+    /// `internal/PLAN_download_modes.md` §4 fallback: when set, format
+    /// detection failed and the run completed as if `--no-extract`
+    /// had been passed. The path is the (URL-basename-derived)
+    /// stream-shaped output target the post-scope cleanup should
+    /// rename `.peel.part` to. Distinct from
+    /// [`CoordinatorConfig::no_extract`] so the cleanup can tell
+    /// "user asked for no-extract" from "we fell back to no-extract"
+    /// — the latter also removes the (legacy default) directory
+    /// that was created up-front.
+    fallback_no_extract_target: Option<PathBuf>,
+}
+
+/// Drop guard that flips an [`AtomicBool`] to `true` on drop unless
+/// disarmed. Used inside [`run`]'s `thread::scope` closure so any
+/// error path out of the closure (the many `?` propagations through
+/// extraction and format detection) cancels the download thread
+/// before scope's implicit join begins. Without this, an extractor
+/// error would leave scope blocked until the entire archive was
+/// downloaded — a 444 GiB / 1 MB-s combination would look like a
+/// multi-day hang to the user.
+struct CancelOnDrop<'a> {
+    flag: &'a AtomicBool,
+    armed: bool,
+}
+
+impl<'a> CancelOnDrop<'a> {
+    fn new(flag: &'a AtomicBool) -> Self {
+        Self { flag, armed: true }
+    }
+
+    /// Consume the guard without flipping the flag. Call on the Ok
+    /// path once download cancellation is no longer wanted.
+    fn disarm(mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for CancelOnDrop<'_> {
+    fn drop(&mut self) {
+        if self.armed {
+            self.flag.store(true, Ordering::Release);
+        }
+    }
+}
+
+/// What [`build_resume_plan`] decides to do with a prior checkpoint.
+///
+/// The `Resume` variant grew larger once `SinkState::Tar` started
+/// carrying in-flight parser state in v6 (a few hundred bytes).
+/// Boxing the variant would force every pattern match to deref the
+/// box; we construct one [`ResumePlan`] per run and match it a
+/// handful of times, so the allocation isn't worth the syntactic
+/// noise. The lint is silenced locally with rationale.
+#[derive(Debug)]
+#[allow(clippy::large_enum_variant)]
+enum ResumePlan {
+    Fresh,
+    Resume {
+        decoder_position: u64,
+        bitmap_bytes: Vec<u8>,
+        sink_state: SinkState,
+        chunk_crc32c: Option<Vec<u32>>,
+        /// Decoder-private resume state captured at the same step
+        /// as `decoder_position` (`OPTIMIZATIONS.md` §O.7b). `Some`
+        /// for lz4 mid-frame block boundaries; `None` for every
+        /// other format and for every coarser boundary.
+        decoder_state: Option<Vec<u8>>,
+    },
+}
+
+/// Decide whether to resume off `prior` or start fresh.
+fn build_resume_plan(
+    prior: Option<&Checkpoint>,
+    info: &DownloadInfo,
+    requested_url: &str,
+    config: &CoordinatorConfig,
+    output: &OutputTarget,
+) -> Result<ResumePlan, CoordinatorError> {
+    let Some(prior) = prior else {
+        return Ok(ResumePlan::Fresh);
+    };
+
+    if prior.url != requested_url && prior.url != info.url.to_string() {
+        return Err(CoordinatorError::SourceChanged {
+            reason: format!(
+                "checkpoint URL was {:?}, current request is {:?}",
+                prior.url, requested_url
+            ),
+        });
+    }
+    if prior.total_size != info.total_size {
+        return Err(CoordinatorError::SourceChanged {
+            reason: format!(
+                "checkpoint total_size was {}, current source is {}",
+                prior.total_size, info.total_size
+            ),
+        });
+    }
+    // Multi-URL parts comparison
+    // (`internal/PLAN_multi_url_source.md` §5 step 4): the part count
+    // and per-part `(url, size)` must agree. Per-part fingerprints
+    // can drift across runs (a CDN swap legitimately changes
+    // `ETag` per part) so we don't reject on those alone — the
+    // top-level `fingerprint_matches` check still covers the
+    // primary part, and `--sha256` (when set) is the byte-level
+    // guard.
+    if prior.parts.len() != info.source.len() {
+        return Err(CoordinatorError::SourceChanged {
+            reason: format!(
+                "checkpoint had {} parts, current run has {}",
+                prior.parts.len(),
+                info.source.len(),
+            ),
+        });
+    }
+    for (i, (prior_part, current_part)) in prior
+        .parts
+        .iter()
+        .zip(info.source.parts().iter())
+        .enumerate()
+    {
+        if prior_part.url != current_part.url.to_string() {
+            return Err(CoordinatorError::SourceChanged {
+                reason: format!(
+                    "part {i} URL was {:?}, current request is {:?}",
+                    prior_part.url, current_part.url
+                ),
+            });
+        }
+        if prior_part.size != current_part.size {
+            return Err(CoordinatorError::SourceChanged {
+                reason: format!(
+                    "part {i} size was {}, current source reports {}",
+                    prior_part.size, current_part.size,
+                ),
+            });
+        }
+    }
+    if prior.chunk_size != config.chunk_size {
+        return Err(CoordinatorError::SourceChanged {
+            reason: format!(
+                "checkpoint chunk_size was {}, current chunk_size is {}",
+                prior.chunk_size, config.chunk_size
+            ),
+        });
+    }
+    if !fingerprint_matches(prior, &info.fingerprint) {
+        return Err(CoordinatorError::SourceChanged {
+            reason: format!(
+                "ETag/Last-Modified changed (was etag={:?} last_modified={:?}, \
+                 now etag={:?} last_modified={:?})",
+                prior.etag,
+                prior.last_modified,
+                info.fingerprint.etag,
+                info.fingerprint.last_modified,
+            ),
+        });
+    }
+    let sink_compat = matches!(
+        (output, &prior.sink_state),
+        (OutputTarget::File(_), SinkState::Raw { .. })
+            | (OutputTarget::Dir(_), SinkState::Tar { .. })
+            | (OutputTarget::Dir(_), SinkState::Zip { .. })
+            | (OutputTarget::Dir(_), SinkState::Sevenz { .. })
+            | (OutputTarget::Dir(_), SinkState::Rar { .. })
+    );
+    if !sink_compat {
+        return Err(CoordinatorError::SourceChanged {
+            reason: "checkpoint sink type does not match the requested output".into(),
+        });
+    }
+    Ok(ResumePlan::Resume {
+        decoder_position: prior.decoder_position.get(),
+        bitmap_bytes: prior.bitmap_completed.clone(),
+        sink_state: prior.sink_state.clone(),
+        chunk_crc32c: prior.chunk_crc32c.clone(),
+        decoder_state: prior.decoder_state.clone(),
+    })
+}
+
+fn fingerprint_matches(prior: &Checkpoint, fingerprint: &SourceFingerprint) -> bool {
+    if let (Some(a), Some(b)) = (&prior.etag, &fingerprint.etag) {
+        // Weak ETags only promise semantic equivalence (RFC 7232
+        // §2.3); a weak-tag mismatch is advisory because §11's
+        // per-chunk CRC-32C probe runs right after this and gives
+        // us a real byte-level guard. Treating weak mismatches as
+        // a hard error here would force users to re-download for
+        // upstream cache normalization that didn't actually change
+        // the bytes.
+        if a != b
+            && !crate::download::worker::etag_is_weak(a)
+            && !crate::download::worker::etag_is_weak(b)
+        {
+            return false;
+        }
+    }
+    if let (Some(a), Some(b)) = (&prior.last_modified, &fingerprint.last_modified) {
+        if a != b {
+            return false;
+        }
+    }
+    // If neither side carries an identifier we fall through and accept
+    // the resume; we cannot prove the source unchanged but neither can
+    // a fresh `HEAD`, so the only honest move is to take the user's
+    // request at face value. The §11 resume probe will catch any
+    // genuine byte drift before we accept the bitmap.
+    true
+}
+
+/// Internal: build the RawSink for either fresh or resumed mode.
+fn build_raw_sink(path: &Path, plan: &ResumePlan) -> Result<RawSink, CoordinatorError> {
+    let sink = match plan {
+        ResumePlan::Fresh => RawSink::create(path).map_err(CoordinatorError::Sink)?,
+        ResumePlan::Resume { sink_state, .. } => {
+            let SinkState::Raw { bytes_written } = sink_state else {
+                return Err(CoordinatorError::SourceChanged {
+                    reason: "checkpoint sink_state is Tar but output is a File".into(),
+                });
+            };
+            RawSink::resume(path, *bytes_written).map_err(CoordinatorError::Sink)?
+        }
+    };
+    Ok(sink)
+}
+
+/// Internal: build the TarSink for either fresh or resumed mode.
+///
+/// Fresh runs and resumes from a coarser boundary (sink state
+/// without `in_flight`) construct via [`TarSink::new`]: the decoded
+/// byte stream picks up at a member boundary and the parser starts
+/// at a 0-filled header buffer.
+///
+/// Resumes carrying a v6 [`crate::checkpoint::TarSinkState`] —
+/// captured by [`crate::sink::Sink::sink_state`] at any decoder
+/// block boundary, including mid-member ones — go through
+/// [`TarSink::resume`], which reopens the in-flight file at the
+/// already-written offset and seeds the parser state directly.
+fn build_tar_sink(path: &Path, plan: &ResumePlan) -> Result<TarSink, CoordinatorError> {
+    if let ResumePlan::Resume {
+        sink_state: SinkState::Tar {
+            in_flight: Some(state),
+            ..
+        },
+        ..
+    } = plan
+    {
+        return TarSink::resume(path, state).map_err(CoordinatorError::Sink);
+    }
+    TarSink::new(path).map_err(CoordinatorError::Sink)
+}
+
+/// Pure-function helper for the Phase 2 rate-aware byte floor.
+///
+/// `live_floor = max(configured_floor, realized_bps * target_interval)`.
+/// Saturates on overflow. Returns the configured floor unchanged
+/// when `target_interval` is zero (the disable signal).
+///
+/// `PLAN_checkpoint_cadence_throughput.md` Phase 2.
+fn rate_aware_floor(configured_floor: u64, realized_bps: f64, target_interval: Duration) -> u64 {
+    if target_interval.is_zero() {
+        return configured_floor;
+    }
+    if !realized_bps.is_finite() || realized_bps <= 0.0 {
+        return configured_floor;
+    }
+    let scaled = realized_bps * target_interval.as_secs_f64();
+    let scaled_u64 = if scaled.is_finite() && scaled > 0.0 {
+        // Saturate at u64::MAX rather than wrapping; an absurd
+        // scaled value still produces the largest possible floor.
+        if scaled >= u64::MAX as f64 {
+            u64::MAX
+        } else {
+            scaled as u64
+        }
+    } else {
+        0
+    };
+    configured_floor.max(scaled_u64)
+}
+
+/// Internal helper that estimates the realized download rate for
+/// the Phase 2 rate-aware byte floor.
+///
+/// The estimator returns a running average over the run lifetime
+/// (`bytes_downloaded / elapsed_since_start`) rather than an EWMA.
+/// Three reasons:
+///
+/// 1. **Convergence in one sample.** Cadence at 10 Gbps fires the
+///    observer every few ms; an EWMA with a 1-second time constant
+///    spends most of its weight on samples that haven't happened
+///    yet, so the smoothed value lags far below the asymptote on
+///    short fast runs (the bench, and any production run < ~3 s).
+///    A running average is correct from the first sample for
+///    constant-rate runs.
+/// 2. **Stable against bursty completion.** Worker chunks complete
+///    in batches; the instantaneous `(dbytes / dt)` over any single
+///    observer interval is high-variance. The running average
+///    integrates over the whole run and is monotone-stable.
+/// 3. **Slow to react is fine here.** The cadence target is 200 ms
+///    and the time floor caps resume granularity from above; a
+///    slow-reacting rate estimate matches the cadence's natural
+///    timescale and avoids oscillation.
+///
+/// On long-running variable-rate downloads the average lags the
+/// current rate, but the cadence still tracks aggregate progress
+/// honestly: each checkpoint represents the run's average bytes per
+/// 200 ms of wall-clock so far. The
+/// [`CoordinatorConfig::checkpoint_min_interval`] (`2 s` by default)
+/// remains the upper bound on resume granularity regardless.
+#[derive(Debug, Clone, Copy)]
+struct RealizedRate {
+    started_at: Instant,
+    started_bytes: u64,
+}
+
+impl RealizedRate {
+    fn new(now: Instant, bytes: u64) -> Self {
+        Self {
+            started_at: now,
+            started_bytes: bytes,
+        }
+    }
+
+    /// Return the average bytes-per-second from the constructor
+    /// instant through `(now, bytes)`. Returns `0.0` for any
+    /// non-positive elapsed window.
+    fn rate(&self, now: Instant, bytes: u64) -> f64 {
+        let dt = now.saturating_duration_since(self.started_at).as_secs_f64();
+        if dt <= 0.0 {
+            return 0.0;
+        }
+        let dbytes = bytes.saturating_sub(self.started_bytes) as f64;
+        dbytes / dt
+    }
+}
+
+/// Per-step accumulator for the checkpoint observer's wall-clock cost.
+///
+/// `PLAN_checkpoint_cadence_throughput.md` Phase 0 needs the per-step
+/// breakdown to attribute the per-checkpoint stall to a specific
+/// syscall. The fields are non-overlapping; the run loop sums them
+/// across every observer invocation and merges them into the
+/// extractor's [`ExtractionStats`] before the function returns.
+#[derive(Debug, Default, Clone, Copy)]
+struct CheckpointObserverStats {
+    sparse_sync_time: Duration,
+    sparse_sync_calls: u64,
+    serialize_time: Duration,
+    /// Wall-clock time spent in
+    /// [`StreamingDecoder::decoder_state_into`]. Lives inside
+    /// `serialize_time` (the closure runs inside
+    /// `Checkpoint::serialize_with`); the merge subtracts it back
+    /// out of `ckpt_serialize_time` so the diagnostic columns stay
+    /// non-overlapping. `PLAN_checkpoint_blob_dedup.md` Phase 2.
+    decoder_state_time: Duration,
+    decoder_state_calls: u64,
+    tmp_write_time: Duration,
+    tmp_fsync_time: Duration,
+    rename_time: Duration,
+    dir_fsync_time: Duration,
+    dir_fsync_calls: u64,
+    observer_time: Duration,
+}
+
+impl CheckpointObserverStats {
+    fn merge_into(&self, stats: &mut ExtractionStats) {
+        stats.ckpt_sparse_sync_time = stats
+            .ckpt_sparse_sync_time
+            .saturating_add(self.sparse_sync_time);
+        stats.ckpt_sparse_sync_calls = stats
+            .ckpt_sparse_sync_calls
+            .saturating_add(self.sparse_sync_calls);
+        // Subtract decoder_state_time so `ckpt_serialize_time`
+        // reflects fnv1a64 + body building only — decstate stays
+        // a separate column for diagnostic clarity even though
+        // it now physically runs inside the serialize phase.
+        stats.ckpt_serialize_time = stats
+            .ckpt_serialize_time
+            .saturating_add(self.serialize_time.saturating_sub(self.decoder_state_time));
+        stats.ckpt_decoder_state_time = stats
+            .ckpt_decoder_state_time
+            .saturating_add(self.decoder_state_time);
+        stats.ckpt_decoder_state_calls = stats
+            .ckpt_decoder_state_calls
+            .saturating_add(self.decoder_state_calls);
+        stats.ckpt_tmp_write_time = stats
+            .ckpt_tmp_write_time
+            .saturating_add(self.tmp_write_time);
+        stats.ckpt_tmp_fsync_time = stats
+            .ckpt_tmp_fsync_time
+            .saturating_add(self.tmp_fsync_time);
+        stats.ckpt_rename_time = stats.ckpt_rename_time.saturating_add(self.rename_time);
+        stats.ckpt_dir_fsync_time = stats
+            .ckpt_dir_fsync_time
+            .saturating_add(self.dir_fsync_time);
+        stats.ckpt_dir_fsync_calls = stats
+            .ckpt_dir_fsync_calls
+            .saturating_add(self.dir_fsync_calls);
+        stats.ckpt_observer_time = stats.ckpt_observer_time.saturating_add(self.observer_time);
+    }
+}
+
+/// Internal: drive the extractor with a checkpoint-writing observer.
+#[allow(clippy::too_many_arguments)]
+fn run_one<S: Sink>(
+    extractor: &Extractor,
+    sparse: &MultiSparse,
+    decoder: &mut dyn StreamingDecoder,
+    sink: S,
+    puncher: &dyn PunchHole,
+    ckpt_path: &Path,
+    part_path: &Path,
+    info: &DownloadInfo,
+    requested_url: &str,
+    bitmap: &ChunkBitmap,
+    fingerprints: &ChunkFingerprints,
+    chunk_size: u64,
+    current_mode: RunMode,
+    progress: Option<&mut ProgressFn>,
+    kill_switch: Option<&Arc<AtomicBool>>,
+    hasher_for_ckpt: Option<&crate::hash::SharedHasher>,
+    prior_elapsed: Duration,
+    started: Instant,
+) -> Result<ExtractionStats, CoordinatorError> {
+    let mut progress_inner = progress;
+    let mut checkpoints_written: u64 = 0;
+    let mut obs_stats = CheckpointObserverStats::default();
+
+    // The Extractor forwards `source_fd` straight to `puncher.punch`.
+    // For single-part runs the first part's fd is the correct target;
+    // for multi-part runs (lit up by §7 Phase 3) `puncher` must
+    // already be a [`crate::download::RoutingPuncher`] that ignores
+    // this fd and dispatches per-part by global offset, so the value
+    // passed here is harmless either way.
+    let source_fd = sparse.parts()[0].as_fd();
+    let result = extractor.extract_with_callback(
+        source_fd,
+        decoder,
+        sink,
+        puncher,
+        |info_cb: CheckpointInfo| -> io::Result<()> {
+            // Throttle moved into the extractor in Phase 1 of
+            // `PLAN_lazy_decoder_state.md`; this closure now only
+            // runs when the extractor has decided the cadence floor
+            // is cleared. Each call corresponds to a durable
+            // checkpoint write.
+            //
+            // Crash-test hook. We test the kill switch *before*
+            // writing so the count of durable checkpoints exactly
+            // matches the value the caller observed.
+            if let Some(flag) = kill_switch {
+                if flag.load(Ordering::Acquire) {
+                    return Err(io::Error::other(KILL_SENTINEL));
+                }
+            }
+
+            // Unknown-size runs (issue #8) can't resume — single-stream
+            // has no ranged read and the size isn't known until EOF — and
+            // the part file's bytes are released by hole-punching as the
+            // decoder advances anyway. Skip the durable write entirely
+            // rather than persist a misleading `total_size = 0` sidecar.
+            if !info.size_known {
+                return Ok(());
+            }
+
+            let observer_start = Instant::now();
+
+            // Phase 1 of `PLAN_checkpoint_cadence_throughput.md`:
+            // order writes instead of full fsync. The checkpoint
+            // about to be written is a publication event; the resume
+            // contract is "if the renamed `.peel.ckpt` is observed by
+            // a future run, every page the bitmap claims durable is
+            // at least as durable as the checkpoint", and an ordering
+            // barrier is the right primitive for that. The
+            // clean-completion path below still issues a full
+            // `sync_all` before returning so the post-run state is
+            // device-flushed.
+            let sparse_sync_start = Instant::now();
+            let sparse_sync_result = sparse.order_writes();
+            obs_stats.sparse_sync_time = obs_stats
+                .sparse_sync_time
+                .saturating_add(sparse_sync_start.elapsed());
+            obs_stats.sparse_sync_calls = obs_stats.sparse_sync_calls.saturating_add(1);
+            sparse_sync_result
+                .map_err(|e| io::Error::other(format!("sparse order_writes: {e}")))?;
+
+            let serialize_prep_start = Instant::now();
+            let sink_state = info_cb.sink_state.clone();
+            let hash_state = snapshot_hash_state(hasher_for_ckpt);
+            let chunk_crc32c = if fingerprints.is_empty() {
+                None
+            } else {
+                Some(fingerprints.to_vec())
+            };
+            // Phase 2 of `PLAN_checkpoint_blob_dedup.md`: the
+            // `decoder_state` field is no longer pre-cloned into
+            // the `Checkpoint` struct. Instead, `write_timed_with`
+            // invokes a closure that calls
+            // `info_cb.decoder.decoder_state_into(&mut body)`
+            // directly, so the resume blob bytes flow into the
+            // body buffer with one memcpy.
+            let ckpt = Checkpoint {
+                url: requested_url.to_string(),
+                etag: info.fingerprint.etag.clone(),
+                last_modified: info.fingerprint.last_modified.clone(),
+                parts: parts_from_source(&info.source),
+                total_size: info.total_size,
+                chunk_size,
+                decoder_position: ByteOffset::new(info_cb.source_position),
+                bitmap_completed: bitmap.to_bytes(),
+                created_at: SystemTime::now(),
+                sink_state,
+                hash_state,
+                chunk_crc32c,
+                decoder_state: None,
+                mode: current_mode,
+                source_mtime: None,
+                cumulative_elapsed: prior_elapsed.saturating_add(started.elapsed()),
+            };
+            let prep_time = serialize_prep_start.elapsed();
+            let mut decstate_time = Duration::ZERO;
+            let mut decstate_called = false;
+            // Pre-reserve body capacity for the (typically 8 MiB
+            // xz_native dict) blob so the closure's
+            // `extend_from_slice` doesn't pay amortized-doubling
+            // memcpies. `PLAN_checkpoint_blob_dedup.md` Phase 2.
+            let decstate_hint = info_cb.decoder.decoder_state_size_hint();
+            let write_timings = ckpt
+                .write_timed_with(ckpt_path, decstate_hint, |body| {
+                    let t = Instant::now();
+                    let r = info_cb.decoder.decoder_state_into(body);
+                    decstate_time = t.elapsed();
+                    decstate_called = true;
+                    r
+                })
+                .map_err(|e| io::Error::other(format!("checkpoint write: {e}")))?;
+            obs_stats.decoder_state_time =
+                obs_stats.decoder_state_time.saturating_add(decstate_time);
+            if decstate_called {
+                obs_stats.decoder_state_calls = obs_stats.decoder_state_calls.saturating_add(1);
+            }
+            // Bucket the prep clones together with the body
+            // serialize so the diagnostic's `serialize` column
+            // reflects everything that pre-builds the on-disk image,
+            // not just the binary frame itself.
+            obs_stats.serialize_time = obs_stats
+                .serialize_time
+                .saturating_add(prep_time.saturating_add(write_timings.serialize_time));
+            obs_stats.tmp_write_time = obs_stats
+                .tmp_write_time
+                .saturating_add(write_timings.tmp_write_time);
+            obs_stats.tmp_fsync_time = obs_stats
+                .tmp_fsync_time
+                .saturating_add(write_timings.tmp_fsync_time);
+            obs_stats.rename_time = obs_stats
+                .rename_time
+                .saturating_add(write_timings.rename_time);
+            obs_stats.dir_fsync_time = obs_stats
+                .dir_fsync_time
+                .saturating_add(write_timings.dir_fsync_time);
+            if write_timings.dir_fsync_called {
+                obs_stats.dir_fsync_calls = obs_stats.dir_fsync_calls.saturating_add(1);
+            }
+
+            checkpoints_written = checkpoints_written.saturating_add(1);
+            if let Some(cb) = progress_inner.as_deref_mut() {
+                cb(ProgressEvent::CheckpointWritten {
+                    source_position: info_cb.source_position,
+                    bytes_in: info_cb.bytes_in,
+                    bytes_out: info_cb.bytes_out,
+                });
+            }
+            obs_stats.observer_time = obs_stats
+                .observer_time
+                .saturating_add(observer_start.elapsed());
+            Ok(())
+        },
+    );
+
+    // Avoid unused-variable warnings even when no `Err` path runs.
+    let _ = part_path;
+    match result {
+        Ok(mut stats) => {
+            obs_stats.merge_into(&mut stats);
+            Ok(stats)
+        }
+        Err(ExtractorError::Observer(e)) if e.to_string() == KILL_SENTINEL => {
+            Err(CoordinatorError::Aborted {
+                checkpoints_written,
+            })
+        }
+        // §2.1: a kill-switch trip inside `BlockingSparseReader::read`
+        // (or anywhere else inside the decoder's source-read path)
+        // surfaces as `DecodeError::Read` carrying our sentinel. Match
+        // it so the operator gets `Aborted` instead of an apparent
+        // decode failure.
+        Err(ExtractorError::Decode(DecodeError::Read { source, .. }))
+            if source.to_string() == KILL_SENTINEL =>
+        {
+            Err(CoordinatorError::Aborted {
+                checkpoints_written,
+            })
+        }
+        Err(other) => Err(CoordinatorError::Extractor(other)),
+    }
+}
+
+/// Drive the ZIP per-entry pipeline with a checkpoint-writing
+/// observer.
+///
+/// Mirrors [`run_one`]'s shape: same checkpoint cadence
+/// (`checkpoint_min_bytes` / `checkpoint_min_interval`), same
+/// kill-switch handling, same [`ProgressEvent::CheckpointWritten`]
+/// emission. The differences are mechanical — the pipeline runs
+/// per-entry rather than per-frame, and the checkpoint records
+/// [`SinkState::Zip`] instead of `Tar` / `Raw`.
+#[cfg(feature = "zip")]
+#[allow(clippy::too_many_arguments)]
+fn run_zip(
+    sparse: &MultiSparse,
+    bitmap: &ChunkBitmap,
+    fingerprints: &ChunkFingerprints,
+    cursor: &Arc<AtomicU64>,
+    download_done: &Arc<AtomicBool>,
+    download_outcome: &Arc<Mutex<Option<Result<DownloadStats, SchedulerError>>>>,
+    puncher: &dyn PunchHole,
+    ckpt_path: &Path,
+    info: &DownloadInfo,
+    requested_url: &str,
+    chunk_size: u64,
+    total_size: u64,
+    output_dir: &Path,
+    plan: &ResumePlan,
+    config: &CoordinatorConfig,
+    mut progress: Option<&mut ProgressFn>,
+    progress_state: Option<&Arc<ProgressState>>,
+    kill_switch: Option<&Arc<AtomicBool>>,
+    prior_elapsed: Duration,
+    started: Instant,
+) -> Result<ExtractionStats, CoordinatorError> {
+    fs::create_dir_all(output_dir).map_err(|source| CoordinatorError::Io {
+        path: output_dir.to_path_buf(),
+        source,
+    })?;
+    let mut sink = ZipSink::new(output_dir).map_err(CoordinatorError::Sink)?;
+
+    // Translate the resume plan into the ZIP-specific shape.
+    let resume = match plan {
+        ResumePlan::Fresh => ZipResumeState::default(),
+        ResumePlan::Resume { sink_state, .. } => match sink_state {
+            SinkState::Zip {
+                entries_completed,
+                current_entry,
+                current_entry_offset,
+                current_entry_decoder_state,
+            } => ZipResumeState {
+                entries_completed: entries_completed.clone(),
+                current_entry: *current_entry,
+                current_entry_offset: *current_entry_offset,
+                current_entry_decoder_state: current_entry_decoder_state.clone(),
+            },
+            SinkState::Raw { .. }
+            | SinkState::Tar { .. }
+            | SinkState::Sevenz { .. }
+            | SinkState::Rar { .. } => {
+                return Err(CoordinatorError::SourceChanged {
+                    reason: "checkpoint sink_state is not Zip but the resolved format is zip"
+                        .into(),
+                });
+            }
+        },
+    };
+
+    let pipeline_cfg = ZipPipelineConfig {
+        total_size,
+        chunk_size,
+        poll_interval: config.reader_poll_interval,
+        initial_tail_window: crate::zip::MAX_EOCD_TAIL_BYTES.min(total_size),
+    };
+    let pipeline = ZipPipeline {
+        config: pipeline_cfg,
+        sparse,
+        bitmap,
+        cursor,
+        download_done,
+        download_outcome,
+        progress_state,
+        password_source: config.password_source.as_ref(),
+        password_label: requested_url,
+    };
+
+    // The zip pipeline now respects `max_disk_buffer`. Same
+    // shape as `run_sevenz`: entries are processed in
+    // ascending lfh_offset order so `bytes_decoded_input`
+    // advances monotonically, the per-entry
+    // `BoundedSparseReader` publishes its position on every
+    // pread, and the EOCD/CD fetches are exempt from the cap
+    // (they're metadata, not bulk entry data). Older
+    // revisions called `set_max_disk_buffer(0)` here to
+    // dodge the issue at the cost of unbounded disk
+    // footprint — that bypass is gone.
+
+    // Checkpoint cadence state, mirroring `run_one`.
+    let mut last_write_at = Instant::now()
+        .checked_sub(config.checkpoint_min_interval)
+        .unwrap_or_else(Instant::now);
+    let mut last_progress: u64 = 0;
+    let mut bytes_extracted_total: u64 = 0;
+    let mut bytes_punched_total: u64 = 0;
+    let mut entries_completed: Vec<u32> = resume.entries_completed.clone();
+    let mut entries_extracted_this_run: u64 = 0;
+    let mut checkpoints_written: u64 = 0;
+    let mut obs_stats = CheckpointObserverStats::default();
+    // Phase 2: rate-aware byte floor. Same shape as `run_one`'s
+    // floor provider, but the ZIP path's throttle is inline so the
+    // EWMA lives here directly. `Some` only when scaling is enabled
+    // and a `ProgressState` is wired up; falls back to the
+    // configured floor otherwise.
+    let zip_rate = if !config.checkpoint_target_interval.is_zero() && progress_state.is_some() {
+        let initial_bytes = progress_state
+            .map(|p| p.snapshot().bytes_downloaded)
+            .unwrap_or(0);
+        Some(RealizedRate::new(Instant::now(), initial_bytes))
+    } else {
+        None
+    };
+    let live_floor = || -> u64 {
+        match (zip_rate, progress_state) {
+            (Some(r), Some(p)) => {
+                let bytes = p.snapshot().bytes_downloaded;
+                let bps = r.rate(Instant::now(), bytes);
+                rate_aware_floor(
+                    config.checkpoint_min_bytes,
+                    bps,
+                    config.checkpoint_target_interval,
+                )
+            }
+            _ => config.checkpoint_min_bytes,
+        }
+    };
+
+    let result = pipeline.run(&mut sink, puncher, resume, |event| -> io::Result<()> {
+        // Kill-switch fires before any state mutation so the
+        // user-observable "checkpoint count" matches what's durable
+        // on disk.
+        if let Some(flag) = kill_switch {
+            if flag.load(Ordering::Acquire) {
+                return Err(io::Error::other(KILL_SENTINEL));
+            }
+        }
+        match event {
+            ZipPipelineEvent::Started { .. } => Ok(()),
+            ZipPipelineEvent::InEntryProgress {
+                index,
+                bytes_written,
+                decoder_state,
+            } => {
+                // Phase 9b: write a throttled checkpoint that
+                // captures the in-flight entry's codec state. The
+                // resumed run picks the entry up at this offset +
+                // blob and continues without restarting from
+                // byte 0.
+                //
+                // Throttle vs entry-finished: same cadence
+                // (checkpoint_min_bytes / _min_interval), measured
+                // against the same `bytes_extracted_total` proxy.
+                // We don't update `bytes_extracted_total` here
+                // because the entry isn't finished yet; the
+                // checkpoint records `bytes_extracted_total +
+                // bytes_written` indirectly via the on-disk file
+                // sizes (the resumed sink's begin_entry_resume
+                // truncates the file to `bytes_written` and
+                // re-CRCs it).
+                let elapsed = last_write_at.elapsed();
+                let in_flight_progress = bytes_extracted_total.saturating_add(*bytes_written);
+                let progressed = in_flight_progress.saturating_sub(last_progress);
+                // Phase 2: live (rate-aware) floor. Falls back to
+                // the configured floor when scaling is disabled or
+                // no ProgressState is attached.
+                let bytes_floor = live_floor();
+                if progressed < bytes_floor && elapsed < config.checkpoint_min_interval {
+                    return Ok(());
+                }
+                let observer_start = Instant::now();
+                // Phase 1: barrier-style publication. See run_one for
+                // the full rationale.
+                let sparse_sync_start = Instant::now();
+                let sparse_sync_result = sparse.order_writes();
+                obs_stats.sparse_sync_time = obs_stats
+                    .sparse_sync_time
+                    .saturating_add(sparse_sync_start.elapsed());
+                obs_stats.sparse_sync_calls = obs_stats.sparse_sync_calls.saturating_add(1);
+                sparse_sync_result
+                    .map_err(|e| io::Error::other(format!("sparse order_writes: {e}")))?;
+                let serialize_prep_start = Instant::now();
+                let chunk_crc32c = if fingerprints.is_empty() {
+                    None
+                } else {
+                    Some(fingerprints.to_vec())
+                };
+                let ckpt = Checkpoint {
+                    url: requested_url.to_string(),
+                    etag: info.fingerprint.etag.clone(),
+                    last_modified: info.fingerprint.last_modified.clone(),
+                    parts: Vec::new(),
+                    total_size: info.total_size,
+                    chunk_size,
+                    decoder_position: ByteOffset::new(0),
+                    bitmap_completed: bitmap.to_bytes(),
+                    created_at: SystemTime::now(),
+                    sink_state: SinkState::Zip {
+                        entries_completed: entries_completed.clone(),
+                        current_entry: Some(*index),
+                        current_entry_offset: *bytes_written,
+                        current_entry_decoder_state: decoder_state.clone(),
+                    },
+                    hash_state: None,
+                    chunk_crc32c,
+                    decoder_state: None,
+                    mode: current_run_mode(config),
+                    source_mtime: None,
+                    cumulative_elapsed: prior_elapsed.saturating_add(started.elapsed()),
+                };
+                let prep_time = serialize_prep_start.elapsed();
+                let write_timings = ckpt
+                    .write_timed(ckpt_path)
+                    .map_err(|e| io::Error::other(format!("checkpoint write: {e}")))?;
+                obs_stats.serialize_time = obs_stats
+                    .serialize_time
+                    .saturating_add(prep_time.saturating_add(write_timings.serialize_time));
+                obs_stats.tmp_write_time = obs_stats
+                    .tmp_write_time
+                    .saturating_add(write_timings.tmp_write_time);
+                obs_stats.tmp_fsync_time = obs_stats
+                    .tmp_fsync_time
+                    .saturating_add(write_timings.tmp_fsync_time);
+                obs_stats.rename_time = obs_stats
+                    .rename_time
+                    .saturating_add(write_timings.rename_time);
+                obs_stats.dir_fsync_time = obs_stats
+                    .dir_fsync_time
+                    .saturating_add(write_timings.dir_fsync_time);
+                if write_timings.dir_fsync_called {
+                    obs_stats.dir_fsync_calls = obs_stats.dir_fsync_calls.saturating_add(1);
+                }
+                last_write_at = Instant::now();
+                last_progress = in_flight_progress;
+                checkpoints_written = checkpoints_written.saturating_add(1);
+                if let Some(cb) = progress.as_deref_mut() {
+                    cb(ProgressEvent::CheckpointWritten {
+                        source_position: 0,
+                        bytes_in: in_flight_progress,
+                        bytes_out: in_flight_progress,
+                    });
+                }
+                obs_stats.observer_time = obs_stats
+                    .observer_time
+                    .saturating_add(observer_start.elapsed());
+                Ok(())
+            }
+            ZipPipelineEvent::EntryFinished {
+                index,
+                bytes_written,
+                bytes_punched,
+                ..
+            } => {
+                entries_completed.push(*index);
+                bytes_extracted_total = bytes_extracted_total.saturating_add(*bytes_written);
+                bytes_punched_total = bytes_punched_total.saturating_add(*bytes_punched);
+                entries_extracted_this_run = entries_extracted_this_run.saturating_add(1);
+                // Per-entry granularity for the renderer's
+                // bytes_extracted counter — finer than per-checkpoint
+                // (which the throttle below skips most of the time).
+                if let Some(p) = progress_state {
+                    p.add_extracted(*bytes_written);
+                }
+
+                // Throttle checkpoint writes. The "progress" we
+                // measure is bytes_extracted_total — an entry-by-entry
+                // proxy for source-byte progress that's monotonic,
+                // bounded by the archive's uncompressed size, and
+                // close to what a user would expect.
+                let elapsed = last_write_at.elapsed();
+                let progressed = bytes_extracted_total.saturating_sub(last_progress);
+                let bytes_floor = live_floor();
+                if progressed < bytes_floor && elapsed < config.checkpoint_min_interval {
+                    return Ok(());
+                }
+
+                let observer_start = Instant::now();
+
+                // Phase 1: barrier-style publication. See run_one for
+                // the full rationale.
+                let sparse_sync_start = Instant::now();
+                let sparse_sync_result = sparse.order_writes();
+                obs_stats.sparse_sync_time = obs_stats
+                    .sparse_sync_time
+                    .saturating_add(sparse_sync_start.elapsed());
+                obs_stats.sparse_sync_calls = obs_stats.sparse_sync_calls.saturating_add(1);
+                sparse_sync_result
+                    .map_err(|e| io::Error::other(format!("sparse order_writes: {e}")))?;
+
+                let serialize_prep_start = Instant::now();
+                let chunk_crc32c = if fingerprints.is_empty() {
+                    None
+                } else {
+                    Some(fingerprints.to_vec())
+                };
+                let ckpt = Checkpoint {
+                    url: requested_url.to_string(),
+                    etag: info.fingerprint.etag.clone(),
+                    last_modified: info.fingerprint.last_modified.clone(),
+                    parts: Vec::new(),
+                    total_size: info.total_size,
+                    chunk_size,
+                    decoder_position: ByteOffset::new(0),
+                    bitmap_completed: bitmap.to_bytes(),
+                    created_at: SystemTime::now(),
+                    sink_state: SinkState::Zip {
+                        entries_completed: entries_completed.clone(),
+                        current_entry: None,
+                        current_entry_offset: 0,
+                        // EntryFinished — the just-finished entry is
+                        // durable on disk; no in-flight codec state
+                        // to preserve. Mid-entry checkpoints
+                        // (Phase 9b's `InEntryProgress` path) emit
+                        // their own blob via the separate code path
+                        // below.
+                        current_entry_decoder_state: None,
+                    },
+                    // Integrity tracking is implemented for the
+                    // streaming pipeline only; ZIP runs leave it
+                    // unset (`PLAN_v2.md` §10 + §5).
+                    hash_state: None,
+                    chunk_crc32c,
+                    // ZIP entries carry their codec state in
+                    // `SinkState::Zip::current_entry_decoder_state`,
+                    // not in the streaming-pipeline-shaped
+                    // [`Checkpoint::decoder_state`] field. Phase 9b.
+                    decoder_state: None,
+                    mode: current_run_mode(config),
+                    source_mtime: None,
+                    cumulative_elapsed: prior_elapsed.saturating_add(started.elapsed()),
+                };
+                let prep_time = serialize_prep_start.elapsed();
+                let write_timings = ckpt
+                    .write_timed(ckpt_path)
+                    .map_err(|e| io::Error::other(format!("checkpoint write: {e}")))?;
+                obs_stats.serialize_time = obs_stats
+                    .serialize_time
+                    .saturating_add(prep_time.saturating_add(write_timings.serialize_time));
+                obs_stats.tmp_write_time = obs_stats
+                    .tmp_write_time
+                    .saturating_add(write_timings.tmp_write_time);
+                obs_stats.tmp_fsync_time = obs_stats
+                    .tmp_fsync_time
+                    .saturating_add(write_timings.tmp_fsync_time);
+                obs_stats.rename_time = obs_stats
+                    .rename_time
+                    .saturating_add(write_timings.rename_time);
+                obs_stats.dir_fsync_time = obs_stats
+                    .dir_fsync_time
+                    .saturating_add(write_timings.dir_fsync_time);
+                if write_timings.dir_fsync_called {
+                    obs_stats.dir_fsync_calls = obs_stats.dir_fsync_calls.saturating_add(1);
+                }
+
+                last_write_at = Instant::now();
+                last_progress = bytes_extracted_total;
+                checkpoints_written = checkpoints_written.saturating_add(1);
+                if let Some(cb) = progress.as_deref_mut() {
+                    cb(ProgressEvent::CheckpointWritten {
+                        source_position: 0,
+                        bytes_in: bytes_extracted_total,
+                        bytes_out: bytes_extracted_total,
+                    });
+                }
+                obs_stats.observer_time = obs_stats
+                    .observer_time
+                    .saturating_add(observer_start.elapsed());
+                Ok(())
+            }
+        }
+    });
+
+    match result {
+        Ok(stats) => {
+            sink.close().map_err(CoordinatorError::Sink)?;
+            // Translate ZipExtractionStats into the
+            // ExtractionStats shape the rest of the coordinator
+            // returns. Some fields don't have a natural ZIP
+            // counterpart and stay zero.
+            let mut out = ExtractionStats {
+                bytes_in: total_size,
+                bytes_out: stats.bytes_written,
+                bytes_punched: stats.bytes_punched,
+                punch_calls: u64::from(stats.entries_extracted),
+                punch_unsupported: false,
+                frame_boundaries_observed: u64::from(stats.entries_extracted),
+                quiescent_checkpoints: checkpoints_written,
+                decode_time: Duration::default(),
+                write_time: Duration::default(),
+                punch_time: Duration::default(),
+                ..ExtractionStats::default()
+            };
+            obs_stats.merge_into(&mut out);
+            Ok(out)
+        }
+        Err(ZipPipelineError::Aborted(e)) if e.to_string() == KILL_SENTINEL => {
+            Err(CoordinatorError::Aborted {
+                checkpoints_written,
+            })
+        }
+        Err(other) => Err(CoordinatorError::Zip(other)),
+    }
+}
+
+/// RAR per-entry pipeline driver wired into the coordinator
+/// (`internal/PLAN_rar.md` §3).
+///
+/// Mirrors `run_zip`'s shape: per-entry checkpoint cadence,
+/// kill-switch threading, mid-entry progress emission so the
+/// resumed run can pick the in-flight entry up at byte
+/// `current_entry_offset` without restarting from byte 0.
+/// Round-one §3 supports STORED entries only; the §4 hand-rolled
+/// decoder will plug into the same flow.
+#[cfg(feature = "rar")]
+#[allow(clippy::too_many_arguments)]
+fn run_rar(
+    sparse: &MultiSparse,
+    bitmap: &ChunkBitmap,
+    fingerprints: &ChunkFingerprints,
+    cursor: &Arc<AtomicU64>,
+    download_done: &Arc<AtomicBool>,
+    download_outcome: &Arc<Mutex<Option<Result<DownloadStats, SchedulerError>>>>,
+    puncher: &dyn PunchHole,
+    ckpt_path: &Path,
+    info: &DownloadInfo,
+    requested_url: &str,
+    chunk_size: u64,
+    total_size: u64,
+    output_dir: &Path,
+    plan: &ResumePlan,
+    config: &CoordinatorConfig,
+    mut progress: Option<&mut ProgressFn>,
+    progress_state: Option<&Arc<ProgressState>>,
+    kill_switch: Option<&Arc<AtomicBool>>,
+    prior_elapsed: Duration,
+    started: Instant,
+) -> Result<ExtractionStats, CoordinatorError> {
+    use crate::download::rar_pipeline::{
+        RarPipeline, RarPipelineConfig, RarPipelineError, RarPipelineEvent, RarResumeState,
+    };
+    use crate::sink::RarSink;
+
+    fs::create_dir_all(output_dir).map_err(|source| CoordinatorError::Io {
+        path: output_dir.to_path_buf(),
+        source,
+    })?;
+    let mut sink = RarSink::new(output_dir).map_err(CoordinatorError::Sink)?;
+
+    let resume = match plan {
+        ResumePlan::Fresh => RarResumeState::default(),
+        ResumePlan::Resume { sink_state, .. } => match sink_state {
+            SinkState::Rar {
+                entries_completed,
+                current_entry,
+                current_entry_offset,
+                current_entry_decoder_state,
+            } => RarResumeState {
+                entries_completed: entries_completed.clone(),
+                current_entry: *current_entry,
+                current_entry_offset: *current_entry_offset,
+                current_entry_decoder_state: current_entry_decoder_state.clone(),
+            },
+            SinkState::Raw { .. }
+            | SinkState::Tar { .. }
+            | SinkState::Zip { .. }
+            | SinkState::Sevenz { .. } => {
+                return Err(CoordinatorError::SourceChanged {
+                    reason: "checkpoint sink_state is not Rar but the resolved format is rar"
+                        .into(),
+                });
+            }
+        },
+    };
+
+    let pipeline_cfg = RarPipelineConfig {
+        total_size,
+        chunk_size,
+        poll_interval: config.reader_poll_interval,
+        initial_header_window: 64 * 1024,
+        // `internal/PLAN_multivolume_archives.md` §2c: when the run is
+        // multi-part (one volume per part, laid out across the
+        // `.peel.part.NNN` sidecars by §7), the walker must jump the
+        // cursor across each volume's signature + main header on
+        // EOA-with-more_volumes. The offsets are the prefix sums of
+        // each part's logical size — exactly what
+        // `MultiSparse::part_start_offsets` returns. Single-volume
+        // input keeps the empty default so the walker takes the
+        // pre-§2c single-buffer path.
+        volume_starts: if sparse.part_count() > 1 {
+            sparse.part_start_offsets().to_vec()
+        } else {
+            Vec::new()
+        },
+    };
+    let pipeline = RarPipeline {
+        config: pipeline_cfg,
+        sparse,
+        bitmap,
+        cursor,
+        download_done,
+        download_outcome,
+        progress_state,
+        password_source: config.password_source.as_ref(),
+        password_label: requested_url,
+    };
+
+    let mut last_write_at = Instant::now()
+        .checked_sub(config.checkpoint_min_interval)
+        .unwrap_or_else(Instant::now);
+    let mut last_progress: u64 = 0;
+    let mut bytes_extracted_total: u64 = 0;
+    let mut bytes_punched_total: u64 = 0;
+    let mut entries_completed: Vec<u32> = resume.entries_completed.clone();
+    let mut entries_extracted_this_run: u64 = 0;
+    let mut checkpoints_written: u64 = 0;
+    let mut obs_stats = CheckpointObserverStats::default();
+    let rate = if !config.checkpoint_target_interval.is_zero() && progress_state.is_some() {
+        let initial_bytes = progress_state
+            .map(|p| p.snapshot().bytes_downloaded)
+            .unwrap_or(0);
+        Some(RealizedRate::new(Instant::now(), initial_bytes))
+    } else {
+        None
+    };
+    let live_floor = || -> u64 {
+        match (rate, progress_state) {
+            (Some(r), Some(p)) => {
+                let bytes = p.snapshot().bytes_downloaded;
+                let bps = r.rate(Instant::now(), bytes);
+                rate_aware_floor(
+                    config.checkpoint_min_bytes,
+                    bps,
+                    config.checkpoint_target_interval,
+                )
+            }
+            _ => config.checkpoint_min_bytes,
+        }
+    };
+
+    // Helper: serialize and write a checkpoint capturing the
+    // supplied SinkState::Rar shape. Encapsulated so the
+    // mid-entry and end-of-entry paths share one
+    // sparse-sync + write code path.
+    let write_ckpt = |sink_state: SinkState, obs: &mut CheckpointObserverStats| -> io::Result<()> {
+        let sparse_sync_start = Instant::now();
+        let sparse_sync_result = sparse.order_writes();
+        obs.sparse_sync_time = obs
+            .sparse_sync_time
+            .saturating_add(sparse_sync_start.elapsed());
+        obs.sparse_sync_calls = obs.sparse_sync_calls.saturating_add(1);
+        sparse_sync_result.map_err(|e| io::Error::other(format!("sparse order_writes: {e}")))?;
+        let serialize_prep_start = Instant::now();
+        let chunk_crc32c = if fingerprints.is_empty() {
+            None
+        } else {
+            Some(fingerprints.to_vec())
+        };
+        let ckpt = Checkpoint {
+            url: requested_url.to_string(),
+            etag: info.fingerprint.etag.clone(),
+            last_modified: info.fingerprint.last_modified.clone(),
+            parts: Vec::new(),
+            total_size: info.total_size,
+            chunk_size,
+            decoder_position: ByteOffset::new(0),
+            bitmap_completed: bitmap.to_bytes(),
+            created_at: SystemTime::now(),
+            sink_state,
+            hash_state: None,
+            chunk_crc32c,
+            decoder_state: None,
+            mode: current_run_mode(config),
+            source_mtime: None,
+            cumulative_elapsed: prior_elapsed.saturating_add(started.elapsed()),
+        };
+        let prep_time = serialize_prep_start.elapsed();
+        let write_timings = ckpt
+            .write_timed(ckpt_path)
+            .map_err(|e| io::Error::other(format!("checkpoint write: {e}")))?;
+        obs.serialize_time = obs
+            .serialize_time
+            .saturating_add(prep_time.saturating_add(write_timings.serialize_time));
+        obs.tmp_write_time = obs
+            .tmp_write_time
+            .saturating_add(write_timings.tmp_write_time);
+        obs.tmp_fsync_time = obs
+            .tmp_fsync_time
+            .saturating_add(write_timings.tmp_fsync_time);
+        obs.rename_time = obs.rename_time.saturating_add(write_timings.rename_time);
+        obs.dir_fsync_time = obs
+            .dir_fsync_time
+            .saturating_add(write_timings.dir_fsync_time);
+        if write_timings.dir_fsync_called {
+            obs.dir_fsync_calls = obs.dir_fsync_calls.saturating_add(1);
+        }
+        Ok(())
+    };
+
+    let result = pipeline.run(&mut sink, puncher, resume, |event| -> io::Result<()> {
+        if let Some(flag) = kill_switch {
+            if flag.load(Ordering::Acquire) {
+                return Err(io::Error::other(KILL_SENTINEL));
+            }
+        }
+        match event {
+            RarPipelineEvent::Started { .. } => Ok(()),
+            RarPipelineEvent::InEntryProgress {
+                index,
+                bytes_written,
+            } => {
+                let elapsed = last_write_at.elapsed();
+                let in_flight_progress = bytes_extracted_total.saturating_add(*bytes_written);
+                let progressed = in_flight_progress.saturating_sub(last_progress);
+                let bytes_floor = live_floor();
+                if progressed < bytes_floor && elapsed < config.checkpoint_min_interval {
+                    return Ok(());
+                }
+                let observer_start = Instant::now();
+                let sink_state = SinkState::Rar {
+                    entries_completed: entries_completed.clone(),
+                    current_entry: Some(*index),
+                    current_entry_offset: *bytes_written,
+                    current_entry_decoder_state: None,
+                };
+                write_ckpt(sink_state, &mut obs_stats)?;
+                last_write_at = Instant::now();
+                last_progress = in_flight_progress;
+                checkpoints_written = checkpoints_written.saturating_add(1);
+                if let Some(cb) = progress.as_deref_mut() {
+                    cb(ProgressEvent::CheckpointWritten {
+                        source_position: 0,
+                        bytes_in: in_flight_progress,
+                        bytes_out: in_flight_progress,
+                    });
+                }
+                obs_stats.observer_time = obs_stats
+                    .observer_time
+                    .saturating_add(observer_start.elapsed());
+                Ok(())
+            }
+            RarPipelineEvent::InEntryProgressCompressed {
+                index,
+                bytes_written,
+                decoder_state,
+            } => {
+                let elapsed = last_write_at.elapsed();
+                let in_flight_progress = bytes_extracted_total.saturating_add(*bytes_written);
+                let progressed = in_flight_progress.saturating_sub(last_progress);
+                let bytes_floor = live_floor();
+                if progressed < bytes_floor && elapsed < config.checkpoint_min_interval {
+                    return Ok(());
+                }
+                let observer_start = Instant::now();
+                let sink_state = SinkState::Rar {
+                    entries_completed: entries_completed.clone(),
+                    current_entry: Some(*index),
+                    current_entry_offset: *bytes_written,
+                    current_entry_decoder_state: decoder_state.clone(),
+                };
+                write_ckpt(sink_state, &mut obs_stats)?;
+                last_write_at = Instant::now();
+                last_progress = in_flight_progress;
+                checkpoints_written = checkpoints_written.saturating_add(1);
+                if let Some(cb) = progress.as_deref_mut() {
+                    cb(ProgressEvent::CheckpointWritten {
+                        source_position: 0,
+                        bytes_in: in_flight_progress,
+                        bytes_out: in_flight_progress,
+                    });
+                }
+                obs_stats.observer_time = obs_stats
+                    .observer_time
+                    .saturating_add(observer_start.elapsed());
+                Ok(())
+            }
+            RarPipelineEvent::EntryFinished {
+                index,
+                bytes_written,
+                bytes_punched,
+                ..
+            } => {
+                entries_completed.push(*index);
+                bytes_extracted_total = bytes_extracted_total.saturating_add(*bytes_written);
+                bytes_punched_total = bytes_punched_total.saturating_add(*bytes_punched);
+                entries_extracted_this_run = entries_extracted_this_run.saturating_add(1);
+                if let Some(p) = progress_state {
+                    p.add_extracted(*bytes_written);
+                }
+                let elapsed = last_write_at.elapsed();
+                let progressed = bytes_extracted_total.saturating_sub(last_progress);
+                let bytes_floor = live_floor();
+                if progressed < bytes_floor && elapsed < config.checkpoint_min_interval {
+                    return Ok(());
+                }
+                let observer_start = Instant::now();
+                let sink_state = SinkState::Rar {
+                    entries_completed: entries_completed.clone(),
+                    current_entry: None,
+                    current_entry_offset: 0,
+                    current_entry_decoder_state: None,
+                };
+                write_ckpt(sink_state, &mut obs_stats)?;
+                last_write_at = Instant::now();
+                last_progress = bytes_extracted_total;
+                checkpoints_written = checkpoints_written.saturating_add(1);
+                if let Some(cb) = progress.as_deref_mut() {
+                    cb(ProgressEvent::CheckpointWritten {
+                        source_position: 0,
+                        bytes_in: bytes_extracted_total,
+                        bytes_out: bytes_extracted_total,
+                    });
+                }
+                obs_stats.observer_time = obs_stats
+                    .observer_time
+                    .saturating_add(observer_start.elapsed());
+                Ok(())
+            }
+        }
+    });
+
+    match result {
+        Ok(stats) => {
+            sink.close().map_err(CoordinatorError::Sink)?;
+            let mut out = ExtractionStats {
+                bytes_in: total_size,
+                bytes_out: stats.bytes_written,
+                bytes_punched: stats.bytes_punched,
+                punch_calls: u64::from(stats.entries_extracted),
+                punch_unsupported: false,
+                frame_boundaries_observed: u64::from(stats.entries_extracted),
+                quiescent_checkpoints: checkpoints_written,
+                decode_time: Duration::default(),
+                write_time: Duration::default(),
+                punch_time: Duration::default(),
+                ..ExtractionStats::default()
+            };
+            obs_stats.merge_into(&mut out);
+            Ok(out)
+        }
+        Err(RarPipelineError::Aborted(e)) if e.to_string() == KILL_SENTINEL => {
+            Err(CoordinatorError::Aborted {
+                checkpoints_written,
+            })
+        }
+        Err(other) => Err(CoordinatorError::Rar(other)),
+    }
+}
+
+/// 7z second-pipeline driver wired into the coordinator (`§10`
+/// of `internal/PLAN_7z_support.md`).
+///
+/// Mirrors `run_zip`'s shape: per-folder checkpoint cadence,
+/// kill-switch threading, disk-buffer-cap override (7z is
+/// random-access just like zip — trailer at the end, pack
+/// data at the front).
+#[cfg(feature = "sevenz")]
+#[allow(clippy::too_many_arguments)]
+fn run_sevenz(
+    sparse: &MultiSparse,
+    bitmap: &ChunkBitmap,
+    cursor: &Arc<AtomicU64>,
+    download_done: &Arc<AtomicBool>,
+    download_outcome: &Arc<Mutex<Option<Result<DownloadStats, SchedulerError>>>>,
+    puncher: &dyn PunchHole,
+    ckpt_path: &Path,
+    info: &DownloadInfo,
+    requested_url: &str,
+    chunk_size: u64,
+    total_size: u64,
+    output_dir: &Path,
+    plan: &ResumePlan,
+    config: &CoordinatorConfig,
+    // The pipeline reads this through to its
+    // `SparseFileSliceReader`, which publishes
+    // `bytes_decoded_input` on every successful pread. That
+    // is what makes `max_disk_buffer` actually bound the
+    // on-disk-but-not-yet-extracted footprint.
+    progress_state: Option<&Arc<ProgressState>>,
+    kill_switch: Option<&Arc<AtomicBool>>,
+    prior_elapsed: Duration,
+    started: Instant,
+) -> Result<ExtractionStats, CoordinatorError> {
+    fs::create_dir_all(output_dir).map_err(|source| CoordinatorError::Io {
+        path: output_dir.to_path_buf(),
+        source,
+    })?;
+
+    // Translate the resume plan into the 7z-specific shape.
+    let resume = match plan {
+        ResumePlan::Fresh => SevenzResumeState::default(),
+        ResumePlan::Resume { sink_state, .. } => match sink_state {
+            SinkState::Sevenz {
+                folders_completed,
+                current_folder,
+            } => SevenzResumeState {
+                folders_completed: folders_completed.clone(),
+                current_folder: *current_folder,
+            },
+            SinkState::Raw { .. }
+            | SinkState::Tar { .. }
+            | SinkState::Zip { .. }
+            | SinkState::Rar { .. } => {
+                return Err(CoordinatorError::SourceChanged {
+                    reason: "checkpoint sink_state is not Sevenz but the resolved format is 7z"
+                        .into(),
+                });
+            }
+        },
+    };
+
+    // Construct the sink without a file list — the §8 pipeline
+    // installs it via `set_files` after parsing the trailer.
+    let mut sink = SevenzSink::new(output_dir).map_err(CoordinatorError::Sink)?;
+
+    let pipeline_cfg = SevenzPipelineConfig {
+        total_size,
+        chunk_size,
+        poll_interval: config.reader_poll_interval,
+    };
+    let pipeline = SevenzPipeline {
+        config: pipeline_cfg,
+        sparse,
+        bitmap,
+        cursor,
+        download_done,
+        download_outcome,
+        progress_state,
+        password_source: config.password_source.as_ref(),
+        password_label: requested_url,
+    };
+
+    // The 7z pipeline respects `max_disk_buffer`. Unlike
+    // [`run_zip`] (which disables the throttle because zip's
+    // entries are scattered in non-monotone order), 7z's
+    // pack data is laid out front-to-back in archive order;
+    // a sequential folder walk plus a steered trailer fetch
+    // plays naturally with a cursor-relative lookahead cap.
+    // The pipeline:
+    //
+    //   1. Steers the cursor to the trailer to fetch
+    //      metadata. The cap measures lookahead *past* the
+    //      cursor, so chunks at the trailer are dispatchable
+    //      while the cursor is there. Trailer is small
+    //      (~KB to MB) and lands quickly.
+    //   2. Steers the cursor back to the pack-data origin
+    //      (byte 32) and walks folders in archive order. The
+    //      reader publishes its position to the cursor as it
+    //      drains chunks, so workers' dispatch window slides
+    //      forward and never carries more than
+    //      `max_disk_buffer` ahead of extraction. This bounds
+    //      the on-disk footprint regardless of archive size.
+    //
+    // (`run_zip`'s `set_max_disk_buffer(0)` bypass is the
+    // analogous fix waiting to happen for the zip pipeline —
+    // filed separately.)
+
+    let mut last_write_at = Instant::now()
+        .checked_sub(config.checkpoint_min_interval)
+        .unwrap_or_else(Instant::now);
+    let mut last_progress: u64 = 0;
+    let mut bytes_punched_total: u64 = 0;
+    let mut folders_completed: Vec<u32> = resume.folders_completed.clone();
+    let mut checkpoints_written: u64 = 0;
+
+    let result = pipeline.run(&mut sink, puncher, resume, |event| -> io::Result<()> {
+        if let Some(flag) = kill_switch {
+            if flag.load(Ordering::Acquire) {
+                return Err(io::Error::other(KILL_SENTINEL));
+            }
+        }
+        match event {
+            SevenzPipelineEvent::Started { .. } => Ok(()),
+            SevenzPipelineEvent::FolderFinished {
+                index,
+                bytes_punched,
+            } => {
+                folders_completed.push(*index);
+                bytes_punched_total = bytes_punched_total.saturating_add(*bytes_punched);
+
+                // Throttle the checkpoint write per the same
+                // policy `run_zip` uses, with one simplification:
+                // there is no in-folder progress tracking yet
+                // (mid-folder resume is `O.32c`), so the only
+                // place a checkpoint can land is at folder
+                // boundaries. The throttle still applies — for
+                // archives with thousands of tiny folders the
+                // per-folder write would dominate.
+                let elapsed = last_write_at.elapsed();
+                let proxy = total_size.saturating_sub(bytes_punched_total.saturating_add(1));
+                let progressed = (folders_completed.len() as u64).saturating_sub(last_progress);
+                if progressed == 0 && elapsed < config.checkpoint_min_interval {
+                    return Ok(());
+                }
+                let _ = proxy;
+
+                let sparse_sync_result = sparse.order_writes();
+                sparse_sync_result
+                    .map_err(|e| io::Error::other(format!("sparse order_writes: {e}")))?;
+
+                let ckpt = Checkpoint {
+                    url: requested_url.to_string(),
+                    etag: info.fingerprint.etag.clone(),
+                    last_modified: info.fingerprint.last_modified.clone(),
+                    parts: Vec::new(),
+                    total_size: info.total_size,
+                    chunk_size,
+                    decoder_position: ByteOffset::new(0),
+                    bitmap_completed: bitmap.to_bytes(),
+                    created_at: SystemTime::now(),
+                    sink_state: SinkState::Sevenz {
+                        folders_completed: folders_completed.clone(),
+                        current_folder: None,
+                    },
+                    hash_state: None,
+                    chunk_crc32c: None,
+                    decoder_state: None,
+                    mode: current_run_mode(config),
+                    source_mtime: None,
+                    cumulative_elapsed: prior_elapsed.saturating_add(started.elapsed()),
+                };
+                ckpt.write_timed(ckpt_path)
+                    .map_err(|e| io::Error::other(format!("checkpoint write: {e}")))?;
+                last_write_at = Instant::now();
+                last_progress = folders_completed.len() as u64;
+                checkpoints_written = checkpoints_written.saturating_add(1);
+                Ok(())
+            }
+            SevenzPipelineEvent::Complete { .. } => Ok(()),
+        }
+    });
+
+    match result {
+        Ok(stats) => Ok(extraction_stats_from_sevenz(stats, total_size)),
+        Err(SevenzPipelineError::Aborted(e)) if e.to_string() == KILL_SENTINEL => {
+            Err(CoordinatorError::Aborted {
+                checkpoints_written,
+            })
+        }
+        Err(SevenzPipelineError::Sevenz(e)) | Err(SevenzPipelineError::FolderDecode(e)) => {
+            Err(CoordinatorError::Sevenz(e))
+        }
+        Err(SevenzPipelineError::Sink(e)) => Err(CoordinatorError::Sink(e)),
+        Err(SevenzPipelineError::Sparse(e)) => Err(CoordinatorError::SparseFile(e)),
+        Err(other) => Err(CoordinatorError::SevenzPipeline(other)),
+    }
+}
+
+/// Translate a [`SevenzExtractionStats`] into the wider
+/// [`ExtractionStats`] shape the caller surfaces. Several
+/// fields the streaming-pipeline run carries (decode_time,
+/// write_time, punch_time) stay at `Default` because the §10
+/// minimum-viable wiring does not collect them; that lands as
+/// a follow-up alongside the kill-switch + checkpoint cadence
+/// integration.
+#[cfg(feature = "sevenz")]
+fn extraction_stats_from_sevenz(stats: SevenzExtractionStats, total_size: u64) -> ExtractionStats {
+    ExtractionStats {
+        bytes_in: total_size,
+        bytes_out: 0,
+        bytes_punched: stats.bytes_punched,
+        punch_calls: u64::from(stats.folders_extracted),
+        punch_unsupported: false,
+        frame_boundaries_observed: u64::from(stats.folders_extracted),
+        quiescent_checkpoints: 0,
+        decode_time: Duration::default(),
+        write_time: Duration::default(),
+        punch_time: Duration::default(),
+        ..ExtractionStats::default()
+    }
+}
+
+/// Build a fresh [`ChunkFingerprints`] store sized to the run's
+/// chunk count, pre-populated from the resume plan when applicable.
+///
+/// `Fresh` runs return an all-zero store. `Resume` runs whose
+/// checkpoint carries a `chunk_crc32c` of matching length restore
+/// every fingerprint into the store. A length mismatch surfaces as
+/// [`CoordinatorError::SourceChanged`] — the chunk count derived
+/// from `total_size / chunk_size` did not agree with what the
+/// checkpoint recorded, which means the source layout shifted and
+/// resume is unsafe.
+fn build_fingerprints(
+    total_chunks: u32,
+    plan: &ResumePlan,
+) -> Result<ChunkFingerprints, CoordinatorError> {
+    let store = ChunkFingerprints::new(total_chunks);
+    if let ResumePlan::Resume {
+        chunk_crc32c: Some(crcs),
+        ..
+    } = plan
+    {
+        if u32::try_from(crcs.len()).unwrap_or(u32::MAX) != total_chunks {
+            return Err(CoordinatorError::SourceChanged {
+                reason: format!(
+                    "checkpoint chunk_crc32c length {} does not match expected chunk \
+                     count {total_chunks}",
+                    crcs.len(),
+                ),
+            });
+        }
+        for (i, crc) in crcs.iter().enumerate() {
+            store.record(ChunkIndex::new(i as u32), *crc);
+        }
+    }
+    Ok(store)
+}
+
+/// Re-fetch a single already-complete chunk and verify its
+/// CRC-32C against the stored fingerprint (`PLAN_v2.md` §11).
+///
+/// Picks a random chunk whose bitmap bit is set and whose
+/// fingerprint is non-zero; bytes that have not been seen by §11
+/// (resumed-from-pre-§11 checkpoints; chunks without a recorded
+/// fingerprint) are silently skipped. A successful probe leaves
+/// the sparse file unchanged. A CRC-32C mismatch is surfaced as
+/// [`CoordinatorError::SourceChangedSinceCheckpoint`].
+fn run_resume_probe(
+    client: &Client,
+    info: &DownloadInfo,
+    sparse: &MultiSparse,
+    bitmap: &ChunkBitmap,
+    fingerprints: &ChunkFingerprints,
+    chunk_size: u64,
+    retry: &RetryConfig,
+) -> Result<(), CoordinatorError> {
+    let total_chunks = bitmap.len();
+    if total_chunks == 0 || chunk_size == 0 || fingerprints.is_empty() {
+        return Ok(());
+    }
+
+    // Pick the first complete + fingerprinted chunk in a
+    // pseudorandom walk. Deterministic-ish so the test harness can
+    // reason about which chunk gets probed.
+    let mut rng: u64 =
+        (u64::from(total_chunks) << 32) ^ 0xC0DE_FACE_5A5A_5A5A_u64 ^ info.total_size;
+    let mut picked: Option<(ChunkIndex, u32)> = None;
+    for _ in 0..16 {
+        rng = rng
+            .wrapping_mul(6_364_136_223_846_793_005)
+            .wrapping_add(1_442_695_040_888_963_407);
+        let idx = u32::try_from(rng.wrapping_shr(32) % u64::from(total_chunks))
+            .unwrap_or(0)
+            .min(total_chunks - 1);
+        let chunk = ChunkIndex::new(idx);
+        if !bitmap.is_complete(chunk) {
+            continue;
+        }
+        let crc = fingerprints.get(chunk);
+        if crc == 0 {
+            continue;
+        }
+        picked = Some((chunk, crc));
+        break;
+    }
+
+    let Some((chunk, expected)) = picked else {
+        // No fingerprinted chunk to probe (resume from pre-§11
+        // checkpoint, or every fingerprint slot is unset). The §11
+        // contract is "verify what we can"; absent fingerprints
+        // means we can't, and that's fine — fall through.
+        return Ok(());
+    };
+
+    let start_byte = u64::from(chunk.get()).saturating_mul(chunk_size);
+    if start_byte >= info.total_size {
+        return Ok(());
+    }
+    let end_byte = start_byte.saturating_add(chunk_size).min(info.total_size);
+    let Some(range) =
+        crate::types::ByteRange::new(ByteOffset::new(start_byte), ByteOffset::new(end_byte))
+    else {
+        return Ok(());
+    };
+
+    let dispatch = crate::download::Dispatch {
+        first: chunk,
+        count: 1,
+        range,
+        kind: crate::download::DispatchKind::Probe { expected },
+    };
+    // The resume probe always speaks to the primary URL: per
+    // `PLAN_v2.md` §11 the probe verifies that *the source we
+    // checkpointed against* still serves the bytes we recorded. Even
+    // when `--mirror` is in play, we only have a fingerprint
+    // recorded against the URL the prior run discovered; cross-mirror
+    // probing happens later via §11's mid-flight verifier.
+    let probe_mirrors =
+        crate::download::MirrorSet::single(info.url.clone(), info.fingerprint.clone());
+    // Multi-URL routing for the probe (`internal/PLAN_multi_url_source.md`
+    // §1 step 4): when the source has more than one part, hand the
+    // worker the part list so the probe's ranged GET goes to the
+    // *correct* per-part URL with a part-relative `Range` header.
+    // Without this, every probe would hit the primary URL with a
+    // global offset and trip a 416 on out-of-bound parts.
+    let multi_part: Option<&crate::download::MultiPartSource> = if info.source.len() > 1 {
+        Some(&info.source)
+    } else {
+        None
+    };
+    let ctx = crate::download::worker::ChunkContext {
+        client,
+        mirrors: &probe_mirrors,
+        source: multi_part,
+        chunk_size,
+        sparse,
+        progress: None,
+        rate_limiter: None,
+    };
+    let cancel = AtomicBool::new(false);
+    match crate::download::worker::download_dispatch(&ctx, dispatch, retry, &cancel) {
+        Ok(_) => Ok(()),
+        Err(crate::download::ChunkFailure {
+            error:
+                crate::download::WorkerError::SourceDriftDetected {
+                    chunk,
+                    expected,
+                    actual,
+                },
+            ..
+        }) => Err(CoordinatorError::SourceChangedSinceCheckpoint {
+            chunk,
+            expected,
+            actual,
+        }),
+        Err(crate::download::ChunkFailure {
+            error: other,
+            attempts,
+        }) => Err(CoordinatorError::Scheduler(SchedulerError::ChunkFailed {
+            chunk,
+            attempts,
+            source: other,
+        })),
+    }
+}
+
+/// `PLAN_responsiveness.md` §3.1: re-CRC the on-disk bytes for the
+/// chunk that contains `decoder_position` and compare against the
+/// fingerprint persisted in the prior checkpoint.
+///
+/// This is the local twin of [`run_resume_probe`]: the latter
+/// re-fetches a random already-complete chunk from the server to
+/// catch upstream drift; this one reads back the bytes peel itself
+/// most recently wrote, to catch corruption in the part file. The
+/// cursor chunk is the most likely suspect — it's the one the
+/// decoder is about to read — so we always inspect it on resume.
+///
+/// Behaviour:
+/// - No fingerprints recorded (resume from a pre-§11 checkpoint) ⇒
+///   no-op.
+/// - Cursor past EOF (degenerate; should not happen but the
+///   resume path tolerates it) ⇒ no-op.
+/// - Cursor chunk not marked complete in the bitmap ⇒ no-op: the
+///   download path itself will block until the chunk lands, and the
+///   reader's normal logic surfaces a clearer error if it never does.
+/// - Cursor chunk fingerprint is `0` (unset) ⇒ no-op (an unset
+///   fingerprint is indistinguishable from a genuine zero CRC, but
+///   bitmap chunks are non-empty so the latter cannot arise in
+///   practice — a `0` here means "not recorded yet").
+/// - Otherwise: re-checksum the on-disk bytes; mismatch ⇒
+///   [`CoordinatorError::PartFileCorrupted`].
+fn run_cursor_chunk_audit(
+    sparse: &MultiSparse,
+    bitmap: &ChunkBitmap,
+    fingerprints: &ChunkFingerprints,
+    chunk_size: u64,
+    total_size: u64,
+    decoder_position: u64,
+) -> Result<(), CoordinatorError> {
+    if chunk_size == 0 || total_size == 0 || fingerprints.is_empty() {
+        return Ok(());
+    }
+    if decoder_position >= total_size {
+        return Ok(());
+    }
+    let cursor_chunk_idx = decoder_position / chunk_size;
+    let total_chunks = u64::from(bitmap.len());
+    if cursor_chunk_idx >= total_chunks {
+        return Ok(());
+    }
+    // INVARIANT: cursor_chunk_idx < total_chunks (≤ u32::MAX), so
+    // the cast is lossless.
+    let chunk = ChunkIndex::new(cursor_chunk_idx as u32);
+    if !bitmap.is_complete(chunk) {
+        // The reader will block on this chunk normally; no value in
+        // a separate error here.
+        return Ok(());
+    }
+    let expected = fingerprints.get(chunk);
+    if expected == 0 {
+        // Fingerprint not recorded — pre-§11 resume, or a slot the
+        // worker never wrote. Nothing to compare against.
+        return Ok(());
+    }
+
+    let start_byte = cursor_chunk_idx.saturating_mul(chunk_size);
+    if decoder_position > start_byte {
+        // Cursor is mid-chunk: bytes below it have been hole-punched
+        // by the prior run's extractor (zeroed) up to roughly
+        // `align_down(decoder_position, fs_block)`. The fingerprint
+        // was recorded over the pristine pre-punch chunk, so a
+        // whole-chunk re-CRC here would always mismatch and produce
+        // a false-positive `PartFileCorrupted`. We skip rather than
+        // alarm; on-disk corruption of the post-cursor bytes will
+        // still surface as a decoder error when the decoder reads
+        // them.
+        return Ok(());
+    }
+    let end_byte = start_byte.saturating_add(chunk_size).min(total_size);
+    let len = end_byte.saturating_sub(start_byte);
+    // INVARIANT: len ≤ chunk_size which fits in usize on every
+    // 64-bit target peel runs on. Defensive cast guards 32-bit
+    // hosts (where chunk_size could in principle exceed usize).
+    let len_usize = match usize::try_from(len) {
+        Ok(n) => n,
+        Err(_) => return Ok(()),
+    };
+    let mut buf = vec![0u8; len_usize];
+    sparse
+        .read_exact_at(ByteOffset::new(start_byte), &mut buf)
+        .map_err(CoordinatorError::SparseFile)?;
+    let actual = crate::hash::crc32c::castagnoli(&buf);
+    if actual != expected {
+        return Err(CoordinatorError::PartFileCorrupted {
+            chunk,
+            expected,
+            actual,
+        });
+    }
+    Ok(())
+}
+
+/// Combined SharedHasher + initial skip count returned by
+/// [`build_integrity_hasher`] when integrity tracking is enabled.
+struct IntegrityHasherSetup {
+    hasher: crate::hash::SharedHasher,
+    skip_remaining: u64,
+}
+
+/// Build the integrity hasher for this run, or `None` when no
+/// hashes were configured.
+///
+/// `info.source` carries the per-part layout (length 1 for
+/// single-URL); `expected` is parallel to it, with each entry
+/// `Some` when the user supplied a hash for that part and `None`
+/// otherwise. When every entry is `None` (or `expected` is empty)
+/// no hasher is built and the coordinator skips the integrity
+/// pipeline entirely.
+///
+/// Resume semantics:
+///
+/// - **Fresh run + any expected hash** → fresh single- or
+///   multi-part [`IntegrityHasher`], skip = 0.
+/// - **Resume + single-URL + saved hash_state** → restore the
+///   active `Sha256` from the saved state and rebuild a 1-part
+///   `IntegrityHasher` around it. Today's `--sha256` resume path
+///   (`PLAN_v2.md` §10 step 4) is unchanged.
+/// - **Resume + single-URL + no saved hash_state** → hard error
+///   ([`crate::hash::IntegrityError::CheckpointMissingHashState`]);
+///   we cannot rebuild a faithful end-of-run digest from a
+///   half-tracked run.
+/// - **Resume + no expected hashes + saved hash_state** → hard
+///   error ([`crate::hash::IntegrityError::CheckpointHadHashState`]);
+///   refusing keeps the user's prior intent intact rather than
+///   silently losing it.
+/// - **Resume + active_part_idx out of range** → hard error
+///   ([`crate::hash::IntegrityError::CheckpointPartIndexOutOfRange`])
+///   when the saved index points past the current run's part
+///   count, which happens if the user changed the URL list
+///   between runs while keeping the same `.peel.ckpt` sidecar.
+fn build_integrity_hasher(
+    source: &crate::download::MultiPartSource,
+    expected: &[Option<[u8; crate::hash::sha256::DIGEST_LEN]>],
+    prior: Option<&Checkpoint>,
+    ckpt_path: &Path,
+    reader_start: u64,
+) -> Result<Option<IntegrityHasherSetup>, CoordinatorError> {
+    debug_assert_eq!(
+        expected.len(),
+        source.len(),
+        "expected length must match part count"
+    );
+    let any_expected = expected.iter().any(Option::is_some);
+    let prior_hash_state = prior.and_then(|p| p.hash_state.as_ref());
+
+    match (any_expected, prior_hash_state) {
+        (false, Some(_)) => Err(CoordinatorError::Integrity(
+            crate::hash::IntegrityError::CheckpointHadHashState {
+                ckpt_path: ckpt_path.to_path_buf(),
+            },
+        )),
+        (false, None) => Ok(None),
+        (true, None) => {
+            // Fresh run (or a resume without integrity tracking
+            // before — surface the latter as an error rather than
+            // silently dropping coverage).
+            if prior.is_some() {
+                return Err(CoordinatorError::Integrity(
+                    crate::hash::IntegrityError::CheckpointMissingHashState {
+                        ckpt_path: ckpt_path.to_path_buf(),
+                    },
+                ));
+            }
+            let hasher_inner = if source.len() == 1 {
+                crate::hash::IntegrityHasher::single(source.total_size(), expected[0])
+            } else {
+                let sizes: Vec<u64> = source.parts().iter().map(|p| p.size).collect();
+                crate::hash::IntegrityHasher::multi_part(&sizes, expected.to_vec())
+            };
+            Ok(Some(IntegrityHasherSetup {
+                hasher: crate::hash::shared_hasher(hasher_inner),
+                skip_remaining: 0,
+            }))
+        }
+        (true, Some(saved)) => {
+            let restored =
+                crate::hash::sha256::Sha256::deserialize(&saved.bytes).map_err(|source| {
+                    CoordinatorError::Integrity(
+                        crate::hash::IntegrityError::CheckpointHashStateDecode { source },
+                    )
+                })?;
+            let active_part_idx = saved.active_part_idx as usize;
+            // Reject a checkpoint whose saved active_part_idx
+            // doesn't fit this run's part list. The most common
+            // cause is a v7 checkpoint (active_part_idx implied
+            // 0) being resumed against a multi-URL re-run with
+            // matching parts.len() > 1 — that combination is
+            // safe iff the prior run finished part 0 (idx > 0)
+            // or hadn't started part 0 yet (idx == 0). v7 always
+            // implies idx == 0 so it's compatible only if
+            // single-URL OR no parts crossed yet.
+            if active_part_idx >= source.len() {
+                return Err(CoordinatorError::Integrity(
+                    crate::hash::IntegrityError::CheckpointPartIndexOutOfRange {
+                        ckpt_path: ckpt_path.to_path_buf(),
+                        active_part_idx,
+                        part_count: source.len(),
+                    },
+                ));
+            }
+            let part_sizes: Vec<u64> = source.parts().iter().map(|p| p.size).collect();
+            // The saved active hasher's bytes_processed counts
+            // only the active part's bytes, so the *global*
+            // bytes_processed = sum(part_sizes[0..idx]) +
+            // active.bytes_processed(). Anything in
+            // `[reader_start, global_bytes_processed)` was
+            // already hashed by the previous run; skip those.
+            let prefix: u64 = part_sizes.iter().take(active_part_idx).sum();
+            let global_bytes_processed = prefix.saturating_add(restored.bytes_processed());
+            let skip_remaining = global_bytes_processed.saturating_sub(reader_start);
+            let hasher_inner = if source.len() == 1 {
+                crate::hash::IntegrityHasher::from_single_snapshot(
+                    restored,
+                    source.total_size(),
+                    expected[0],
+                )
+            } else {
+                crate::hash::IntegrityHasher::from_multi_part_snapshot(
+                    restored,
+                    &part_sizes,
+                    expected.to_vec(),
+                    active_part_idx,
+                )
+            };
+            Ok(Some(IntegrityHasherSetup {
+                hasher: crate::hash::shared_hasher(hasher_inner),
+                skip_remaining,
+            }))
+        }
+    }
+}
+
+/// Build the v8 [`crate::checkpoint::PartRecord`] vec for a
+/// checkpoint write from the live [`crate::download::MultiPartSource`]
+/// (`internal/PLAN_multi_url_source.md` §5). Single-URL runs produce a
+/// one-element vec; multi-URL runs record one entry per part. Per-
+/// part expected SHA-256 digests are *not* recorded — the CLI
+/// re-supplies them on resume and the
+/// [`crate::hash::IntegrityHasher`] state is rebuilt from
+/// [`crate::checkpoint::HashState::active_part_idx`] alone.
+fn parts_from_source(
+    source: &crate::download::MultiPartSource,
+) -> Vec<crate::checkpoint::PartRecord> {
+    source
+        .parts()
+        .iter()
+        .map(|p| crate::checkpoint::PartRecord {
+            url: p.url.to_string(),
+            size: p.size,
+            etag: p.fingerprint.etag.clone(),
+            last_modified: p.fingerprint.last_modified.clone(),
+            expected_sha256: None,
+            volume_role: None,
+        })
+        .collect()
+}
+
+/// Snapshot the running integrity hasher's active part state for
+/// inclusion in the next checkpoint.
+///
+/// Locks the shared hasher, asks the [`crate::hash::IntegrityHasher`]
+/// for its active part's serialized form (small, fixed-size), and
+/// pairs it with the active part index so resume can rebuild the
+/// per-part state machine. Returns `None` when integrity tracking is
+/// off or when a prior boundary mismatch already poisoned the hasher
+/// (no point checkpointing a doomed state). Single-URL runs always
+/// emit `active_part_idx = 0`.
+fn snapshot_hash_state(
+    hasher: Option<&crate::hash::SharedHasher>,
+) -> Option<crate::checkpoint::HashState> {
+    let h = hasher?;
+    // INVARIANT: the mutex is touched from the extractor's thread
+    // only — the checkpoint observer pauses the decoder before
+    // calling here. Poisoning would mean a panic inside an
+    // earlier hash update; surfacing the error would force the
+    // coordinator into the panic path. Returning `None` (degrades
+    // to "no integrity state captured this round") is the safe
+    // option — a subsequent successful snapshot supersedes it.
+    let guard = h.lock().ok()?;
+    let bytes = guard.snapshot_active_serialized()?;
+    let active_part_idx = u32::try_from(guard.active_part_idx()).unwrap_or(u32::MAX);
+    Some(crate::checkpoint::HashState {
+        active_part_idx,
+        bytes,
+    })
+}
+
+/// Construct the [`SparseFile`] for this run, picking between the
+/// pwrite/pread storage (any platform, any non-mmap backend choice)
+/// and the §9 `mmap` storage (Linux only).
+///
+/// `Mmap` is selected on Linux when the user passed
+/// [`crate::io_backend::IoBackendChoice::Mmap`] *or*
+/// [`crate::io_backend::IoBackendChoice::Auto`]. Auto resolves to
+/// mmap on Linux because `tests/test_bench_streaming.rs` measured
+/// it 20% faster than pwrite/pread on representative cluster
+/// hardware, with no observed downside on filesystems that don't
+/// support `MADV_REMOVE` (the puncher degrades to noop the same way
+/// it does on the pwrite path).
+fn open_sparse_part(
+    path: &Path,
+    total_size: u64,
+    config: &CoordinatorConfig,
+    io_backend: &Arc<dyn crate::io_backend::IoBackend>,
+) -> Result<SparseFile, CoordinatorError> {
+    #[cfg(target_os = "linux")]
+    if matches!(
+        config.io_backend,
+        crate::io_backend::IoBackendChoice::Mmap | crate::io_backend::IoBackendChoice::Auto
+    ) {
+        return SparseFile::open_or_create_mmap(path, total_size)
+            .map_err(CoordinatorError::SparseFile);
+    }
+    // `config` is only consulted on Linux (where mmap storage is
+    // selectable). Bind it to `_` on non-Linux to keep the signature
+    // uniform across platforms.
+    #[cfg(not(target_os = "linux"))]
+    let _ = config;
+
+    SparseFile::open_or_create_with_backend(path, total_size, Arc::clone(io_backend))
+        .map_err(CoordinatorError::SparseFile)
+}
+
+/// Choose the right puncher for this run: the `mmap`-mode
+/// [`crate::punch::LinuxPuncher::for_mmap`] when the sparse file is
+/// memory-mapped, otherwise the platform default
+/// (`fallocate(PUNCH_HOLE)` on Linux, `fcntl(F_PUNCHHOLE)` on macOS,
+/// [`crate::punch::NoopPuncher`] elsewhere).
+fn make_puncher(sparse: &Arc<MultiSparse>) -> Box<dyn PunchHole> {
+    let base = make_base_puncher(sparse);
+    if sparse.part_count() <= 1 {
+        return base;
+    }
+    // Multi-part runs need every `punch` call routed to the matching
+    // per-part fd. The platform puncher's `fd` argument becomes the
+    // routing puncher's wrapped target; the caller-supplied `fd`
+    // arrives at the wrapper and is dropped on the floor.
+    Box::new(crate::download::RoutingPuncher::new(
+        Arc::clone(sparse),
+        base,
+    ))
+}
+
+/// Construct the platform-default base puncher for `sparse` —
+/// mmap-mode on Linux when every part is mmap-backed, fallocate on
+/// every other Unix-pwrite combination, [`crate::punch::NoopPuncher`]
+/// elsewhere. The multi-part routing wrapper in [`make_puncher`]
+/// sits on top of whatever this returns.
+fn make_base_puncher(sparse: &MultiSparse) -> Box<dyn PunchHole> {
+    #[cfg(target_os = "linux")]
+    if let Some(p) = sparse.make_mmap_puncher() {
+        return Box::new(p);
+    }
+    let _ = sparse;
+    default_puncher()
+}
+
+/// Verify the `.peel.part` sparse file is consistent with the
+/// `.peel.ckpt` we just loaded.
+///
+/// `open_sparse` is willing to CREAT + `set_len` the part file
+/// unconditionally, which would silently turn a missing or truncated
+/// part into a `total_size`-of-zeros sparse file. The bitmap inside
+/// the checkpoint claims chunks complete that — without their bytes
+/// — would now be all-zero garbage. This check fires before
+/// `open_sparse` and surfaces the inconsistency as a hard error so
+/// the user can either restore the part or delete both sidecars,
+/// rather than discovering the corruption later via the §11 probe's
+/// "source changed" message (or, if the checkpoint claimed zero
+/// chunks complete, not at all).
+///
+/// Tolerates a part file that's *exactly* `total_size`, including
+/// the freshly-created sparse case from a prior run that died before
+/// any download had landed: in that case the bitmap claims zero
+/// chunks and the resume effectively starts from byte 0 anyway.
+fn validate_part_file(
+    ckpt_path: &Path,
+    part_path: &Path,
+    total_size: u64,
+) -> Result<(), CoordinatorError> {
+    match fs::metadata(part_path) {
+        Ok(meta) => {
+            let actual = meta.len();
+            if actual < total_size {
+                return Err(CoordinatorError::CheckpointPartMismatch {
+                    ckpt_path: ckpt_path.to_path_buf(),
+                    part_path: part_path.to_path_buf(),
+                    reason: format!(
+                        "part file is {actual} bytes, source's total_size is {total_size}"
+                    ),
+                });
+            }
+            Ok(())
+        }
+        Err(e) if e.kind() == io::ErrorKind::NotFound => {
+            Err(CoordinatorError::CheckpointPartMismatch {
+                ckpt_path: ckpt_path.to_path_buf(),
+                part_path: part_path.to_path_buf(),
+                reason: "part file is missing".into(),
+            })
+        }
+        Err(source) => Err(CoordinatorError::Io {
+            path: part_path.to_path_buf(),
+            source,
+        }),
+    }
+}
+
+/// Compute `<anchor> + suffix` for the .peel.part / .peel.ckpt
+/// sidecars, optionally redirected to `config.workdir`.
+fn sidecar_path(output: &OutputTarget, config: &CoordinatorConfig, suffix: &str) -> PathBuf {
+    let anchor = output.anchor();
+    let basename = anchor
+        .file_name()
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("output"));
+    let parent = config
+        .workdir
+        .clone()
+        .or_else(|| anchor.parent().map(Path::to_path_buf))
+        .unwrap_or_else(|| PathBuf::from("."));
+    let mut name = basename.into_os_string();
+    name.push(suffix);
+    parent.join(PathBuf::from(name))
+}
+
+/// Compute the per-part sidecar paths for a multi-part run
+/// (`internal/PLAN_multivolume_archives.md` §7).
+///
+/// For `count == 1` returns a one-element vec whose single path
+/// matches today's [`sidecar_path`] output, so the on-disk shape for
+/// single-URL runs is unchanged. For `count > 1` produces
+/// `<anchor>.peel.part.NNN`, zero-padded to the width of `count` (so
+/// a 5-volume set lays out as `.peel.part.001` .. `.peel.part.005`
+/// and a 999-volume set goes three digits wide too — sort order
+/// matches volume order).
+fn multi_part_sidecar_paths(
+    output: &OutputTarget,
+    config: &CoordinatorConfig,
+    count: usize,
+    base_suffix: &str,
+) -> Vec<PathBuf> {
+    assert!(count > 0, "multi_part_sidecar_paths called with count == 0");
+    if count == 1 {
+        return vec![sidecar_path(output, config, base_suffix)];
+    }
+    // Minimum width 3 keeps the canonical multi-volume naming
+    // (`peel.part.001`) even when the volume count is small.
+    let width = part_index_width(count);
+    (1..=count)
+        .map(|idx| {
+            let suffix = format!("{base_suffix}.{idx:0width$}", width = width);
+            sidecar_path(output, config, &suffix)
+        })
+        .collect()
+}
+
+/// Zero-pad width for a multi-part sidecar's numeric suffix. Minimum 3
+/// so a small volume set still reads as the canonical
+/// `.peel.part.001` rather than `.peel.part.1`.
+fn part_index_width(count: usize) -> usize {
+    let mut digits = 0usize;
+    let mut n = count;
+    while n > 0 {
+        digits += 1;
+        n /= 10;
+    }
+    digits.max(3)
+}
+
+/// Build the [`MultiSparse`] for this run, opening one sparse per
+/// source part when `config.multi_part_storage` and
+/// `info.source.len() > 1` agree that the multi-part layout applies.
+///
+/// Returns the wrapper plus the per-part sidecar paths the caller
+/// uses for cleanup / resume validation. For single-part runs the
+/// returned vec has length 1 and matches today's
+/// `<anchor>.peel.part` location, so existing callers keep their
+/// shape.
+fn open_sources(
+    info: &DownloadInfo,
+    output: &OutputTarget,
+    config: &CoordinatorConfig,
+    io_backend: &Arc<dyn crate::io_backend::IoBackend>,
+) -> Result<(MultiSparse, Vec<PathBuf>), CoordinatorError> {
+    let parts = info.source.parts();
+    let multi = config.multi_part_storage && parts.len() > 1;
+    let count = if multi { parts.len() } else { 1 };
+    let paths = multi_part_sidecar_paths(output, config, count, ".peel.part");
+    for p in &paths {
+        ensure_parent_dir(p)?;
+    }
+    if !multi {
+        // Unknown-size source (issue #8): the size isn't known up front,
+        // so open a growable part file that extends as bytes arrive
+        // rather than pre-`set_len`-ing it to a (zero) total.
+        if !info.size_known {
+            let single =
+                SparseFile::open_growable(&paths[0]).map_err(CoordinatorError::SparseFile)?;
+            return Ok((MultiSparse::from_single_growable(single), paths));
+        }
+        let single = open_sparse_part(&paths[0], info.total_size, config, io_backend)?;
+        return Ok((MultiSparse::from_single(single), paths));
+    }
+    let mut sparse_parts = Vec::with_capacity(parts.len());
+    for (idx, part) in parts.iter().enumerate() {
+        let s = open_sparse_part(&paths[idx], part.size, config, io_backend)?;
+        sparse_parts.push(s);
+    }
+    let ms = MultiSparse::from_parts(sparse_parts).map_err(|e| CoordinatorError::Io {
+        path: paths[0].clone(),
+        source: std::io::Error::other(format!("MultiSparse::from_parts failed: {e}")),
+    })?;
+    Ok((ms, paths))
+}
+
+fn ensure_parent_dir(path: &Path) -> Result<(), CoordinatorError> {
+    if let Some(parent) = path.parent() {
+        if !parent.as_os_str().is_empty() {
+            fs::create_dir_all(parent).map_err(|source| CoordinatorError::Io {
+                path: parent.to_path_buf(),
+                source,
+            })?;
+        }
+    }
+    Ok(())
+}
+
+pub(crate) fn filename_from_url(url: &Url) -> Option<String> {
+    let path = url.path().split('?').next()?;
+    let last = path.rsplit('/').next()?;
+    if last.is_empty() {
+        None
+    } else {
+        Some(last.to_string())
+    }
+}
+
+/// Short progress-row label derived from a part URL
+/// (`internal/PLAN_multi_url_source.md`). Falls back to the host when the
+/// URL has no usable basename so the renderer always has something to
+/// print, and caps at 48 columns to keep multi-row TTY blocks tidy on
+/// 80-column terminals.
+fn label_from_url(url: &Url) -> String {
+    const LABEL_MAX_COLUMNS: usize = 48;
+    let raw = filename_from_url(url).unwrap_or_else(|| url.host().to_string());
+    if raw.chars().count() <= LABEL_MAX_COLUMNS {
+        return raw;
+    }
+    // Drop characters from the middle so both ends survive (the
+    // progress eye usually wants the trailing part0000-style suffix
+    // and the leading file name).
+    let head_take = LABEL_MAX_COLUMNS / 2 - 1;
+    let tail_take = LABEL_MAX_COLUMNS - head_take - 1;
+    let mut head = String::with_capacity(LABEL_MAX_COLUMNS + 1);
+    for c in raw.chars().take(head_take) {
+        head.push(c);
+    }
+    head.push('…');
+    let total = raw.chars().count();
+    for c in raw.chars().skip(total - tail_take) {
+        head.push(c);
+    }
+    head
+}
+
+#[derive(Debug, Default)]
+struct SourceReadMetrics {
+    sparse_read_bytes: AtomicU64,
+    sparse_read_time_ns: AtomicU64,
+    wait_time_ns: AtomicU64,
+    wait_count: AtomicU64,
+    poll_sleeps: AtomicU64,
+}
+
+#[derive(Debug, Default, Clone, Copy)]
+struct SourceReadMetricsSnapshot {
+    sparse_read_bytes: u64,
+    sparse_read_time: Duration,
+    wait_time: Duration,
+    wait_count: u64,
+    poll_sleeps: u64,
+}
+
+impl SourceReadMetrics {
+    fn record_sparse_read(&self, bytes: u64, elapsed: Duration) {
+        self.sparse_read_bytes.fetch_add(bytes, Ordering::Relaxed);
+        self.sparse_read_time_ns
+            .fetch_add(duration_nanos_u64(elapsed), Ordering::Relaxed);
+    }
+
+    fn record_wait(&self, elapsed: Duration) {
+        self.wait_count.fetch_add(1, Ordering::Relaxed);
+        self.wait_time_ns
+            .fetch_add(duration_nanos_u64(elapsed), Ordering::Relaxed);
+    }
+
+    fn record_poll_sleep(&self) {
+        self.poll_sleeps.fetch_add(1, Ordering::Relaxed);
+    }
+
+    fn snapshot(&self) -> SourceReadMetricsSnapshot {
+        SourceReadMetricsSnapshot {
+            sparse_read_bytes: self.sparse_read_bytes.load(Ordering::Relaxed),
+            sparse_read_time: Duration::from_nanos(
+                self.sparse_read_time_ns.load(Ordering::Relaxed),
+            ),
+            wait_time: Duration::from_nanos(self.wait_time_ns.load(Ordering::Relaxed)),
+            wait_count: self.wait_count.load(Ordering::Relaxed),
+            poll_sleeps: self.poll_sleeps.load(Ordering::Relaxed),
+        }
+    }
+}
+
+fn duration_nanos_u64(duration: Duration) -> u64 {
+    u64::try_from(duration.as_nanos()).unwrap_or(u64::MAX)
+}
+
+/// `Read` adapter that feeds the decoder from the sparse file,
+/// blocking when the chunk it needs hasn't been downloaded yet.
+///
+/// Construct via [`Self::new`]; the type owns its own cursor. The
+/// scheduler reads `cursor` to bias dispatch toward the chunk the
+/// decoder is about to need.
+pub struct BlockingSparseReader {
+    sparse: Arc<MultiSparse>,
+    bitmap: Arc<ChunkBitmap>,
+    chunk_size: u64,
+    total_size: u64,
+    cursor: Arc<AtomicU64>,
+    download_done: Arc<AtomicBool>,
+    download_outcome: Arc<Mutex<Option<Result<DownloadStats, SchedulerError>>>>,
+    poll_interval: Duration,
+    /// Optional shared progress state. When set, every advance of
+    /// the cursor also publishes the new value as
+    /// `bytes_decoded_input`, so the scheduler's disk-buffer throttle
+    /// (and the renderer's lookahead indicator) can read it.
+    progress_state: Option<Arc<ProgressState>>,
+    /// Optional kill-switch the read loop polls between sleeps. When
+    /// set, a tripped flag surfaces as
+    /// `io::Error::other(KILL_SENTINEL)` so the outer `run_one`
+    /// matcher maps it to [`CoordinatorError::Aborted`]
+    /// (`PLAN_responsiveness.md` §2.1).
+    kill_switch: Option<Arc<AtomicBool>>,
+    /// Optional passive counters used by throughput diagnostics to
+    /// split source-side sparse reads from bitmap waits.
+    source_metrics: Option<Arc<SourceReadMetrics>>,
+    /// When `true` the source size was not known up front (issue #8):
+    /// the reader ignores `total_size` and the bitmap and instead gates
+    /// on the growable sparse file's live high-water
+    /// (`MultiSparse::total_size`). EOF is `download_done && pos >= hw`.
+    unknown_size: bool,
+    /// Sequential write frontier for known-size **single-stream** mode
+    /// (`internal/PLAN_single_stream_concurrent_extract.md`). When set,
+    /// byte-availability is gated on this live frontier — the
+    /// scheduler's sequential `pwrite_at` position — instead of the
+    /// coarse `chunk_size` bitmap, so the decoder advances byte-for-byte
+    /// with the download rather than waiting for whole chunks (or, for
+    /// an archive ≤ `chunk_size`, the entire download). `None` for
+    /// parallel / random-access modes, where chunks complete out of
+    /// order and the bitmap is the only correct availability signal.
+    /// Ignored when `unknown_size` is set (that path uses the growable
+    /// high-water).
+    write_frontier: Option<Arc<AtomicU64>>,
+}
+
+impl BlockingSparseReader {
+    #[allow(clippy::too_many_arguments)]
+    fn new(
+        sparse: Arc<MultiSparse>,
+        bitmap: Arc<ChunkBitmap>,
+        chunk_size: u64,
+        total_size: u64,
+        start_offset: u64,
+        download_done: Arc<AtomicBool>,
+        download_outcome: Arc<Mutex<Option<Result<DownloadStats, SchedulerError>>>>,
+        poll_interval: Duration,
+    ) -> Self {
+        // Coordinator-level invariant: the cursor was set to
+        // start_offset before construction; we don't reset it here so
+        // the scheduler can't observe a transient regression.
+        let cursor = Arc::new(AtomicU64::new(start_offset));
+        Self {
+            sparse,
+            bitmap,
+            chunk_size,
+            total_size,
+            cursor,
+            download_done,
+            download_outcome,
+            poll_interval,
+            progress_state: None,
+            kill_switch: None,
+            source_metrics: None,
+            unknown_size: false,
+            write_frontier: None,
+        }
+    }
+
+    /// Switch the reader into unknown-size mode (issue #8): EOF and
+    /// byte-availability are driven by the growable sparse file's live
+    /// high-water rather than `total_size` and the chunk bitmap.
+    #[must_use]
+    fn with_unknown_size(mut self) -> Self {
+        self.unknown_size = true;
+        self
+    }
+
+    /// Drive a known-size **single-stream** read off the scheduler's
+    /// sequential write frontier instead of the chunk bitmap
+    /// (`internal/PLAN_single_stream_concurrent_extract.md`). The body
+    /// is written strictly `0..total_size` in order, so the frontier is
+    /// an exact, byte-granular availability signal — the bitmap's 4 MiB
+    /// chunk granularity would otherwise force the decoder to wait a
+    /// full chunk behind the download (and the whole download for an
+    /// archive ≤ `chunk_size`).
+    #[must_use]
+    fn with_write_frontier(mut self, frontier: Arc<AtomicU64>) -> Self {
+        self.write_frontier = Some(frontier);
+        self
+    }
+
+    /// Hook the reader up to a shared progress state so cursor
+    /// advances publish to `bytes_decoded_input`. Returns `self` for
+    /// chained construction.
+    #[must_use]
+    fn with_progress(mut self, state: Arc<ProgressState>) -> Self {
+        // Seed the progress state at the resume offset so the
+        // first lookahead query (before the first read) reads the
+        // correct value.
+        state.set_bytes_decoded_input(self.cursor.load(Ordering::Acquire));
+        self.progress_state = Some(state);
+        self
+    }
+
+    /// Hook the reader up to the run-wide kill switch. When the flag
+    /// flips, the next iteration of the read poll loop returns the
+    /// kill sentinel `io::Error` so the outer `run_one` matcher
+    /// surfaces a typed [`CoordinatorError::Aborted`]
+    /// (`PLAN_responsiveness.md` §2.1).
+    #[must_use]
+    fn with_kill_switch(mut self, kill: Arc<AtomicBool>) -> Self {
+        self.kill_switch = Some(kill);
+        self
+    }
+
+    /// Attach passive source-read instrumentation for diagnostics.
+    #[must_use]
+    fn with_source_metrics(mut self, metrics: Arc<SourceReadMetrics>) -> Self {
+        self.source_metrics = Some(metrics);
+        self
+    }
+}
+
+impl BlockingSparseReader {
+    /// Unknown-size read path (issue #8): there is no `total_size` and
+    /// no chunk bitmap, so availability and EOF are decided by the
+    /// growable sparse file's live high-water. A byte at `pos` is
+    /// readable once `pos < sparse.total_size()`; EOF is reached when
+    /// the download has finished and the cursor has caught up to the
+    /// final high-water.
+    fn read_unknown(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        if buf.is_empty() {
+            return Ok(0);
+        }
+        loop {
+            if let Some(flag) = self.kill_switch.as_ref() {
+                if flag.load(Ordering::Acquire) {
+                    return Err(io::Error::other(KILL_SENTINEL));
+                }
+            }
+            let pos = self.cursor.load(Ordering::Acquire);
+            let high_water = self.sparse.total_size();
+            if pos < high_water {
+                let want = (high_water - pos).min(buf.len() as u64) as usize;
+                let sparse_read_started = Instant::now();
+                let n = self
+                    .sparse
+                    .read_at(ByteOffset::new(pos), &mut buf[..want])
+                    .map_err(|e| io::Error::other(format!("sparse read: {e}")))?;
+                if let Some(metrics) = self.source_metrics.as_ref() {
+                    metrics.record_sparse_read(n as u64, sparse_read_started.elapsed());
+                }
+                if n == 0 {
+                    // The bytes up to `high_water` are durable by the
+                    // Release/Acquire edge on `pwrite_at`, so a zero read
+                    // below the high-water is not expected; re-poll
+                    // rather than report a spurious EOF.
+                    thread::sleep(self.poll_interval);
+                    continue;
+                }
+                let new_pos = self.cursor.fetch_add(n as u64, Ordering::Release) + n as u64;
+                if let Some(p) = self.progress_state.as_ref() {
+                    p.set_bytes_decoded_input(new_pos);
+                }
+                return Ok(n);
+            }
+            // Caught up to the writer. If the download is finished, a
+            // re-read of the high-water (it is published Release *before*
+            // `download_done`) tells us whether this is real EOF.
+            if self.download_done.load(Ordering::Acquire) {
+                if pos >= self.sparse.total_size() {
+                    // Surface a download-side error if there is one, but
+                    // leave a successful `Ok(stats)` in the slot: the
+                    // coordinator reads it after the reader hits EOF to
+                    // report `bytes_downloaded`. An unconditional `take()`
+                    // here drops the `Ok` and the run reports `0 bytes
+                    // downloaded` (same contract as
+                    // `wait_for_download_complete`).
+                    if let Ok(mut slot) = self.download_outcome.lock() {
+                        if matches!(slot.as_ref(), Some(Err(_))) {
+                            if let Some(Err(e)) = slot.take() {
+                                return Err(io::Error::other(e));
+                            }
+                        }
+                    }
+                    return Ok(0);
+                }
+                // The high-water advanced between the two loads; read it.
+                continue;
+            }
+            if let Some(metrics) = self.source_metrics.as_ref() {
+                metrics.record_poll_sleep();
+            }
+            thread::sleep(self.poll_interval);
+        }
+    }
+
+    /// Known-size **single-stream** read path
+    /// (`internal/PLAN_single_stream_concurrent_extract.md`). The body
+    /// is written strictly sequentially `0..total_size`, so
+    /// byte-availability is the scheduler's live write frontier — far
+    /// finer than the `chunk_size` bitmap the default path gates on.
+    /// Structurally this mirrors [`Self::read_unknown`], but EOF is the
+    /// known `total_size` and the frontier (not the growable
+    /// high-water) is the availability signal.
+    fn read_sequential(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        if buf.is_empty() {
+            return Ok(0);
+        }
+        // INVARIANT: `read` only dispatches here when `write_frontier`
+        // is `Some` (set via `with_write_frontier` for single-stream).
+        let Some(frontier) = self.write_frontier.clone() else {
+            return Err(io::Error::other(
+                "read_sequential entered without a write frontier",
+            ));
+        };
+        // Time spent blocked on the network within this `read` call.
+        // Mirrors the bitmap path's `record_wait` accounting so
+        // `RunStats::source_wait_time` reflects genuine source-wait time
+        // during concurrent single-stream extraction (rather than the
+        // old "0 because everything was already on disk").
+        let mut wait_started: Option<Instant> = None;
+        loop {
+            if let Some(flag) = self.kill_switch.as_ref() {
+                if flag.load(Ordering::Acquire) {
+                    if let (Some(metrics), Some(started)) =
+                        (self.source_metrics.as_ref(), wait_started.take())
+                    {
+                        metrics.record_wait(started.elapsed());
+                    }
+                    return Err(io::Error::other(KILL_SENTINEL));
+                }
+            }
+            let pos = self.cursor.load(Ordering::Acquire);
+            if pos >= self.total_size {
+                return Ok(0);
+            }
+            let high_water = frontier.load(Ordering::Acquire);
+            if pos < high_water {
+                if let (Some(metrics), Some(started)) =
+                    (self.source_metrics.as_ref(), wait_started.take())
+                {
+                    metrics.record_wait(started.elapsed());
+                }
+                let want = (high_water - pos)
+                    .min(self.total_size - pos)
+                    .min(buf.len() as u64) as usize;
+                let sparse_read_started = Instant::now();
+                let n = self
+                    .sparse
+                    .read_at(ByteOffset::new(pos), &mut buf[..want])
+                    .map_err(|e| io::Error::other(format!("sparse read: {e}")))?;
+                if let Some(metrics) = self.source_metrics.as_ref() {
+                    metrics.record_sparse_read(n as u64, sparse_read_started.elapsed());
+                }
+                if n == 0 {
+                    // Bytes below the frontier are durable by the
+                    // Release/Acquire edge on the scheduler's
+                    // `pwrite_at`/`store`, so a zero read here is not
+                    // expected; re-poll rather than report spurious EOF.
+                    thread::sleep(self.poll_interval);
+                    continue;
+                }
+                let new_pos = self.cursor.fetch_add(n as u64, Ordering::Release) + n as u64;
+                if let Some(p) = self.progress_state.as_ref() {
+                    p.set_bytes_decoded_input(new_pos);
+                }
+                return Ok(n);
+            }
+            // Caught up to the writer. If the download finished, decide
+            // real EOF vs. a short body. The frontier is published
+            // `Release` *before* `download_done`, so re-reading it after
+            // observing `download_done` cannot miss a final advance.
+            if self.download_done.load(Ordering::Acquire) {
+                if pos < frontier.load(Ordering::Acquire) {
+                    continue;
+                }
+                if let (Some(metrics), Some(started)) =
+                    (self.source_metrics.as_ref(), wait_started.take())
+                {
+                    metrics.record_wait(started.elapsed());
+                }
+                if let Ok(mut slot) = self.download_outcome.lock() {
+                    // Only take a download-side *error*; leave a
+                    // successful `Ok(stats)` in the slot for the
+                    // coordinator to report (see `read_unknown`). Preserve
+                    // the typed SchedulerError as the io::Error source so
+                    // the outer retry path can walk `Error::source()`
+                    // (same contract as the bitmap path below).
+                    if matches!(slot.as_ref(), Some(Err(_))) {
+                        if let Some(Err(e)) = slot.take() {
+                            return Err(io::Error::other(e));
+                        }
+                    }
+                }
+                if pos < self.total_size {
+                    return Err(io::Error::new(
+                        io::ErrorKind::UnexpectedEof,
+                        format!(
+                            "download finished but only {pos} of {} bytes are available",
+                            self.total_size
+                        ),
+                    ));
+                }
+                return Ok(0);
+            }
+            if wait_started.is_none() {
+                wait_started = Some(Instant::now());
+            }
+            if let Some(metrics) = self.source_metrics.as_ref() {
+                metrics.record_poll_sleep();
+            }
+            thread::sleep(self.poll_interval);
+        }
+    }
+}
+
+impl Read for BlockingSparseReader {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        if self.unknown_size {
+            return self.read_unknown(buf);
+        }
+        if self.write_frontier.is_some() {
+            return self.read_sequential(buf);
+        }
+        // §1.3: enter a debug-level span around the source-read poll
+        // loop so a stuck decoder shows up in the per-component
+        // breakdown when the operator runs with `RUST_LOG=peel=debug`.
+        // The span itself is filtered at default INFO and costs an
+        // atomic-load + branch per `read`.
+        let initial_pos = self.cursor.load(Ordering::Acquire);
+        let span = tracing::debug_span!(
+            target: "peel::reader",
+            "blocking_sparse_read",
+            cursor = initial_pos,
+            buf_len = buf.len(),
+        );
+        let _enter = span.enter();
+        // §2.1: poll the kill switch immediately on entry — the most
+        // common stall site for the snapshot-restore bug was a decoder
+        // that called into this read repeatedly without the surrounding
+        // checkpoint observer ever firing, so SIGTERM had nowhere else
+        // to land. Returning the kill sentinel here propagates as
+        // `DecodeError::Read` and the outer `run_one` matcher maps it
+        // to `CoordinatorError::Aborted`.
+        if let Some(flag) = self.kill_switch.as_ref() {
+            if flag.load(Ordering::Acquire) {
+                return Err(io::Error::other(KILL_SENTINEL));
+            }
+        }
+        // §2.5 (PLAN_decoder_freeze.md): one-shot diagnostic when the
+        // poll loop has been waiting on the same chunk for too long.
+        // The §2.4b watchdog fires from the renderer thread to flag
+        // *that* a `decode_step` is hung; this dump prints the bitmap
+        // state local to the read so we can distinguish:
+        //   - gap   : `bitmap[N] = false` but `bitmap[N+1..]` = true
+        //             → something orphaned a chunk in `dispatched`
+        //   - cliff : `bitmap[N..] = false`
+        //             → scheduler isn't dispatching N (likely the
+        //               throttle-deadlock pattern)
+        //   - other : `next_incomplete_after(N)` returns something
+        //             unexpected → bitmap consistency bug
+        // Local to the read invocation: each fresh `read()` resets the
+        // counter, so a healthy short wait never triggers it.
+        let read_started = Instant::now();
+        let mut last_dump_at: Option<Instant> = None;
+        let dump_interval = Duration::from_secs(30);
+        let mut wait_started: Option<Instant> = None;
+        loop {
+            let pos = self.cursor.load(Ordering::Acquire);
+            if pos >= self.total_size {
+                return Ok(0);
+            }
+
+            // Identify the chunk this position lives in. If chunk_size
+            // is somehow zero we already rejected at config time, but
+            // we still saturate to avoid div-by-zero.
+            if self.chunk_size == 0 {
+                return Err(io::Error::other("zero chunk_size"));
+            }
+            let chunk_idx = (pos / self.chunk_size) as u32;
+            if !self.bitmap.is_complete(ChunkIndex::new(chunk_idx)) {
+                if wait_started.is_none() {
+                    wait_started = Some(Instant::now());
+                }
+                if self.download_done.load(Ordering::Acquire) {
+                    if let (Some(metrics), Some(started)) =
+                        (self.source_metrics.as_ref(), wait_started.take())
+                    {
+                        metrics.record_wait(started.elapsed());
+                    }
+                    if let Ok(mut slot) = self.download_outcome.lock() {
+                        // Only take a download-side *error*; a successful
+                        // `Ok(stats)` is left for the coordinator to report
+                        // (see `read_unknown`). Wrap the typed scheduler
+                        // error as the io::Error source rather than
+                        // stringifying it: the outer-loop retry path in
+                        // `main` walks `Error::source()` and matches on the
+                        // `SchedulerError` / `WorkerError` types to decide
+                        // whether to restart from checkpoint; collapsing to
+                        // a `String` here would erase that.
+                        if matches!(slot.as_ref(), Some(Err(_))) {
+                            if let Some(Err(e)) = slot.take() {
+                                return Err(io::Error::other(e));
+                            }
+                        }
+                    }
+                    return Err(io::Error::new(
+                        io::ErrorKind::UnexpectedEof,
+                        format!(
+                            "download finished but chunk {chunk_idx} (cursor {pos}) is not \
+                             complete"
+                        ),
+                    ));
+                }
+                // §2.5 diagnostic: once we've been waiting `dump_interval`
+                // (or `2 × dump_interval`, `3 ×`, …) on the same `read()`
+                // invocation, dump the bitmap state around the cursor
+                // chunk. Cheap (a handful of atomic loads) and scoped
+                // to a true wedge.
+                let elapsed = read_started.elapsed();
+                if elapsed >= dump_interval {
+                    let should_dump = last_dump_at.is_none_or(|prev| {
+                        Instant::now().saturating_duration_since(prev) >= dump_interval
+                    });
+                    if should_dump {
+                        last_dump_at = Some(Instant::now());
+                        let next_incomplete = self
+                            .bitmap
+                            .next_incomplete_after(ChunkIndex::new(chunk_idx))
+                            .map(ChunkIndex::get);
+                        let mut neighbors: Vec<u8> = Vec::with_capacity(13);
+                        let lo = chunk_idx.saturating_sub(2);
+                        let hi = chunk_idx.saturating_add(10);
+                        for i in lo..=hi {
+                            neighbors.push(u8::from(self.bitmap.is_complete(ChunkIndex::new(i))));
+                        }
+                        tracing::warn!(
+                            target: "peel::reader",
+                            cursor = pos,
+                            chunk_idx,
+                            elapsed_secs = elapsed.as_secs(),
+                            next_incomplete = ?next_incomplete,
+                            window_lo = lo,
+                            window_hi = hi,
+                            neighbors = ?neighbors,
+                            "blocking_sparse_read stuck waiting for chunk: \
+                             cursor at byte {pos} (chunk {chunk_idx}), waiting {} s; \
+                             next_incomplete_after={next_incomplete:?}; \
+                             chunks [{lo}..={hi}]={neighbors:?}",
+                            elapsed.as_secs(),
+                        );
+                    }
+                }
+                // §2.1: a decoder waiting for the next chunk to arrive
+                // can sit here indefinitely on a slow network. Polling
+                // before sleeping bounds the kill-switch latency to one
+                // `poll_interval` (default 5 ms).
+                if let Some(flag) = self.kill_switch.as_ref() {
+                    if flag.load(Ordering::Acquire) {
+                        if let (Some(metrics), Some(started)) =
+                            (self.source_metrics.as_ref(), wait_started.take())
+                        {
+                            metrics.record_wait(started.elapsed());
+                        }
+                        return Err(io::Error::other(KILL_SENTINEL));
+                    }
+                }
+                if let Some(metrics) = self.source_metrics.as_ref() {
+                    metrics.record_poll_sleep();
+                }
+                thread::sleep(self.poll_interval);
+                continue;
+            }
+            if let (Some(metrics), Some(started)) =
+                (self.source_metrics.as_ref(), wait_started.take())
+            {
+                metrics.record_wait(started.elapsed());
+            }
+
+            let want = self.total_size.saturating_sub(pos).min(buf.len() as u64) as usize;
+            // Also stop at the end of the current chunk so we don't
+            // accidentally read into a chunk that hasn't been claimed
+            // yet.
+            let chunk_end = u64::from(chunk_idx)
+                .saturating_add(1)
+                .saturating_mul(self.chunk_size)
+                .min(self.total_size);
+            let chunk_remaining = chunk_end.saturating_sub(pos) as usize;
+            let want = want.min(chunk_remaining);
+            if want == 0 {
+                return Ok(0);
+            }
+            let sparse_read_started = Instant::now();
+            let n = self
+                .sparse
+                .read_at(ByteOffset::new(pos), &mut buf[..want])
+                .map_err(|e| io::Error::other(format!("sparse read: {e}")))?;
+            if let Some(metrics) = self.source_metrics.as_ref() {
+                metrics.record_sparse_read(n as u64, sparse_read_started.elapsed());
+            }
+            if n == 0 {
+                // Defensive: the sparse file is sized to total_size, so
+                // a short read of zero here is unexpected. Surface as
+                // an io error rather than spinning.
+                return Err(io::Error::new(
+                    io::ErrorKind::UnexpectedEof,
+                    format!("short read from sparse file at offset {pos}"),
+                ));
+            }
+            let new_pos = self.cursor.fetch_add(n as u64, Ordering::Release) + n as u64;
+            if let Some(p) = self.progress_state.as_ref() {
+                p.set_bytes_decoded_input(new_pos);
+            }
+            return Ok(n);
+        }
+    }
+}
+
+/// Pick the decoder factory the run should use, applying (in order):
+///
+/// 1. `config.forced_format` — short-circuit, no sniffing.
+/// 2. URL-suffix lookup against the registry.
+/// 3. Magic-byte lookup against the first
+///    `min(chunk_size, max_magic_window)` bytes of the source. Sniffing
+///    waits for the chunks covering that prefix to be downloaded.
+/// 4. Conflict resolution:
+///    - both lookups agree → use that factory;
+///    - both lookups disagree → return [`CoordinatorError::FormatMismatch`]
+///      unless `config.force_format_from_magic` is set, in which case
+///      the magic wins and a warning is emitted;
+///    - only one lookup matched → use it;
+///    - neither matched → return [`CoordinatorError::NoDecoder`].
+#[allow(clippy::too_many_arguments)]
+fn select_decoder_factory(
+    registry: &DecoderRegistry,
+    info: &DownloadInfo,
+    config: &CoordinatorConfig,
+    sparse: &MultiSparse,
+    bitmap: &ChunkBitmap,
+    download_done: &Arc<AtomicBool>,
+    download_outcome: &Arc<Mutex<Option<Result<DownloadStats, SchedulerError>>>>,
+    kill_switch: Option<&Arc<AtomicBool>>,
+    write_frontier: Option<&Arc<AtomicU64>>,
+) -> Result<(FormatShape, DecoderFactory), CoordinatorError> {
+    if let Some(name) = config.forced_format.as_deref() {
+        let factory = registry.factory_for_format_name(name).ok_or_else(|| {
+            CoordinatorError::UnknownFormatName {
+                name: name.to_string(),
+                available: registry
+                    .format_names()
+                    .into_iter()
+                    .map(String::from)
+                    .collect(),
+            }
+        })?;
+        let shape = registry
+            .shape_for_format_name(name)
+            // INVARIANT: factory_for_format_name returned Some(_) for `name`
+            // above, so shape_for_format_name (same lookup table) cannot miss.
+            .unwrap_or(FormatShape::Tree);
+        return Ok((shape, factory));
+    }
+
+    let suffix_lookup = registry
+        .lookup_by_name(
+            Path::new(info.url.path())
+                .file_name()
+                .and_then(|s| s.to_str())
+                .unwrap_or(""),
+        )
+        .or_else(|| filename_from_url(&info.url).and_then(|n| registry.lookup_by_name(&n)));
+
+    // The plan calls for sniffing the first
+    // `min(chunk_size, max_magic_window)` bytes — but
+    // `max_magic_window` is small (≤ a few hundred bytes for every
+    // currently-registered format) and chunk_size is megabytes, so
+    // `max_magic_window` always wins. We still cap by `total_size`
+    // for the rare archive shorter than the magic window.
+    let max_window = registry.max_magic_window();
+    let prefix = if max_window == 0 {
+        Vec::new()
+    } else {
+        sniff_prefix(
+            sparse,
+            bitmap,
+            config.chunk_size,
+            info.total_size,
+            max_window,
+            download_done,
+            download_outcome,
+            config.reader_poll_interval,
+            kill_switch,
+            !info.size_known,
+            write_frontier,
+        )?
+    };
+    let magic_lookup = registry.lookup_by_prefix(&prefix);
+
+    match (suffix_lookup, magic_lookup) {
+        (Some((shape, s)), Some((_, m))) if std::ptr::fn_addr_eq(s, m) => Ok((shape, s)),
+        (Some((suffix_shape, s)), Some((magic_shape, m))) => {
+            let suffix_name = registry.name_for_factory(s).map(String::from);
+            let magic_name = registry.name_for_factory(m).map(String::from);
+            if config.force_format_from_magic {
+                // User-facing notice. We don't pull in `tracing` for
+                // this single call site — the rest of the binary uses
+                // `eprintln!` for user-visible output (see main.rs)
+                // and this is unambiguously user-facing rather than
+                // diagnostic logging.
+                eprintln!(
+                    "[warn] format-detection conflict: URL suffix indicates {} but \
+                     magic bytes indicate {}; using {} per --force-format-from-magic",
+                    suffix_name.as_deref().unwrap_or("?"),
+                    magic_name.as_deref().unwrap_or("?"),
+                    magic_name.as_deref().unwrap_or("?"),
+                );
+                // Magic wins: shape from magic too. A `.tar.zst` URL
+                // forced to magic (zstd) loses the Tree wrapping
+                // information; the user opted into this with
+                // --force-format-from-magic.
+                let _ = suffix_shape;
+                Ok((magic_shape, m))
+            } else {
+                Err(CoordinatorError::FormatMismatch {
+                    suffix_format: suffix_name,
+                    magic_format: magic_name,
+                })
+            }
+        }
+        (Some((shape, s)), None) => Ok((shape, s)),
+        (None, Some((shape, m))) => Ok((shape, m)),
+        (None, None) => {
+            let filename =
+                filename_from_url(&info.url).unwrap_or_else(|| info.url.path().to_string());
+            Err(CoordinatorError::NoDecoder { filename })
+        }
+    }
+}
+
+/// Derive the [`RunMode`] for the current run from
+/// [`CoordinatorConfig`] (`internal/PLAN_download_modes.md` §5).
+///
+/// Stamped on every checkpoint the coordinator writes so a
+/// later resume with a different mode surfaces
+/// [`CheckpointError::ModeMismatch`] before it can lose progress.
+fn current_run_mode(config: &CoordinatorConfig) -> RunMode {
+    if config.no_extract {
+        RunMode::NoExtract
+    } else if config.keep_archive.is_some() {
+        RunMode::KeepArchive
+    } else {
+        RunMode::Extract
+    }
+}
+
+/// Derive the on-disk path where the `--no-extract` §4 fallback
+/// should rename `.peel.part` when format detection misses.
+///
+/// The URL basename is used directly (with the `.partNNNN`
+/// multi-URL suffix stripped if present) so the user gets the
+/// remote object under its natural name. The path is placed in the
+/// same directory as the user-supplied `-o` value — siblings of the
+/// (legacy default) directory the unknown-format path created
+/// up-front — so a `peel https://host/foo.bin -o ./out/` invocation
+/// lands the bytes at `./foo.bin` rather than overwriting `./out`.
+fn fallback_no_extract_path(info: &DownloadInfo, output: &OutputTarget) -> PathBuf {
+    let basename = filename_from_url(&info.url).unwrap_or_else(|| info.url.path().to_string());
+    let depart = {
+        // Same conservative `.partNNNN` strip as the CLI helper.
+        let lower = basename.to_ascii_lowercase();
+        match lower.rfind(".part") {
+            Some(idx) => {
+                let tail = &basename[idx + ".part".len()..];
+                if !tail.is_empty() && tail.bytes().all(|b| b.is_ascii_digit()) {
+                    &basename[..idx]
+                } else {
+                    basename.as_str()
+                }
+            }
+            None => basename.as_str(),
+        }
+    };
+    let parent: PathBuf = match output {
+        OutputTarget::File(p) | OutputTarget::Dir(p) => {
+            p.parent().map(PathBuf::from).unwrap_or_else(PathBuf::new)
+        }
+    };
+    parent.join(depart)
+}
+
+/// Verify that the resolved [`FormatShape`] matches the
+/// [`OutputTarget`] variant the user supplied. Surfaces a typed
+/// [`CoordinatorError::OutputShapeMismatch`] before any pipeline
+/// kicks off (`internal/PLAN_download_modes.md` §1 / §6).
+///
+/// The CLI's unified `-o` resolver pre-validates against suffix and
+/// `--format` lookups, but magic detection can still flip the shape
+/// (a `.bin` URL whose first bytes match zstd magic produces Stream
+/// shape regardless of the suffix). This check is the second line of
+/// defence — it runs after magic detection but before extraction
+/// starts.
+fn verify_output_shape(shape: FormatShape, output: &OutputTarget) -> Result<(), CoordinatorError> {
+    match (shape, output) {
+        (FormatShape::Tree, OutputTarget::Dir(_)) => Ok(()),
+        (FormatShape::Stream, OutputTarget::File(_)) => Ok(()),
+        (FormatShape::Tree, OutputTarget::File(path)) => {
+            Err(CoordinatorError::OutputShapeMismatch {
+                shape,
+                path: path.clone(),
+                detail: format!(
+                    "format produces a directory tree but `-o {}` is a file path. \
+                     Pass a directory path (trailing slash optional) instead.",
+                    path.display(),
+                ),
+            })
+        }
+        (FormatShape::Stream, OutputTarget::Dir(path)) => {
+            Err(CoordinatorError::OutputShapeMismatch {
+                shape,
+                path: path.clone(),
+                detail: format!(
+                    "format produces a single file but `-o {}` is a directory path. \
+                     Pass a file path (without trailing slash) instead.",
+                    path.display(),
+                ),
+            })
+        }
+    }
+}
+
+/// `pub(crate)` re-export so [`crate::coordinator::local::run`]
+/// can validate the format-vs-output-target pairing using the
+/// same logic as the HTTP path. Local mode runs the check inside
+/// the coordinator (after magic detection, before sink open) for
+/// the same reason the HTTP path does — magic detection can flip
+/// the format shape, and we want the typed error before any sink
+/// IO happens.
+pub(crate) fn verify_output_shape_local(
+    shape: FormatShape,
+    output: &OutputTarget,
+) -> Result<(), CoordinatorError> {
+    verify_output_shape(shape, output)
+}
+
+/// Block until the download thread sets `download_done`, polling the
+/// kill switch so a SIGTERM unblocks promptly. Used by the unknown-size
+/// random-access path (issue #8), which must have the whole archive on
+/// disk before the pipeline can read its trailer / central directory.
+///
+/// Surfaces a download-side failure as [`CoordinatorError::Scheduler`]
+/// and a kill as [`CoordinatorError::Aborted`]. On success the
+/// `download_outcome` slot is left intact (only an error is taken) so
+/// the caller can still read the download stats afterwards.
+fn wait_for_download_complete(
+    download_done: &Arc<AtomicBool>,
+    download_outcome: &Arc<Mutex<Option<Result<DownloadStats, SchedulerError>>>>,
+    poll_interval: Duration,
+    kill_switch: Option<&Arc<AtomicBool>>,
+) -> Result<(), CoordinatorError> {
+    loop {
+        if let Some(flag) = kill_switch {
+            if flag.load(Ordering::Acquire) {
+                return Err(CoordinatorError::Aborted {
+                    checkpoints_written: 0,
+                });
+            }
+        }
+        if download_done.load(Ordering::Acquire) {
+            if let Ok(mut slot) = download_outcome.lock() {
+                if matches!(slot.as_ref(), Some(Err(_))) {
+                    if let Some(Err(e)) = slot.take() {
+                        return Err(CoordinatorError::Scheduler(e));
+                    }
+                }
+            }
+            return Ok(());
+        }
+        thread::sleep(poll_interval);
+    }
+}
+
+/// Wait for the chunks covering `[0, min(max_window, total_size))` to
+/// be marked complete in `bitmap`, then read the prefix from `sparse`.
+///
+/// Returns a buffer that may be shorter than `max_window` if the
+/// source itself is smaller. Surfaces a typed
+/// [`CoordinatorError::Scheduler`] / [`CoordinatorError::Io`] if the
+/// download thread finished before chunk 0 became available.
+#[allow(clippy::too_many_arguments)]
+fn sniff_prefix(
+    sparse: &MultiSparse,
+    bitmap: &ChunkBitmap,
+    chunk_size: u64,
+    total_size: u64,
+    max_window: usize,
+    download_done: &Arc<AtomicBool>,
+    download_outcome: &Arc<Mutex<Option<Result<DownloadStats, SchedulerError>>>>,
+    poll_interval: Duration,
+    kill_switch: Option<&Arc<AtomicBool>>,
+    unknown_size: bool,
+    write_frontier: Option<&Arc<AtomicU64>>,
+) -> Result<Vec<u8>, CoordinatorError> {
+    if max_window == 0 || chunk_size == 0 {
+        return Ok(Vec::new());
+    }
+    if !unknown_size && total_size == 0 {
+        return Ok(Vec::new());
+    }
+    // For an unknown-size source `total_size` is `0` and meaningless; we
+    // want the first `max_window` bytes (or fewer if the body is shorter).
+    let want = if unknown_size {
+        max_window as u64
+    } else {
+        (max_window as u64).min(total_size)
+    };
+    // §1.3: span around the sniff-prefix poll so a slow first chunk is
+    // visible in the per-component breakdown.
+    let span = tracing::debug_span!(target: "peel::sniff", "sniff_prefix", want, unknown_size);
+    let _enter = span.enter();
+
+    if unknown_size {
+        // No bitmap to wait on: poll the growable file's live high-water
+        // until it covers `want`, or the download finishes (a body
+        // shorter than the magic window reads short).
+        loop {
+            if let Some(flag) = kill_switch {
+                if flag.load(Ordering::Acquire) {
+                    return Err(CoordinatorError::Aborted {
+                        checkpoints_written: 0,
+                    });
+                }
+            }
+            if sparse.total_size() >= want {
+                break;
+            }
+            if download_done.load(Ordering::Acquire) {
+                if let Ok(slot) = download_outcome.lock() {
+                    if let Some(Err(e)) = &*slot {
+                        return Err(CoordinatorError::Io {
+                            path: PathBuf::from("<sniff-prefix>"),
+                            source: io::Error::new(
+                                io::ErrorKind::UnexpectedEof,
+                                format!("download failed: {e}"),
+                            ),
+                        });
+                    }
+                }
+                // Clean finish with fewer than `want` bytes — read what
+                // arrived.
+                break;
+            }
+            thread::sleep(poll_interval);
+        }
+    } else if let Some(frontier) = write_frontier {
+        // Known-size single-stream: the body is written sequentially
+        // `0..total_size`, so poll the scheduler's live write frontier
+        // until it covers `want` rather than waiting on the chunk
+        // bitmap — whose only completion for an archive ≤ chunk_size is
+        // the post-download mark, which would stall format detection
+        // (and therefore extraction) until the whole download finished
+        // (`internal/PLAN_single_stream_concurrent_extract.md`).
+        loop {
+            if let Some(flag) = kill_switch {
+                if flag.load(Ordering::Acquire) {
+                    return Err(CoordinatorError::Aborted {
+                        checkpoints_written: 0,
+                    });
+                }
+            }
+            if frontier.load(Ordering::Acquire) >= want {
+                break;
+            }
+            if download_done.load(Ordering::Acquire) {
+                // Re-read the frontier (published `Release` before
+                // `download_done`) before concluding it fell short.
+                if frontier.load(Ordering::Acquire) >= want {
+                    break;
+                }
+                if let Ok(slot) = download_outcome.lock() {
+                    if let Some(Err(e)) = &*slot {
+                        return Err(CoordinatorError::Io {
+                            path: PathBuf::from("<sniff-prefix>"),
+                            source: io::Error::new(
+                                io::ErrorKind::UnexpectedEof,
+                                format!("download failed: {e}"),
+                            ),
+                        });
+                    }
+                }
+                // Clean finish with fewer than `want` bytes — read what
+                // arrived (a body shorter than the magic window).
+                break;
+            }
+            thread::sleep(poll_interval);
+        }
+    } else {
+        // Number of chunks required to cover offset 0..want. For typical
+        // configs this is exactly 1 (chunk_size ≫ max_window).
+        // INVARIANT: chunk_size > 0 (checked above) so div_ceil is sound.
+        let chunks_needed = u32::try_from(want.div_ceil(chunk_size).max(1)).unwrap_or(u32::MAX);
+        for i in 0..chunks_needed {
+            let idx = ChunkIndex::new(i);
+            loop {
+                // §2.2: a SIGTERM during sniff (slow connect / TLS / DNS)
+                // would otherwise hang until the chunk arrives. Surface
+                // the kill switch as a typed `Aborted` with zero
+                // checkpoints written, since nothing has been persisted
+                // at this point in the run.
+                if let Some(flag) = kill_switch {
+                    if flag.load(Ordering::Acquire) {
+                        return Err(CoordinatorError::Aborted {
+                            checkpoints_written: 0,
+                        });
+                    }
+                }
+                if bitmap.is_complete(idx) {
+                    break;
+                }
+                if download_done.load(Ordering::Acquire) {
+                    let detail = match download_outcome.lock() {
+                        Ok(slot) => match &*slot {
+                            Some(Err(e)) => format!("download failed: {e}"),
+                            _ => format!(
+                                "download finished but chunk {i} (needed for format detection) \
+                                 is not complete"
+                            ),
+                        },
+                        Err(_) => "download outcome poisoned".to_string(),
+                    };
+                    return Err(CoordinatorError::Io {
+                        path: PathBuf::from("<sniff-prefix>"),
+                        source: io::Error::new(io::ErrorKind::UnexpectedEof, detail),
+                    });
+                }
+                thread::sleep(poll_interval);
+            }
+        }
+    }
+    // INVARIANT: want <= usize::MAX because want <= max_window: usize.
+    let mut buf = vec![0u8; want as usize];
+    let n = sparse
+        .read_at(ByteOffset::ZERO, &mut buf)
+        .map_err(CoordinatorError::SparseFile)?;
+    buf.truncate(n);
+    Ok(buf)
+}
+
+// Marker re-export so the unused-import warning doesn't fire when the
+// `Read` import is only used through trait dispatch.
+#[allow(dead_code)]
+const _: fn() = || {
+    let _ = NoopPuncher::new();
+};
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    use std::sync::atomic::AtomicU64;
+
+    static UNIQ: AtomicU64 = AtomicU64::new(0);
+
+    fn unique_temp(label: &str) -> PathBuf {
+        let pid = std::process::id();
+        let n = UNIQ.fetch_add(1, Ordering::Relaxed);
+        let nanos = SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+        std::env::temp_dir().join(format!("peel_coord_unit_{label}_{pid}_{nanos}_{n}"))
+    }
+
+    fn sample_info(total_size: u64) -> DownloadInfo {
+        let url = Url::parse("https://example.com/x.tar.zst").expect("parse");
+        let fingerprint = SourceFingerprint {
+            etag: Some("\"abc\"".into()),
+            last_modified: None,
+        };
+        let source = crate::download::MultiPartSource::from_single(
+            url.clone(),
+            total_size,
+            fingerprint.clone(),
+            None,
+        )
+        .expect("non-zero size");
+        DownloadInfo {
+            url,
+            total_size,
+            fingerprint,
+            accept_ranges: true,
+            size_known: true,
+            source,
+        }
+    }
+
+    fn sample_checkpoint(url: &str, total_size: u64, chunk_size: u64) -> Checkpoint {
+        let etag = Some("\"abc\"".to_string());
+        Checkpoint {
+            url: url.into(),
+            etag: etag.clone(),
+            last_modified: None,
+            parts: vec![crate::checkpoint::PartRecord {
+                url: url.into(),
+                size: total_size,
+                etag,
+                last_modified: None,
+                expected_sha256: None,
+                volume_role: None,
+            }],
+            total_size,
+            chunk_size,
+            decoder_position: ByteOffset::new(0),
+            bitmap_completed: vec![],
+            created_at: SystemTime::now(),
+            sink_state: SinkState::Tar {
+                members_completed: vec![],
+                in_flight: None,
+            },
+            hash_state: None,
+            chunk_crc32c: None,
+            decoder_state: None,
+            mode: RunMode::Extract,
+            source_mtime: None,
+            cumulative_elapsed: Duration::ZERO,
+        }
+    }
+
+    // ---- Phase 2: rate-aware byte floor ------------------------------
+
+    #[test]
+    fn rate_aware_floor_returns_configured_at_low_rate() {
+        // 10 Mbps = 1.25 MB/s. Target 200 ms ⇒ scaled = 250 KiB.
+        // Configured floor 8 MiB ⇒ configured wins.
+        let floor = rate_aware_floor(
+            8 * 1024 * 1024,
+            10_000_000.0 / 8.0,
+            Duration::from_millis(200),
+        );
+        assert_eq!(floor, 8 * 1024 * 1024);
+    }
+
+    #[test]
+    fn rate_aware_floor_returns_scaled_at_high_rate() {
+        // 10 Gbps = 1.25 GB/s. Target 200 ms ⇒ scaled = 250 MB ≈
+        // 238 MiB. Configured floor 8 MiB ⇒ scaled wins by ~30x.
+        let bps = 10_000_000_000.0 / 8.0;
+        let floor = rate_aware_floor(8 * 1024 * 1024, bps, Duration::from_millis(200));
+        assert!(
+            floor > 200 * 1024 * 1024 && floor < 260 * 1024 * 1024,
+            "floor={floor}, expected ~250 MB",
+        );
+        assert!(
+            floor > 8 * 1024 * 1024,
+            "scaled floor must exceed the configured floor at 10 Gbps",
+        );
+    }
+
+    #[test]
+    fn rate_aware_floor_disabled_by_zero_target() {
+        let bps = 10_000_000_000.0 / 8.0;
+        let floor = rate_aware_floor(8 * 1024 * 1024, bps, Duration::ZERO);
+        assert_eq!(floor, 8 * 1024 * 1024, "ZERO target disables scaling");
+    }
+
+    #[test]
+    fn rate_aware_floor_handles_zero_and_negative_rates() {
+        // Implausible rates should not relax the floor below the
+        // configured value.
+        assert_eq!(
+            rate_aware_floor(8 * 1024 * 1024, 0.0, Duration::from_millis(200)),
+            8 * 1024 * 1024,
+        );
+        assert_eq!(
+            rate_aware_floor(8 * 1024 * 1024, -1.0, Duration::from_millis(200)),
+            8 * 1024 * 1024,
+        );
+        assert_eq!(
+            rate_aware_floor(8 * 1024 * 1024, f64::NAN, Duration::from_millis(200)),
+            8 * 1024 * 1024,
+        );
+    }
+
+    #[test]
+    fn realized_rate_returns_average_since_start() {
+        // Constant 1 GB/s stream: rate over any window equals bps.
+        let t0 = Instant::now();
+        let rate = RealizedRate::new(t0, 0);
+        let bps = 1_000_000_000.0;
+        for i in 1..=10u64 {
+            let now = t0 + Duration::from_millis(100 * i);
+            let bytes = (bps * (i as f64) * 0.1) as u64;
+            let measured = rate.rate(now, bytes);
+            let rel_err = (measured - bps).abs() / bps;
+            assert!(
+                rel_err < 0.001,
+                "sample {i}: measured={measured} expected={bps} rel_err={rel_err:.6}",
+            );
+        }
+    }
+
+    #[test]
+    fn realized_rate_handles_zero_elapsed() {
+        // Sampling at the constructor instant must not produce
+        // NaN/Inf — return 0.0 so the rate-aware floor falls back
+        // to the configured value.
+        let t0 = Instant::now();
+        let rate = RealizedRate::new(t0, 0);
+        let bps = rate.rate(t0, 1_000_000);
+        assert!(bps.is_finite());
+        assert_eq!(bps, 0.0);
+    }
+
+    #[test]
+    fn build_resume_plan_returns_fresh_when_no_checkpoint() {
+        let info = sample_info(1024);
+        let cfg = CoordinatorConfig::default();
+        let output = OutputTarget::Dir(PathBuf::from("/tmp/x"));
+        let plan = build_resume_plan(None, &info, "https://example.com/x.tar.zst", &cfg, &output)
+            .expect("plan");
+        assert!(matches!(plan, ResumePlan::Fresh));
+    }
+
+    #[test]
+    fn build_resume_plan_resumes_when_everything_matches() {
+        let info = sample_info(1024);
+        let cfg = CoordinatorConfig {
+            chunk_size: 256,
+            ..CoordinatorConfig::default()
+        };
+        let prior = sample_checkpoint("https://example.com/x.tar.zst", 1024, 256);
+        let output = OutputTarget::Dir(PathBuf::from("/tmp/x"));
+        let plan = build_resume_plan(
+            Some(&prior),
+            &info,
+            "https://example.com/x.tar.zst",
+            &cfg,
+            &output,
+        )
+        .expect("plan");
+        assert!(matches!(plan, ResumePlan::Resume { .. }));
+    }
+
+    #[test]
+    fn build_resume_plan_rejects_etag_change() {
+        let mut info = sample_info(1024);
+        info.fingerprint.etag = Some("\"changed\"".into());
+        let cfg = CoordinatorConfig {
+            chunk_size: 256,
+            ..CoordinatorConfig::default()
+        };
+        let prior = sample_checkpoint("https://example.com/x.tar.zst", 1024, 256);
+        let output = OutputTarget::Dir(PathBuf::from("/tmp/x"));
+        let err = build_resume_plan(
+            Some(&prior),
+            &info,
+            "https://example.com/x.tar.zst",
+            &cfg,
+            &output,
+        )
+        .expect_err("should reject");
+        match err {
+            CoordinatorError::SourceChanged { reason } => {
+                assert!(reason.contains("ETag") || reason.contains("etag"));
+            }
+            other => panic!("expected SourceChanged, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn build_resume_plan_rejects_size_change() {
+        let info = sample_info(2048);
+        let cfg = CoordinatorConfig {
+            chunk_size: 256,
+            ..CoordinatorConfig::default()
+        };
+        let prior = sample_checkpoint("https://example.com/x.tar.zst", 1024, 256);
+        let output = OutputTarget::Dir(PathBuf::from("/tmp/x"));
+        let err = build_resume_plan(
+            Some(&prior),
+            &info,
+            "https://example.com/x.tar.zst",
+            &cfg,
+            &output,
+        )
+        .expect_err("should reject");
+        match err {
+            CoordinatorError::SourceChanged { reason } => {
+                assert!(reason.contains("total_size"));
+            }
+            other => panic!("expected SourceChanged, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn build_resume_plan_rejects_url_mismatch() {
+        let info = sample_info(1024);
+        let cfg = CoordinatorConfig {
+            chunk_size: 256,
+            ..CoordinatorConfig::default()
+        };
+        let prior = sample_checkpoint("https://other.example/y.tar.zst", 1024, 256);
+        let output = OutputTarget::Dir(PathBuf::from("/tmp/x"));
+        let err = build_resume_plan(
+            Some(&prior),
+            &info,
+            "https://example.com/x.tar.zst",
+            &cfg,
+            &output,
+        )
+        .expect_err("should reject");
+        match err {
+            CoordinatorError::SourceChanged { reason } => {
+                assert!(reason.contains("URL"));
+            }
+            other => panic!("expected SourceChanged, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn build_resume_plan_rejects_sink_kind_mismatch() {
+        let info = sample_info(1024);
+        let cfg = CoordinatorConfig {
+            chunk_size: 256,
+            ..CoordinatorConfig::default()
+        };
+        // Prior was Tar, request is File.
+        let prior = sample_checkpoint("https://example.com/x.tar.zst", 1024, 256);
+        let output = OutputTarget::File(PathBuf::from("/tmp/y.bin"));
+        let err = build_resume_plan(
+            Some(&prior),
+            &info,
+            "https://example.com/x.tar.zst",
+            &cfg,
+            &output,
+        )
+        .expect_err("should reject");
+        assert!(matches!(err, CoordinatorError::SourceChanged { .. }));
+    }
+
+    #[test]
+    fn validate_part_file_errors_when_missing() {
+        let dir = unique_temp("validate_missing");
+        let _g = TmpDir(dir.clone());
+        fs::create_dir_all(&dir).expect("mkdir");
+        let ckpt = dir.join("out.bin.peel.ckpt");
+        fs::write(&ckpt, b"placeholder").expect("write ckpt");
+        let part = dir.join("out.bin.peel.part");
+        let err = validate_part_file(&ckpt, &part, 1024).expect_err("should reject");
+        match err {
+            CoordinatorError::CheckpointPartMismatch { reason, .. } => {
+                assert!(reason.contains("missing"), "got: {reason}");
+            }
+            other => panic!("expected CheckpointPartMismatch, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn validate_part_file_errors_when_undersized() {
+        let dir = unique_temp("validate_short");
+        let _g = TmpDir(dir.clone());
+        fs::create_dir_all(&dir).expect("mkdir");
+        let ckpt = dir.join("out.bin.peel.ckpt");
+        fs::write(&ckpt, b"placeholder").expect("write ckpt");
+        let part = dir.join("out.bin.peel.part");
+        fs::File::create(&part)
+            .expect("part create")
+            .set_len(512)
+            .expect("set_len");
+        let err = validate_part_file(&ckpt, &part, 1024).expect_err("should reject");
+        match err {
+            CoordinatorError::CheckpointPartMismatch { reason, .. } => {
+                assert!(
+                    reason.contains("512") && reason.contains("1024"),
+                    "got: {reason}"
+                );
+            }
+            other => panic!("expected CheckpointPartMismatch, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn validate_part_file_accepts_exact_size() {
+        let dir = unique_temp("validate_exact");
+        let _g = TmpDir(dir.clone());
+        fs::create_dir_all(&dir).expect("mkdir");
+        let ckpt = dir.join("out.bin.peel.ckpt");
+        fs::write(&ckpt, b"placeholder").expect("write ckpt");
+        let part = dir.join("out.bin.peel.part");
+        fs::File::create(&part)
+            .expect("part create")
+            .set_len(1024)
+            .expect("set_len");
+        validate_part_file(&ckpt, &part, 1024).expect("should accept");
+    }
+
+    #[test]
+    fn sidecar_paths_alongside_output_by_default() {
+        let cfg = CoordinatorConfig::default();
+        let output = OutputTarget::File(PathBuf::from("/tmp/peel_test/out.bin"));
+        let part = sidecar_path(&output, &cfg, ".peel.part");
+        let ckpt = sidecar_path(&output, &cfg, ".peel.ckpt");
+        assert_eq!(part, PathBuf::from("/tmp/peel_test/out.bin.peel.part"));
+        assert_eq!(ckpt, PathBuf::from("/tmp/peel_test/out.bin.peel.ckpt"));
+    }
+
+    #[test]
+    fn sidecar_paths_redirected_to_workdir_when_set() {
+        let cfg = CoordinatorConfig {
+            workdir: Some(PathBuf::from("/var/peel/work")),
+            ..CoordinatorConfig::default()
+        };
+        let output = OutputTarget::File(PathBuf::from("/tmp/peel_test/out.bin"));
+        let part = sidecar_path(&output, &cfg, ".peel.part");
+        assert_eq!(part, PathBuf::from("/var/peel/work/out.bin.peel.part"));
+    }
+
+    /// `internal/PLAN_multivolume_archives.md` §7 Phase 3: single-part
+    /// runs preserve the historical `.peel.part` filename (no number
+    /// suffix), so existing single-URL sidecars and checkpoints
+    /// keep their on-disk shape.
+    #[test]
+    fn multi_part_sidecar_paths_single_part_matches_legacy() {
+        let cfg = CoordinatorConfig::default();
+        let output = OutputTarget::File(PathBuf::from("/tmp/peel_test/out.bin"));
+        let v = multi_part_sidecar_paths(&output, &cfg, 1, ".peel.part");
+        assert_eq!(v.len(), 1);
+        assert_eq!(v[0], PathBuf::from("/tmp/peel_test/out.bin.peel.part"));
+    }
+
+    /// Phase 3 layout: multi-part runs append a zero-padded numeric
+    /// suffix. Minimum 3 digits even for small volume counts so the
+    /// canonical multi-volume naming is consistent.
+    #[test]
+    fn multi_part_sidecar_paths_three_part_layout() {
+        let cfg = CoordinatorConfig::default();
+        let output = OutputTarget::File(PathBuf::from("/tmp/peel_test/out.bin"));
+        let v = multi_part_sidecar_paths(&output, &cfg, 3, ".peel.part");
+        assert_eq!(v.len(), 3);
+        assert_eq!(v[0], PathBuf::from("/tmp/peel_test/out.bin.peel.part.001"));
+        assert_eq!(v[1], PathBuf::from("/tmp/peel_test/out.bin.peel.part.002"));
+        assert_eq!(v[2], PathBuf::from("/tmp/peel_test/out.bin.peel.part.003"));
+    }
+
+    /// Wider padding kicks in only when the count itself crosses
+    /// three digits — a 999-volume set is still `.001` .. `.999`,
+    /// 1000 becomes `.0001`. Sort order matches volume order, which
+    /// is what an `ls` of the workdir relies on.
+    #[test]
+    fn multi_part_sidecar_paths_width_scales_past_999() {
+        let cfg = CoordinatorConfig::default();
+        let output = OutputTarget::File(PathBuf::from("/tmp/x"));
+        let v = multi_part_sidecar_paths(&output, &cfg, 1234, ".peel.part");
+        assert_eq!(v.len(), 1234);
+        assert_eq!(v[0], PathBuf::from("/tmp/x.peel.part.0001"));
+        assert_eq!(v[1233], PathBuf::from("/tmp/x.peel.part.1234"));
+    }
+
+    #[test]
+    fn filename_from_url_extracts_basename() {
+        let u = Url::parse("https://host.example/path/to/file.tar.zst?cache=1").expect("parse");
+        assert_eq!(filename_from_url(&u).as_deref(), Some("file.tar.zst"));
+    }
+
+    #[test]
+    fn filename_from_url_returns_none_for_root() {
+        let u = Url::parse("https://host.example/").expect("parse");
+        assert!(filename_from_url(&u).is_none());
+    }
+
+    #[test]
+    fn blocking_reader_returns_zero_at_eof() {
+        // Build a tiny sparse file and matching bitmap; reader at the
+        // end of the file must return Ok(0) immediately without
+        // touching the bitmap.
+        let path = unique_temp("eof");
+        let _g = TmpFile(path.clone());
+        let sparse = Arc::new(MultiSparse::from_single(
+            SparseFile::open_or_create(&path, 64).expect("sparse"),
+        ));
+        let bitmap = Arc::new(ChunkBitmap::new(1));
+        let download_done = Arc::new(AtomicBool::new(true));
+        let outcome = Arc::new(Mutex::new(Some(Ok(DownloadStats::default()))));
+        let mut reader = BlockingSparseReader::new(
+            sparse,
+            bitmap,
+            64,
+            64,
+            64,
+            download_done,
+            outcome,
+            Duration::from_millis(1),
+        );
+        let mut buf = [0u8; 32];
+        let n = reader.read(&mut buf).expect("read");
+        assert_eq!(n, 0);
+    }
+
+    #[test]
+    fn blocking_reader_reads_complete_chunk() {
+        let path = unique_temp("ready");
+        let _g = TmpFile(path.clone());
+        let sparse = Arc::new(MultiSparse::from_single(
+            SparseFile::open_or_create(&path, 16).expect("sparse"),
+        ));
+        sparse
+            .pwrite_at(ByteOffset::ZERO, b"abcdefghijklmnop")
+            .expect("write");
+        let bitmap = Arc::new(ChunkBitmap::new(1));
+        bitmap.mark_complete(ChunkIndex::new(0));
+        let download_done = Arc::new(AtomicBool::new(false));
+        let outcome = Arc::new(Mutex::new(None));
+        let mut reader = BlockingSparseReader::new(
+            sparse,
+            bitmap,
+            16,
+            16,
+            0,
+            download_done,
+            outcome,
+            Duration::from_millis(1),
+        );
+        let mut buf = [0u8; 32];
+        let n = reader.read(&mut buf).expect("read");
+        assert_eq!(n, 16);
+        assert_eq!(&buf[..n], b"abcdefghijklmnop");
+    }
+
+    #[test]
+    fn blocking_reader_errors_when_download_completes_with_missing_chunk() {
+        let path = unique_temp("missing");
+        let _g = TmpFile(path.clone());
+        let sparse = Arc::new(MultiSparse::from_single(
+            SparseFile::open_or_create(&path, 32).expect("sparse"),
+        ));
+        let bitmap = Arc::new(ChunkBitmap::new(2));
+        // Chunk 0 incomplete; download_done set means we should error.
+        let download_done = Arc::new(AtomicBool::new(true));
+        let outcome = Arc::new(Mutex::new(Some(Ok(DownloadStats::default()))));
+        let mut reader = BlockingSparseReader::new(
+            sparse,
+            bitmap,
+            16,
+            32,
+            0,
+            download_done,
+            outcome,
+            Duration::from_millis(1),
+        );
+        let mut buf = [0u8; 32];
+        let err = reader.read(&mut buf).expect_err("must error");
+        assert_eq!(err.kind(), io::ErrorKind::UnexpectedEof);
+    }
+
+    /// §2.1: a [`BlockingSparseReader`] waiting for the next chunk to
+    /// arrive must observe the kill switch within one `poll_interval`
+    /// — otherwise SIGTERM hangs the pod through the full grace period.
+    #[test]
+    fn blocking_reader_returns_kill_sentinel_when_switch_trips() {
+        let path = unique_temp("kill-poll");
+        let _g = TmpFile(path.clone());
+        // 32-byte file split into two 16-byte chunks. Chunk 0 is not
+        // marked complete, so the reader will spin in the poll loop.
+        let sparse = Arc::new(MultiSparse::from_single(
+            SparseFile::open_or_create(&path, 32).expect("sparse"),
+        ));
+        let bitmap = Arc::new(ChunkBitmap::new(2));
+        let download_done = Arc::new(AtomicBool::new(false));
+        let outcome = Arc::new(Mutex::new(None));
+        let kill = Arc::new(AtomicBool::new(false));
+        let mut reader = BlockingSparseReader::new(
+            sparse,
+            bitmap,
+            16,
+            32,
+            0,
+            download_done,
+            outcome,
+            Duration::from_millis(5),
+        )
+        .with_kill_switch(Arc::clone(&kill));
+
+        // Spawn the read on a worker so the main thread can flip the
+        // kill switch after the reader has started polling. A 1 s
+        // sleep gives the reader several poll iterations before the
+        // switch flips, so we exercise the in-loop poll site (not just
+        // the entry-point check).
+        let kill_for_worker = Arc::clone(&kill);
+        let (tx, rx) = std::sync::mpsc::channel();
+        let handle = std::thread::spawn(move || {
+            let _ = kill_for_worker; // captured by reader.kill_switch
+            let mut buf = [0u8; 32];
+            let result = reader.read(&mut buf);
+            let _ = tx.send(result);
+        });
+        std::thread::sleep(Duration::from_millis(50));
+        kill.store(true, Ordering::Release);
+        let result = rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("kill switch should abort the read within 2s");
+        let err = result.expect_err("must surface kill sentinel");
+        assert_eq!(err.to_string(), "peel:kill-switch-tripped");
+        handle.join().expect("worker join");
+    }
+
+    #[test]
+    fn blocking_reader_sequential_extracts_up_to_frontier_before_chunk_complete() {
+        // Regression
+        // (`internal/PLAN_single_stream_concurrent_extract.md`): a
+        // known-size single-stream archive ≤ chunk_size has exactly one
+        // bitmap chunk, which the scheduler marks complete only *after*
+        // the download finishes. The frontier-gated reader must extract
+        // the bytes already written without waiting on that chunk bit —
+        // i.e. extraction runs concurrently with the download.
+        let path = unique_temp("seq-frontier");
+        let _g = TmpFile(path.clone());
+        let sparse = Arc::new(MultiSparse::from_single(
+            SparseFile::open_or_create(&path, 32).expect("sparse"),
+        ));
+        // The whole body is on disk, but the writer has only *published*
+        // the first 16 bytes via the frontier.
+        sparse
+            .pwrite_at(ByteOffset::ZERO, b"abcdefghijklmnopqrstuvwxyz012345")
+            .expect("write");
+        // One chunk for the whole 32-byte file, left INCOMPLETE: the
+        // bitmap-gated path would block here indefinitely.
+        let bitmap = Arc::new(ChunkBitmap::new(1));
+        let download_done = Arc::new(AtomicBool::new(false));
+        let outcome = Arc::new(Mutex::new(None));
+        let frontier = Arc::new(AtomicU64::new(16));
+        let mut reader = BlockingSparseReader::new(
+            sparse,
+            bitmap,
+            64, // chunk_size > total_size ⇒ a single bitmap chunk
+            32,
+            0,
+            download_done,
+            outcome,
+            Duration::from_millis(1),
+        )
+        .with_write_frontier(Arc::clone(&frontier));
+
+        // Reads are capped at the published frontier, never the whole
+        // file, even though every byte is physically present.
+        let mut buf = [0u8; 32];
+        let mut prefix = Vec::new();
+        while prefix.len() < 16 {
+            let n = reader.read(&mut buf).expect("read prefix");
+            assert!(n > 0 && prefix.len() + n <= 16, "read past frontier: {n}");
+            prefix.extend_from_slice(&buf[..n]);
+        }
+        assert_eq!(&prefix, b"abcdefghijklmnop");
+
+        // Advance the frontier (download made more progress) and drain
+        // the tail through to a clean EOF at total_size.
+        frontier.store(32, Ordering::Release);
+        let mut tail = Vec::new();
+        loop {
+            let n = reader.read(&mut buf).expect("read tail");
+            if n == 0 {
+                break;
+            }
+            tail.extend_from_slice(&buf[..n]);
+        }
+        assert_eq!(&tail, b"qrstuvwxyz012345");
+    }
+
+    #[test]
+    fn blocking_reader_sequential_errors_on_short_body() {
+        // download_done is set, the frontier never reached total_size,
+        // and the outcome carries no error: surface UnexpectedEof rather
+        // than silently treating a truncated body as complete.
+        let path = unique_temp("seq-short");
+        let _g = TmpFile(path.clone());
+        let sparse = Arc::new(MultiSparse::from_single(
+            SparseFile::open_or_create(&path, 32).expect("sparse"),
+        ));
+        let bitmap = Arc::new(ChunkBitmap::new(1));
+        let download_done = Arc::new(AtomicBool::new(true));
+        let outcome = Arc::new(Mutex::new(Some(Ok(DownloadStats::default()))));
+        let frontier = Arc::new(AtomicU64::new(16)); // only 16 of 32 published
+        let mut reader = BlockingSparseReader::new(
+            sparse,
+            bitmap,
+            64,
+            32,
+            16, // cursor starts at the frontier (everything published consumed)
+            download_done,
+            outcome,
+            Duration::from_millis(1),
+        )
+        .with_write_frontier(Arc::clone(&frontier));
+        let mut buf = [0u8; 32];
+        let err = reader.read(&mut buf).expect_err("short body must error");
+        assert_eq!(err.kind(), io::ErrorKind::UnexpectedEof);
+    }
+
+    #[test]
+    fn blocking_reader_unknown_eof_preserves_download_stats() {
+        // Regression: the reader's clean-EOF path must surface a
+        // download-side *error* but leave a successful `Ok(DownloadStats)`
+        // in the shared slot — the coordinator reads it after EOF to
+        // report `bytes_downloaded`. An unconditional `slot.take()` here
+        // dropped the `Ok`, so no-`Content-Length` runs printed
+        // `[done] 0 bytes downloaded`.
+        let path = unique_temp("unknown-eof-stats");
+        let _g = TmpFile(path.clone());
+        let sparse = Arc::new(MultiSparse::from_single_growable(
+            SparseFile::open_growable(&path).expect("growable"),
+        ));
+        sparse
+            .pwrite_at(ByteOffset::ZERO, b"hello world")
+            .expect("write"); // high-water = 11
+        let bitmap = Arc::new(ChunkBitmap::new(0));
+        let download_done = Arc::new(AtomicBool::new(true));
+        let stats = DownloadStats {
+            bytes_downloaded: 11,
+            ..DownloadStats::default()
+        };
+        let outcome = Arc::new(Mutex::new(Some(Ok(stats))));
+        let mut reader = BlockingSparseReader::new(
+            Arc::clone(&sparse),
+            bitmap,
+            64,
+            0,
+            0,
+            download_done,
+            Arc::clone(&outcome),
+            Duration::from_millis(1),
+        )
+        .with_unknown_size();
+
+        let mut buf = [0u8; 32];
+        let n = reader.read(&mut buf).expect("read body");
+        assert_eq!(&buf[..n], b"hello world");
+        assert_eq!(reader.read(&mut buf).expect("eof"), 0);
+
+        // The successful stats must survive the EOF read.
+        let slot = outcome.lock().expect("lock");
+        match &*slot {
+            Some(Ok(s)) => assert_eq!(s.bytes_downloaded, 11),
+            other => panic!("download stats consumed at EOF: {other:?}"),
+        }
+    }
+
+    struct TmpFile(PathBuf);
+    impl Drop for TmpFile {
+        fn drop(&mut self) {
+            let _ = fs::remove_file(&self.0);
+        }
+    }
+
+    struct TmpDir(PathBuf);
+    impl Drop for TmpDir {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.0);
+        }
+    }
+}

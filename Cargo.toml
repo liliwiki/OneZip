@@ -41,3 +41,8 @@ debug = false
 hatchzip-core = { path = "third_party/hatchzip-core" }
 # sevenz-rust2 用的 0.23：多线程 LZMA2 编码器加了进度与取消钩子，见 third_party/lzma-rust2/ONEZIP-CHANGES.md。
 lzma-rust2 = { path = "third_party/lzma-rust2" }
+
+# Peel：WinZip AE-2 加密的 zip 条目 CRC 按规范为 0（由 HMAC 校验），原版仍去比 CRC，
+# 解这类包必定报错。third_party/peel 跳过 AE-2 的 CRC 比较，见其 ONEZIP-CHANGES.md。
+[patch."https://github.com/agouin/peel"]
+peel-rs = { path = "third_party/peel" }
