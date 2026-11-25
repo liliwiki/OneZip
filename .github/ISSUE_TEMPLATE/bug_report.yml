@@ -1,0 +1,65 @@
+name: Bug report
+description: Report an extraction, compression, context menu, window, install, or documentation problem.
+title: "[Bug]: "
+labels:
+  - bug
+body:
+  - type: markdown
+    attributes:
+      value: Do not attach private files or archives you cannot share. If the problem lets an archive write outside its folder or lose data, report it privately instead (see SECURITY.md).
+  - type: dropdown
+    id: area
+    attributes:
+      label: Affected area
+      options:
+        - Extraction
+        - Extract and delete the archive (in place)
+        - Extract while downloading
+        - Compression
+        - Checksums
+        - Context menu
+        - Window or progress window
+        - Command line (onezipc)
+        - Install or uninstall
+        - Build or packaging
+        - Documentation
+        - Other
+    validations:
+      required: true
+  - type: input
+    id: version
+    attributes:
+      label: OneZip version
+      placeholder: 0.1.0
+    validations:
+      required: true
+  - type: input
+    id: windows
+    attributes:
+      label: Windows version
+      placeholder: Windows 11 24H2
+  - type: input
+    id: archive
+    attributes:
+      label: Archive format and size
+      placeholder: 7z, 2 GB, solid, encrypted
+  - type: textarea
+    id: description
+    attributes:
+      label: Problem description
+      description: Explain what happened and what you expected.
+    validations:
+      required: true
+  - type: textarea
+    id: reproduction
+    attributes:
+      label: Reproduction steps
+      description: Provide the smallest sequence that reproduces the issue, using archives you can share.
+    validations:
+      required: true
+  - type: textarea
+    id: evidence
+    attributes:
+      label: Relevant output
+      description: Paste only non-sensitive error messages or onezipc output.
+      render: text

@@ -1,0 +1,32 @@
+name: Feature request
+description: Suggest a format, a context menu item, a safety improvement, or a workflow.
+title: "[Feature]: "
+labels:
+  - enhancement
+body:
+  - type: textarea
+    id: use_case
+    attributes:
+      label: Use case
+      description: Describe what you are trying to do and how often.
+    validations:
+      required: true
+  - type: textarea
+    id: proposal
+    attributes:
+      label: Proposed change
+      description: Explain where it appears (window, context menu, command line) and what it does.
+    validations:
+      required: true
+  - type: textarea
+    id: safety
+    attributes:
+      label: Data and safety impact
+      description: Explain whether the feature deletes, overwrites, or truncates files, or downloads anything.
+    validations:
+      required: true
+  - type: input
+    id: upstream
+    attributes:
+      label: Relevant upstream source
+      description: Link to the format specification or upstream project when available.
