@@ -28,7 +28,7 @@ Requires Windows 10 or 11 (x64). Verify the SHA-256 published on the Release pag
 | Extract | tar.zst, tar.lz4, .zst, .lz4 | Peel |
 | Extract | iso, udf, wim, esd, cab, arj, lzh, dmg, vhd, vhdx, vmdk, vdi, qcow2, msi, chm, cpio, rpm, deb, xar, squashfs, cramfs, hfs, apfs, z, lzma | 7-Zip (7z.dll) |
 | Extract in place | Frees the archive's space batch by batch while extracting; resumes after a power cut or a crash. Works for every format above except disk images and installers (dmg, vhd, vhdx, vmdk, vdi, qcow2, msi, chm and similar), whose layout does not allow it | HatchZip, Peel, OneZip |
-| Extract while downloading | Parallel ranged download, streaming decode, used data released at once, resumable | Peel |
+| Extract while downloading | Parallel ranged download, extraction as the data arrives, used data released at once, resumable. Works for every format above; zip, 7z and rar with passwords too. Disk images and installers keep their downloaded data until the end | Peel, OneZip |
 | Smart extraction | A single top-level item goes next to the archive, otherwise into a folder named after it; nested archives are unpacked too | OneZip |
 | List, test, checksums | CRC-32, CRC-64, MD5, SHA-1, SHA-256, SHA-512 for files and folders | OneZip, HatchZip |
 
@@ -59,7 +59,7 @@ crates/onezip-app/     OneZip.exe window (Slint), single instance, task queue, p
 crates/onezip-shell/   onezip_shell.dll, Windows 11 context menu (IExplorerCommand)
 crates/onezip-setup/   OneZip-<version>-Setup.exe installer
 packaging/             Sparse package manifest, build and signing script, install and uninstall scripts
-third_party/           Modified copies of hatchzip-core and lzma-rust2; 7-Zip's 7z.dll
+third_party/           Modified copies of hatchzip-core, Peel and lzma-rust2; 7-Zip's 7z.dll
 tools/uitest/          Context menu and window tests driven by UI Automation
 docs/                  Original design notes (Chinese)
 ```

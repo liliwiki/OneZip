@@ -28,7 +28,7 @@ Windows 一体化压缩工具：常规压缩、智能解压、本地边解压边
 | 解压 | tar.zst、tar.lz4、.zst、.lz4 | Peel |
 | 解压 | iso、udf、wim、esd、cab、arj、lzh、dmg、vhd、vhdx、vmdk、vdi、qcow2、msi、chm、cpio、rpm、deb、xar、squashfs、cramfs、hfs、apfs、z、lzma | 7-Zip（7z.dll） |
 | 边解压边删除 | 解压过程中逐批释放原压缩包的空间；断电、崩溃后可以接着解。上面所有格式都支持，只有磁盘镜像和安装包（dmg、vhd、vhdx、vmdk、vdi、qcow2、msi、chm 等）因为结构不允许而不支持 | HatchZip、Peel、OneZip |
-| 边下载边解压 | 并行分段下载、流式解码、用过的数据立即释放、断点续传 | Peel |
+| 边下载边解压 | 并行分段下载、数据到了就解、用过的数据立即释放、断点续传。上面所有格式都支持，带密码的 zip、7z、rar 也行；磁盘镜像和安装包下载的数据要到解完才释放 | Peel、OneZip |
 | 智能解压 | 只有一个顶层项时直接放在压缩包旁边，否则放进同名文件夹；嵌套的压缩包也会接着解开 | OneZip |
 | 列表、测试、校验值 | 文件和文件夹的 CRC-32、CRC-64、MD5、SHA-1、SHA-256、SHA-512 | OneZip、HatchZip |
 
@@ -59,7 +59,7 @@ crates/onezip-app/     OneZip.exe 窗口（Slint），单实例、任务队列�
 crates/onezip-shell/   onezip_shell.dll，Windows 11 右键菜单（IExplorerCommand）
 crates/onezip-setup/   安装程序 OneZip-<版本>-Setup.exe
 packaging/             稀疏包清单、打包签名脚本、安装与卸载脚本
-third_party/           改过的 hatchzip-core、lzma-rust2；7-Zip 的 7z.dll
+third_party/           改过的 hatchzip-core、Peel、lzma-rust2；7-Zip 的 7z.dll
 tools/uitest/          用 UI 自动化测试右键菜单和窗口
 docs/                  最初的设计草案
 ```
