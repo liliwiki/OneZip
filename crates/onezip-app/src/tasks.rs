@@ -7,7 +7,7 @@ use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use onezip_core::{
     CompressRequest, Event, ExtractRequest, HashKind, Observer, Outcome, Source, human,
@@ -57,6 +57,10 @@ pub struct Task {
     pub output: Option<PathBuf>,
     /// 校验值任务的结果文本。
     pub report: Option<String>,
+    /// 这一轮开始运行的时间（算已用时间、速度、剩余时间）。
+    pub started: Option<Instant>,
+    /// 这一轮结束的时间；结束后已用时间不再增加。
+    pub ended: Option<Instant>,
     stop: Arc<AtomicBool>,
 }
 
@@ -120,6 +124,33 @@ impl Task {
                 s
             }
         }
+    }
+
+    /// 已处理的字节数（下载任务按已下载算）。
+    pub fn processed(&self) -> u64 {
+        self.remote.map_or(self.done, |(d, _)| d)
+    }
+
+    /// 这一轮已经运行了多久。
+    pub fn elapsed(&self) -> Duration {
+        match (self.started, self.ended) {
+            (Some(s), Some(e)) => e.saturating_duration_since(s),
+            (Some(s), None) => s.elapsed(),
+            _ => Duration::ZERO,
+        }
+    }
+
+    /// 平均速度，字节/秒。
+    pub fn speed(&self) -> Option<f64> {
+        let secs = self.elapsed().as_secs_f64();
+        (secs >= 0.5 && self.processed() > 0).then(|| self.processed() as f64 / secs)
+    }
+
+    /// 按平均速度估算的剩余时间。
+    pub fn remaining(&self) -> Option<Duration> {
+        let speed = self.speed()?;
+        let left = self.total.checked_sub(self.processed())?;
+        (self.total > 0).then(|| Duration::from_secs_f64(left as f64 / speed))
     }
 
     pub fn is_running(&self) -> bool {
@@ -207,6 +238,8 @@ impl Manager {
             note: String::new(),
             output: None,
             report: None,
+            started: None,
+            ended: None,
             stop: Arc::new(AtomicBool::new(false)),
         });
         id
@@ -311,6 +344,8 @@ impl Manager {
             .take(MAX_RUNNING.saturating_sub(running))
         {
             t.status = Status::Running;
+            t.started = Some(Instant::now());
+            t.ended = None;
             t.total = 0;
             t.done = 0;
             t.remote = None;
@@ -379,6 +414,7 @@ impl Manager {
                 })
             }
         };
+        self.with(id, |t| t.ended = Some(Instant::now()));
         self.with(id, |t| match result {
             Ok((status, output)) => {
                 if status == Status::Done && matches!(kind, Kind::Test { .. }) {

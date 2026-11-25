@@ -21,6 +21,7 @@ Set-Content "$Dir\src\资料\子目录\深.txt" ("deep" * 5000)
 Set-Content "$Dir\src\甲\a.txt" ("甲" * 9000); Set-Content "$Dir\src\乙\b.txt" ("乙" * 9000)
 & $cli a "$Dir\资料.zip" "$Dir\src\资料" -t zip | Out-Null
 & $cli a "$Dir\多根.7z" "$Dir\src\甲" "$Dir\src\乙" | Out-Null
+& $cli a "$Dir\加密.7z" "$Dir\src\资料" -p 1234 | Out-Null
 foreach ($n in '到这', '删包', '带 空格 (1)', '测试') { Copy-Item "$Dir\资料.zip" "$Dir\$n.zip" }
 Set-Content "$Dir\笔记.txt" ("note " * 2000)
 Copy-Item "$Dir\src\资料" "$Dir\照片" -Recurse
@@ -59,13 +60,13 @@ $fg = WaitFor { (UI -Do windows | Select-String 'foreground: 解压到哪个文�
 # 粘贴路径（避开输入法）+ 回车进入该文件夹，再点“选择文件夹”。
 Set-Clipboard "$Dir\选的目录"; UI -Do type -Text '^v' | Out-Null; Start-Sleep 1
 UI -Do type -Text '{ENTER}' | Out-Null; Start-Sleep 2
-UI -Do click -Window OneZip -Name '选择文件夹' | Out-Null
+UI -Do click -Window '解压到哪个文件夹' -Name '选择文件夹' | Out-Null
 Check '解压文件…（选文件夹）' ($fg -and (WaitFor { (T "$Dir\选的目录\多根\甲") -eq (T "$Dir\src\甲") }))
 
-# 任务列表只渲染看得见的几行：先清掉已完成的，测试任务就在最上面。
-UI -Do click -Window OneZip -Name '清除已完成' | Out-Null; Start-Sleep 1
+# 测试结果留在它的进度窗口里，点“关闭”关掉。
 MN -Folder $Dir -Items '测试.zip' -Command '测试压缩包'
-Check '测试压缩包' (WaitFor { (UI -Do dump -Window OneZip | Select-String '测试通过') })
+Check '测试压缩包（结果留在进度窗口）' (WaitFor { (UI -Do dump -Window '测试 测试.zip' | Select-String '测试通过') })
+UI -Do click -Window '测试 测试.zip' -Name '关闭' | Out-Null; Start-Sleep 1
 
 MN -Folder $Dir -Items '照片' -Command '添加到*照片.7z*'
 Check '添加到 "照片.7z"' (WaitFor { (Test-Path "$Dir\照片.7z") -and ((& $cli t "$Dir\照片.7z") -match '通过') })
@@ -101,7 +102,20 @@ $md5 = (Get-FileHash "$Dir\照片\f1.txt" -Algorithm MD5).Hash
 Check '校验值全部算法（文件夹递归）' ($ok -and $txt -match $md5 -and $txt -match 'SHA-512' -and $txt -match 'CRC-64' -and $txt -match '共 5 个文件')
 UI -Do click -Window '校验值' -Name '关闭' | Out-Null; Start-Sleep 1
 
+# ---- 加密包：密码框自己弹出来（不需要主窗口）----
+MN -Folder $Dir -Items '加密.7z' -Command '智能解压'
+$pw = WaitFor { (UI -Do windows | Select-String 'foreground: 需要密码') } 15
+UI -Do clicktype -Window '需要密码' -Type Edit -Name 0 | Out-Null; Start-Sleep 1
+UI -Do type -Text '1234' | Out-Null; Start-Sleep 1
+UI -Do click -Window '需要密码' -Name '确定' | Out-Null
+Check '加密包：密码框在最前，输对后解出' ($pw -and (WaitFor { (T "$Dir\资料") -eq $ref }))
+WaitFor { -not (Get-Process OneZip -EA SilentlyContinue) } 20 | Out-Null
+Remove-Item "$Dir\资料" -Recurse -Force -EA SilentlyContinue
+
 # ---- 先开对话框再点“右键菜单…”（以前会卡死）----
+# 从右键菜单来的操作不再弹主窗口，这里先单独打开主窗口。
+Start-Process "$env:LOCALAPPDATA\Programs\OneZip\OneZip.exe"
+WaitFor { (UI -Do windows | Select-String '^OneZip \|') } 10 | Out-Null
 MN -Folder $Dir -Items '笔记.txt' -Command '添加到压缩包…'
 WaitFor { (UI -Do windows | Select-String 'foreground: 添加到压缩包') } 10 | Out-Null
 UI -Do click -Window OneZip -Name '右键菜单…' | Out-Null
@@ -110,6 +124,17 @@ UI -Do click -Window '右键菜单' -Name '确定' | Out-Null; Start-Sleep 1
 UI -Do click -Window '添加到压缩包' -Name '取消' | Out-Null; Start-Sleep 1
 $alive = (Get-Process OneZip).Responding -notcontains $false
 Check '对话框开着时点“右键菜单…”不卡死' ($box -and $alive)
+UI -Do click -Window OneZip -Name '清除已完成' | Out-Null
+(Get-Process OneZip -EA SilentlyContinue).CloseMainWindow() | Out-Null
+WaitFor { -not (Get-Process OneZip -EA SilentlyContinue) } 10 | Out-Null
+
+# ---- 右键菜单的操作只弹小进度窗口，不弹主窗口；做完自动关、程序退出 ----
+MN -Folder $Dir -Items '资料.zip' -Command '解压到当前位置'
+Start-Sleep 1
+$main = [bool](UI -Do windows | Select-String '^OneZip \|')
+$gone = WaitFor { -not (Get-Process OneZip -EA SilentlyContinue) } 20
+Check '菜单操作不弹主窗口，做完自动关闭并退出' (-not $main -and $gone)
+Remove-Item "$Dir\资料" -Recurse -Force -EA SilentlyContinue
 
 # ---- 7z 固实压缩：进度要逐步走，压缩中关窗口不能卡死、不能留下临时文件 ----
 $big = "$Dir\大块"; New-Item -ItemType Directory $big -Force | Out-Null
@@ -121,29 +146,28 @@ foreach ($i in 0..3) {
   foreach ($j in 0..39) { $rng.GetBytes($rb); $fs.Write($rb, 0, $rb.Length); $fs.Write($text, 0, $text.Length) }
   $fs.Close()
 }
-UI -Do click -Window OneZip -Name '清除已完成' | Out-Null; Start-Sleep 1
 MN -Folder $Dir -Items '大块' -Command '添加到*大块.7z*'
+# 进度窗口标题是 “NN% 压缩为 大块.7z”。
 $pcts = @()
 foreach ($k in 1..8) {
   Start-Sleep -Milliseconds 700
-  $p = (UI -Do dump -Window OneZip | Select-String '^Text: (\d+)%$' | Select -First 1)
+  $p = (UI -Do windows | Select-String '^(\d+)% 压缩为 大块\.7z' | Select -First 1)
   if ($p) { $pcts += [int]$p.Matches[0].Groups[1].Value }
 }
 $distinct = @($pcts | Sort-Object -Unique).Count
 Check '7z 进度逐步增加（不是一下 100%）' ($distinct -ge 3 -and ($pcts | Select -First 1) -lt 100) ($pcts -join ',')
-# 再压一次，压到一半关窗口
+WaitFor { -not (Get-Process OneZip -EA SilentlyContinue) } 60 | Out-Null
+# 再压一次，压到一半点进度窗口的 ×：取消压缩、删掉临时文件、程序退出
 Remove-Item "$Dir\大块.7z" -EA SilentlyContinue
 MN -Folder $Dir -Items '大块' -Command '添加到*大块.7z*'
 Start-Sleep 2
 $proc = Get-Process OneZip
-$proc.CloseMainWindow() | Out-Null
-WaitFor { (UI -Do windows | Select-String 'foreground: OneZip') -and (UI -Do dump -Window OneZip | Select-String '还有任务在进行') } 10 | Out-Null
 $t0 = Get-Date
-UI -Do click -Window OneZip -Name '确定' | Out-Null
+$proc.CloseMainWindow() | Out-Null
 $exited = WaitFor { $proc.HasExited } 15
 $secs = ((Get-Date) - $t0).TotalSeconds
 $left = @(Get-ChildItem $Dir -Filter '大块.7z*')
-Check '压缩中关闭：几秒内退出，不留临时文件' ($exited -and $left.Count -eq 0) ("{0:n1}s, 残留 {1}" -f $secs, ($left.Name -join ','))
+Check '压缩中关进度窗口：几秒内退出，不留临时文件' ($exited -and $left.Count -eq 0) ("{0:n1}s, 残留 {1}" -f $secs, ($left.Name -join ','))
 
 $results | Format-Table -AutoSize | Out-String -Width 200
 "通过 {0} / {1}" -f @($results | ? 结果 -eq '通过').Count, $results.Count

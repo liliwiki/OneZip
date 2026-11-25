@@ -1,7 +1,7 @@
 //! 主窗口、压缩对话框、密码对话框和任务队列之间的胶水。
 
-use std::cell::RefCell;
-use std::collections::HashSet;
+use std::cell::{Cell, RefCell};
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
 use std::sync::Arc;
@@ -14,7 +14,9 @@ use slint::{ComponentHandle, ModelRc, SharedString, Timer, TimerMode, VecModel};
 
 use crate::request::{Action, Request};
 use crate::tasks::{Kind, Manager, Status, file_name};
-use crate::{CompressDialog, HashDialog, MainWindow, PasswordDialog, TaskRow, menu, win};
+use crate::{
+    CompressDialog, HashDialog, MainWindow, PasswordDialog, ProgressDialog, TaskRow, menu, win,
+};
 
 struct App {
     window: MainWindow,
@@ -28,6 +30,10 @@ struct App {
     hashes: RefCell<Vec<HashDialog>>,
     /// 已经自动弹过结果窗口的校验值任务。
     shown: RefCell<HashSet<u64>>,
+    /// 右键菜单发起的任务各自的进度窗口。
+    progress: RefCell<HashMap<u64, ProgressDialog>>,
+    /// 第一个请求已经处理过（在那之前没有窗口是正常的，不能当成可以退出）。
+    ready: Cell<bool>,
 }
 
 pub fn run(first: Request, incoming: Receiver<Request>) -> anyhow::Result<()> {
@@ -40,6 +46,8 @@ pub fn run(first: Request, incoming: Receiver<Request>) -> anyhow::Result<()> {
         prompted: RefCell::new(HashSet::new()),
         hashes: RefCell::new(Vec::new()),
         shown: RefCell::new(HashSet::new()),
+        progress: RefCell::new(HashMap::new()),
+        ready: Cell::new(false),
     });
     wire(&app);
     app.window.set_status(status_text().into());
@@ -50,9 +58,10 @@ pub fn run(first: Request, incoming: Receiver<Request>) -> anyhow::Result<()> {
         let app = app.clone();
         timer.start(TimerMode::Repeated, Duration::from_millis(250), move || {
             while let Ok(req) = incoming.try_recv() {
-                handle(&app, req);
+                handle(&app, req, true);
             }
             refresh(&app);
+            quit_if_idle(&app);
         });
     }
 
@@ -60,42 +69,65 @@ pub fn run(first: Request, incoming: Receiver<Request>) -> anyhow::Result<()> {
     {
         let app = app.clone();
         Timer::single_shot(Duration::ZERO, move || {
-            handle(&app, first);
+            handle(&app, first, true);
             refresh(&app);
+            app.ready.set(true);
         });
     }
-    // 不用 window.run()：关窗口后可能还要在后台等任务停到安全点，
-    // 由 [`quit_when_idle`] 决定什么时候真正退出。
-    app.window.show()?;
+    // 主窗口不一定显示：从右键菜单来的操作只弹各自的进度窗口（像 7-Zip）。
+    // 所有窗口都关了、也没有在跑的任务时由 [`quit_if_idle`] 退出。
     slint::run_event_loop_until_quit()?;
     Ok(())
 }
 
-/// 窗口已经隐藏：等在跑的任务停下（解压停在安全点、压缩删掉临时文件）后退出。
-/// 在后台线程里等，界面线程不阻塞；最多等 30 秒。
-fn quit_when_idle(tasks: Arc<Manager>) {
-    std::thread::spawn(move || {
-        let deadline = std::time::Instant::now() + Duration::from_secs(30);
-        while std::time::Instant::now() < deadline
-            && tasks.snapshot().iter().any(|t| t.is_running())
-        {
-            std::thread::sleep(Duration::from_millis(100));
-        }
-        let _ = slint::invoke_from_event_loop(|| {
-            let _ = slint::quit_event_loop();
-        });
-    });
+/// 没有任何窗口、也没有在跑或排队的任务时退出。
+/// （暂停的解压已把进度存在磁盘上，退出不丢。）
+fn quit_if_idle(app: &App) {
+    if !app.ready.get() {
+        return;
+    }
+    let any_window = app.window.window().is_visible()
+        || !app.progress.borrow().is_empty()
+        || app.compress.borrow().is_some()
+        || app.password.borrow().is_some()
+        || app.hashes.borrow().iter().any(|h| h.window().is_visible());
+    let busy = app
+        .tasks
+        .snapshot()
+        .iter()
+        .any(|t| matches!(t.status, Status::Running | Status::Queued));
+    if !any_window && !busy {
+        let _ = slint::quit_event_loop();
+    }
+}
+
+/// 显示一个对话框：主窗口开着时归属主窗口（始终在它上面），否则单独显示。
+fn show_dialog<C: ComponentHandle + 'static>(app: &App, dialog: &C) {
+    if app.window.window().is_visible() {
+        win::present_owned(dialog, &app.window);
+    } else {
+        win::present(dialog);
+    }
 }
 
 /// 归属 `parent` 的提示框：始终在它上面，不会跑到别的窗口后面让人以为程序卡死。
+/// 父窗口隐藏时（例如从右键菜单来、主窗口没开）就不指定父窗口，单独显示。
 fn message(parent: &slint::Window) -> MessageDialog {
-    MessageDialog::new()
-        .set_title("OneZip")
-        .set_parent(&parent.window_handle())
+    let d = MessageDialog::new().set_title("OneZip");
+    if parent.is_visible() {
+        d.set_parent(&parent.window_handle())
+    } else {
+        d
+    }
 }
 
 fn file_dialog(parent: &slint::Window) -> FileDialog {
-    FileDialog::new().set_parent(&parent.window_handle())
+    let d = FileDialog::new();
+    if parent.is_visible() {
+        d.set_parent(&parent.window_handle())
+    } else {
+        d
+    }
 }
 
 fn status_text() -> String {
@@ -136,6 +168,7 @@ fn refresh(app: &Rc<App>) {
         app.shown.borrow_mut().insert(id);
         show_hash(app, id);
     }
+    update_progress(app, &snapshot);
     let rows: Vec<TaskRow> = snapshot
         .iter()
         .map(|t| TaskRow {
@@ -217,7 +250,7 @@ fn wire(app: &Rc<App>) {
             if reclaim && !confirm_reclaim(app.window.window(), files.len()) {
                 return;
             }
-            handle(
+            handle_from_window(
                 &app,
                 Request {
                     action: Action::Extract {
@@ -238,7 +271,7 @@ fn wire(app: &Rc<App>) {
             if url.is_empty() {
                 return;
             }
-            handle(
+            handle_from_window(
                 &app,
                 Request {
                     action: Action::Url(url),
@@ -255,7 +288,7 @@ fn wire(app: &Rc<App>) {
             if let Some(files) = file_dialog(app.window.window())
                 .set_title("选择要压缩的文件")
                 .pick_files() {
-                open_compress_dialog(&app, files);
+                open_compress_dialog(&app, files, false);
             }
         }
     });
@@ -266,7 +299,7 @@ fn wire(app: &Rc<App>) {
             if let Some(dir) = file_dialog(app.window.window())
                 .set_title("选择要压缩的文件夹")
                 .pick_folder() {
-                open_compress_dialog(&app, vec![dir]);
+                open_compress_dialog(&app, vec![dir], false);
             }
         }
     });
@@ -283,8 +316,13 @@ fn wire(app: &Rc<App>) {
     w.window().on_close_requested({
         let tasks = tasks.clone();
         let weak = w.as_weak();
+        let app_weak = Rc::downgrade(app);
         move || {
-            if tasks.busy() {
+            // 右键菜单发起的任务各有进度窗口，关主窗口不影响它们。
+            let has_progress = app_weak
+                .upgrade()
+                .is_some_and(|a| !a.progress.borrow().is_empty());
+            if tasks.busy() && !has_progress {
                 let Some(w) = weak.upgrade() else {
                     return slint::CloseRequestResponse::HideWindow;
                 };
@@ -301,8 +339,8 @@ fn wire(app: &Rc<App>) {
                 }
                 tasks.pause_all();
             }
-            // 先把窗口藏起来，在后台等任务停稳再退出；以前在这里同步等待，窗口会“未响应”。
-            quit_when_idle(tasks.clone());
+            // 只把窗口藏起来：任务停稳、没有别的窗口后由 quit_if_idle 退出。
+            // 以前在这里同步等待，窗口会“未响应”。
             slint::CloseRequestResponse::HideWindow
         }
     });
@@ -369,10 +407,18 @@ fn error(parent: &slint::Window, msg: &str) {
 }
 
 /// 处理一个请求：来自命令行、右键菜单、或窗口按钮。
-fn handle(app: &Rc<App>, req: Request) {
+fn handle_from_window(app: &Rc<App>, req: Request) {
+    handle(app, req, false);
+}
+
+/// 处理一个请求。`external`：来自命令行 / 右键菜单 / 另一个实例——这时不弹主窗口，
+/// 每个任务弹一个自己的进度窗口；来自主窗口的按钮时任务只显示在主窗口的列表里。
+fn handle(app: &Rc<App>, req: Request, external: bool) {
     let w = &app.window;
-    // 先把主窗口亮出来、提到最前，后面的对话框都归属它。
-    win::present(w);
+    if !external || matches!(req.action, Action::Show | Action::RegisterMenu | Action::UnregisterMenu) {
+        win::present(w);
+    }
+    let mut ids = Vec::new();
     match req.action {
         Action::Show => {}
         Action::Extract {
@@ -413,19 +459,21 @@ fn handle(app: &Rc<App>, req: Request) {
                     ..Default::default()
                 };
                 let verb = if reclaim { "解压并释放空间" } else { "解压" };
-                app.tasks
-                    .add(format!("{verb} {}", file_name(&path)), Kind::Extract(r));
+                ids.push(
+                    app.tasks
+                        .add(format!("{verb} {}", file_name(&path)), Kind::Extract(r)),
+                );
             }
         }
         Action::Test => {
             for path in req.paths {
-                app.tasks.add(
+                ids.push(app.tasks.add(
                     format!("测试 {}", file_name(&path)),
                     Kind::Test {
                         path,
                         password: None,
                     },
-                );
+                ));
             }
         }
         Action::Url(url) => {
@@ -448,7 +496,7 @@ fn handle(app: &Rc<App>, req: Request) {
                 output: Some(dir.join(stem(Path::new(&name)))),
                 ..Default::default()
             };
-            app.tasks.add(format!("下载并解压 {name}"), Kind::Extract(r));
+            ids.push(app.tasks.add(format!("下载并解压 {name}"), Kind::Extract(r)));
         }
         Action::Compress(Some(format)) => {
             if req.paths.is_empty() {
@@ -459,12 +507,14 @@ fn handle(app: &Rc<App>, req: Request) {
             };
             let out = unique(out);
             let r = CompressRequest::new(req.paths, out.clone(), format);
-            app.tasks
-                .add(format!("压缩为 {}", file_name(&out)), Kind::Compress(r));
+            ids.push(
+                app.tasks
+                    .add(format!("压缩为 {}", file_name(&out)), Kind::Compress(r)),
+            );
         }
         Action::Compress(None) => {
             if !req.paths.is_empty() {
-                open_compress_dialog(app, req.paths);
+                open_compress_dialog(app, req.paths, external);
             }
         }
         Action::Hash(kinds) => {
@@ -475,16 +525,21 @@ fn handle(app: &Rc<App>, req: Request) {
                     [] => String::new(),
                 };
                 let algos = kinds.iter().map(|k| k.name()).collect::<Vec<_>>().join(" ");
-                app.tasks.add(
+                ids.push(app.tasks.add(
                     format!("校验 {name}（{algos}）"),
                     Kind::Hash {
                         paths: req.paths,
                         kinds,
                     },
-                );
+                ));
             }
         }
         Action::RegisterMenu | Action::UnregisterMenu => toggle_menu(w.window()),
+    }
+    if external {
+        for id in ids {
+            open_progress(app, id);
+        }
     }
 }
 
@@ -534,7 +589,7 @@ fn reveal(path: &Path) {
     let _ = cmd.spawn();
 }
 
-fn open_compress_dialog(app: &Rc<App>, inputs: Vec<PathBuf>) {
+fn open_compress_dialog(app: &Rc<App>, inputs: Vec<PathBuf>, external: bool) {
     let Ok(d) = CompressDialog::new() else { return };
     let formats: Vec<SharedString> = Format::ALL
         .iter()
@@ -626,15 +681,19 @@ fn open_compress_dialog(app: &Rc<App>, inputs: Vec<PathBuf>) {
                 r.overwrite = true;
             }
             let _ = d.hide();
-            app.tasks
+            let id = app
+                .tasks
                 .add(format!("压缩为 {}", file_name(&output)), Kind::Compress(r));
+            if external {
+                open_progress(&app, id);
+            }
         }
     });
     // 之前打开、还没处理的对话框先关掉，免得藏在后面。
     if let Some(old) = app.compress.borrow_mut().take() {
         let _ = old.hide();
     }
-    win::present_owned(&d, &app.window);
+    show_dialog(app, &d);
     *app.compress.borrow_mut() = Some(d);
 }
 
@@ -670,7 +729,7 @@ fn ask_password(app: &Rc<App>, id: u64) {
     if let Some(old) = app.password.borrow_mut().take() {
         let _ = old.hide();
     }
-    win::present_owned(&d, &app.window);
+    show_dialog(app, &d);
     *app.password.borrow_mut() = Some(d);
 }
 
@@ -704,6 +763,148 @@ fn show_hash(app: &Rc<App>, id: u64) {
             app.hashes.borrow_mut().retain(|h| h.window().is_visible());
         }
     });
-    win::present_owned(&d, &app.window);
+    show_dialog(app, &d);
     app.hashes.borrow_mut().push(d);
+}
+
+/// 给右键菜单发起的任务弹一个进度窗口。
+fn open_progress(app: &Rc<App>, id: u64) {
+    let Ok(d) = ProgressDialog::new() else { return };
+    if let Some(t) = app.tasks.get(id) {
+        d.set_heading(t.title.clone().into());
+        d.set_caption(t.title.into());
+    }
+    d.set_progress(-1.0);
+    let tasks = app.tasks.clone();
+    d.on_pause({
+        let t = tasks.clone();
+        move || t.pause(id)
+    });
+    d.on_resume({
+        let t = tasks.clone();
+        move || t.resume(id)
+    });
+    d.on_cancel({
+        let t = tasks.clone();
+        move || t.cancel(id)
+    });
+    d.on_show_tasks({
+        let app = Rc::downgrade(app);
+        move || {
+            if let Some(app) = app.upgrade() {
+                win::present(&app.window);
+            }
+        }
+    });
+    d.on_dismiss({
+        let app = Rc::downgrade(app);
+        move || {
+            if let Some(app) = app.upgrade() {
+                close_progress(&app, id);
+            }
+        }
+    });
+    // 点右上角 ×：解压暂停在安全点（进度已保存，再点一次同样的菜单就能接着来），
+    // 其它任务取消。
+    d.window().on_close_requested({
+        let app = Rc::downgrade(app);
+        move || {
+            if let Some(app) = app.upgrade() {
+                if let Some(t) = app.tasks.get(id) {
+                    if t.can_pause() {
+                        app.tasks.pause(id);
+                    } else if t.can_cancel() {
+                        app.tasks.cancel(id);
+                    }
+                }
+                app.progress.borrow_mut().remove(&id);
+            }
+            slint::CloseRequestResponse::HideWindow
+        }
+    });
+    win::present(&d);
+    app.progress.borrow_mut().insert(id, d);
+}
+
+fn close_progress(app: &App, id: u64) {
+    if let Some(d) = app.progress.borrow_mut().remove(&id) {
+        let _ = d.hide();
+    }
+}
+
+/// 00:01:23
+fn clock(d: Duration) -> String {
+    let s = d.as_secs();
+    format!("{:02}:{:02}:{:02}", s / 3600, s / 60 % 60, s % 60)
+}
+
+/// 刷新各进度窗口；做完的自动关掉（失败和测试结果留着给人看）。
+fn update_progress(app: &App, snapshot: &[crate::tasks::Task]) {
+    let mut done = Vec::new();
+    for (&id, d) in app.progress.borrow().iter() {
+        let Some(t) = snapshot.iter().find(|t| t.id == id) else {
+            done.push(id);
+            continue;
+        };
+        let p = t.progress();
+        let pct = if p >= 0.0 {
+            format!("{}% ", (p * 100.0).floor() as i32)
+        } else {
+            String::new()
+        };
+        let running = matches!(t.status, Status::Running | Status::Queued);
+        d.set_caption(if running { format!("{pct}{}", t.title) } else { t.title.clone() }.into());
+        d.set_progress(p);
+        d.set_elapsed(clock(t.elapsed()).into());
+        d.set_remaining(
+            running
+                .then(|| t.remaining().map(clock))
+                .flatten()
+                .unwrap_or_default()
+                .into(),
+        );
+        d.set_speed(
+            t.speed()
+                .map(|s| format!("{}/s", onezip_core::human(s as u64)))
+                .unwrap_or_default()
+                .into(),
+        );
+        d.set_processed(if t.total > 0 {
+            format!("{} / {}", onezip_core::human(t.processed()), onezip_core::human(t.total))
+                .into()
+        } else {
+            SharedString::new()
+        });
+        d.set_extra(match (t.left, &t.remote) {
+            (Some(left), _) => format!("原压缩包剩余 {}", onezip_core::human(left)).into(),
+            (None, Some((_, out))) => format!("已解出 {}", onezip_core::human(*out)).into(),
+            _ => SharedString::new(),
+        });
+        d.set_can_pause(t.can_pause());
+        d.set_can_resume(t.status == Status::Paused);
+        d.set_can_cancel(t.can_cancel());
+        let (message, failed, finished) = match &t.status {
+            Status::Done if matches!(t.kind, Kind::Test { .. }) => (t.detail(), false, true),
+            // 解压、压缩做完就关；校验值会弹出结果窗口。
+            Status::Done | Status::Cancelled => {
+                done.push(id);
+                continue;
+            }
+            Status::Failed(e) => (e.clone(), true, true),
+            Status::Paused => (
+                "已暂停，进度已保存。可以继续，或以后再从右键菜单解压同一个压缩包接着来。".into(),
+                false,
+                false,
+            ),
+            // 密码框会自动弹出；这里给个能关掉的出口。
+            Status::NeedsPassword { .. } => ("需要密码：请在弹出的密码框里输入。".into(), false, true),
+            _ => (String::new(), false, false),
+        };
+        d.set_message(message.into());
+        d.set_failed(failed);
+        d.set_finished(finished);
+    }
+    for id in done {
+        close_progress(app, id);
+    }
 }
