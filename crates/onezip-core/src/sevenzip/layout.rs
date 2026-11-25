@@ -8,13 +8,13 @@
 //! 宁可不释放，也不能释放错。
 
 use std::collections::{HashMap, VecDeque};
-use std::fs::File;
 use std::io::{Read, Seek, SeekFrom};
 use std::path::Path;
 
 use anyhow::{Context, Result, bail, ensure};
 
 use super::archive::{Archive, Item, clean_path};
+use super::fetch::Src;
 use super::ffi::kpid;
 
 /// 一起解出、一起释放的一组条目。
@@ -27,8 +27,8 @@ pub struct Unit {
 }
 
 pub fn units(path: &Path, arc: &Archive) -> Result<Vec<Unit>> {
-    let mut f = File::open(path)?;
-    let len = f.metadata()?.len();
+    let mut f = Src::open(path)?;
+    let len = f.len()?;
     let units = match arc.format.as_str() {
         "Cab" => cab(&mut f, arc)?,
         "wim" => wim(&mut f, arc)?,
@@ -59,7 +59,7 @@ fn check(units: &[Unit], len: u64) -> Result<()> {
     Ok(())
 }
 
-fn read_at(f: &mut File, pos: u64, buf: &mut [u8]) -> Result<()> {
+fn read_at(f: &mut Src, pos: u64, buf: &mut [u8]) -> Result<()> {
     f.seek(SeekFrom::Start(pos))?;
     f.read_exact(buf)?;
     Ok(())
@@ -95,7 +95,7 @@ fn leftovers(arc: &Archive, used: &std::collections::HashSet<u32>) -> Option<Uni
 
 /// CAB：文件按"文件夹"分组压缩，同一文件夹的数据块（CFDATA）连续存放、前后依赖。
 /// 一个文件夹是一个单元，区间是它全部 CFDATA 块。只支持单个 .cab（不跨卷）。
-fn cab(f: &mut File, arc: &Archive) -> Result<Vec<Unit>> {
+fn cab(f: &mut Src, arc: &Archive) -> Result<Vec<Unit>> {
     let mut h = [0u8; 36];
     read_at(f, 0, &mut h)?;
     ensure!(&h[0..4] == b"MSCF", "不是 CAB");
@@ -195,7 +195,7 @@ const SOLID_MAGIC_SIZE: u64 = 0x1_0000_0000;
 /// WIM：文件内容按 SHA-1 去重存成"资源"，查找表（lookup table）记着每个资源的位置。
 /// 一个资源是一个单元，用到它的所有条目一起解；固实资源（ESD 常见）里的所有流一起算一个单元。
 /// 元数据资源（目录树）、查找表、XML 从不释放。只支持单个文件（不支持 .swm 分卷）。
-fn wim(f: &mut File, arc: &Archive) -> Result<Vec<Unit>> {
+fn wim(f: &mut Src, arc: &Archive) -> Result<Vec<Unit>> {
     let mut h = [0u8; 208];
     read_at(f, 0, &mut h)?;
     ensure!(&h[0..8] == b"MSWIM\0\0\0", "不是 WIM");
@@ -306,7 +306,7 @@ fn sequential(arc: &Archive, entries: Vec<Seq>) -> Result<Vec<Unit>> {
 }
 
 /// ARJ：主头之后，每个文件一个本地头，紧跟着压缩数据。
-fn arj(f: &mut File, len: u64) -> Result<Vec<Seq>> {
+fn arj(f: &mut Src, len: u64) -> Result<Vec<Seq>> {
     let mut pos = 0u64;
     let mut out = Vec::new();
     let mut first = true;
@@ -360,7 +360,7 @@ fn arj(f: &mut File, len: u64) -> Result<Vec<Seq>> {
 }
 
 /// LZH：每个文件一个头（0、1、2 级），紧跟着压缩数据。
-fn lzh(f: &mut File, len: u64) -> Result<Vec<Seq>> {
+fn lzh(f: &mut Src, len: u64) -> Result<Vec<Seq>> {
     let mut pos = 0u64;
     let mut out = Vec::new();
     while pos < len {

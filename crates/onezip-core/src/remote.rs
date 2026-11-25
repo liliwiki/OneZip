@@ -90,7 +90,7 @@ pub(crate) fn extract_file(
     args.destructive = !req.keep_source;
     args.registry = registry;
     args.progress_state = Some(state.clone());
-    args.kill_switch = Some(stop.clone());
+    args.kill_switch = Some(forward_stop(stop, &done));
     let result = run_local(args);
     done.store(true, Ordering::Relaxed);
     let _ = sampler.join();
@@ -100,7 +100,7 @@ pub(crate) fn extract_file(
             output: out_path,
             warning: None,
         }),
-        Err(CoordinatorError::Aborted { .. }) => Ok(Outcome::Paused),
+        Err(CoordinatorError::Aborted { .. }) if stop.load(Ordering::Relaxed) => Ok(Outcome::Paused),
         Err(e) => Err(anyhow!(e)).with_context(|| format!("解压 {name} 失败")),
     }
 }
@@ -161,9 +161,6 @@ pub(crate) fn extract(
     observer: Observer,
     stop: &Arc<AtomicBool>,
 ) -> Result<Outcome> {
-    if req.password.is_some() {
-        bail!("从 URL 解压加密压缩包暂不支持");
-    }
     let registry = DecoderRegistry::with_defaults();
     let output = output_target(url, req.output.as_deref(), &registry)?;
     let out_path = match &output {
@@ -172,15 +169,22 @@ pub(crate) fn extract(
 
     let client = Client::new().map_err(|e| anyhow!(e)).context("创建 HTTP 客户端失败")?;
     let state = ProgressState::new();
+    let password = Password::set(req.password.as_deref());
 
     let (done, sampler) = sample(&state, observer.clone(), 0);
+    // Peel 出错时会把传给它的停止开关置位（用来叫停下载线程），所以给它单独一个开关，
+    // 只把用户的暂停转发过去；否则出错会被当成暂停，而且用户的开关也被弄脏。
+    let kill = forward_stop(stop, &done);
 
     let started = observer.clone();
     let args = RunArgs {
         url: url.to_string(),
         additional_urls: Vec::new(),
         output,
-        config: CoordinatorConfig::default(),
+        config: CoordinatorConfig {
+            password_source: password.source(),
+            ..CoordinatorConfig::default()
+        },
         client,
         registry,
         progress: Some(Box::new(move |ev| {
@@ -197,7 +201,7 @@ pub(crate) fn extract(
             }
         })),
         progress_state: Some(state.clone()),
-        kill_switch: Some(stop.clone()),
+        kill_switch: Some(kill),
         io_backend: None,
     };
 
@@ -217,8 +221,54 @@ pub(crate) fn extract(
                 warning: None,
             })
         }
-        Err(CoordinatorError::Aborted { .. }) => Ok(Outcome::Paused),
+        Err(CoordinatorError::Aborted { .. }) if stop.load(Ordering::Relaxed) => Ok(Outcome::Paused),
         Err(e) => Err(anyhow!(e)).with_context(|| format!("从 {url} 解压失败")),
+    }
+}
+
+/// 给 Peel 的停止开关：用户叫停时跟着置位，`done` 之后不再转发。
+fn forward_stop(stop: &Arc<AtomicBool>, done: &Arc<AtomicBool>) -> Arc<AtomicBool> {
+    let kill = Arc::new(AtomicBool::new(stop.load(Ordering::Relaxed)));
+    let (stop, done, k) = (stop.clone(), done.clone(), kill.clone());
+    thread::spawn(move || {
+        while !done.load(Ordering::Relaxed) {
+            if stop.load(Ordering::Relaxed) {
+                k.store(true, Ordering::Relaxed);
+                return;
+            }
+            thread::sleep(Duration::from_millis(50));
+        }
+    });
+    kill
+}
+
+/// 交给 Peel 的密码。Peel 只能从环境变量、文件或终端读密码，这里用一个本次专用的
+/// 环境变量（不落盘），结束时删掉。
+struct Password(Option<String>);
+
+impl Password {
+    fn set(pw: Option<&str>) -> Password {
+        static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        Password(pw.map(|pw| {
+            let name = format!("ONEZIP_PASSWORD_{}_{}", std::process::id(), NEXT.fetch_add(1, Ordering::Relaxed));
+            // SAFETY: Windows 上读写环境变量由系统加锁（SetEnvironmentVariableW），没有
+            // Unix 上 setenv 与其他线程 getenv 并发的问题；变量名每次都不同，不会互相覆盖。
+            unsafe { std::env::set_var(&name, pw) };
+            name
+        }))
+    }
+
+    fn source(&self) -> Option<peel::secret::source::PasswordSource> {
+        self.0.as_ref().map(|n| peel::secret::source::PasswordSource::Env(n.into()))
+    }
+}
+
+impl Drop for Password {
+    fn drop(&mut self) {
+        if let Some(n) = &self.0 {
+            // SAFETY: 同上。
+            unsafe { std::env::remove_var(n) };
+        }
     }
 }
 

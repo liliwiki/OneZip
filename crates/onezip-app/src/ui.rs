@@ -574,6 +574,13 @@ fn stem(path: &Path) -> String {
             return name[..name.len() - ext.len()].to_string();
         }
     }
+    // 7z.dll 的格式（iso、cab、wim……）
+    if let Some((base, ext)) = name.rsplit_once('.')
+        && !base.is_empty()
+        && menu::ARCHIVE_EXTENSIONS.contains(&ext.to_ascii_lowercase().as_str())
+    {
+        return base.to_string();
+    }
     format!("{name}-extracted")
 }
 

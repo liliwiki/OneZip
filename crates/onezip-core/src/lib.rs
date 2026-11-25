@@ -41,8 +41,15 @@ pub use source::Source;
 /// 这个错误是不是"需要密码 / 密码不对"：前端据此弹出密码框，而不是报失败。
 pub fn needs_password(e: &anyhow::Error) -> bool {
     use hatchzip_core::archive::{PasswordNeeded, WrongPassword};
+    use peel::encryption::EncryptionError;
     e.chain().any(|c| {
-        c.is::<PasswordNeeded>() || c.is::<WrongPassword>() || {
+        c.is::<PasswordNeeded>()
+            || c.is::<WrongPassword>()
+            || matches!(
+                c.downcast_ref::<EncryptionError>(),
+                Some(EncryptionError::PasswordMissing | EncryptionError::PasswordIncorrect)
+            )
+            || {
             #[cfg(windows)]
             {
                 c.is::<sevenzip::NeedPassword>() || c.is::<sevenzip::BadPassword>()
@@ -143,6 +150,8 @@ pub fn extract(
 ) -> Result<Outcome> {
     match &req.source {
         Source::Local(path) => local::extract(path, req, observer, stop, confirm),
+        #[cfg(windows)]
+        Source::Url(url) if sevenzip::handles_url(url) => sevenzip::extract_url(url, req, observer, stop),
         Source::Url(url) => remote::extract(url, req, observer, stop),
     }
 }

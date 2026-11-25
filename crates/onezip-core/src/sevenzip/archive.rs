@@ -12,6 +12,7 @@ use std::sync::{Arc, Mutex};
 use anyhow::{Result, anyhow, bail};
 use windows_core::{AsImpl, HRESULT, Interface, implement};
 
+use super::fetch::Src;
 use super::ffi::*;
 
 /// 7z.dll 报告的一个条目。
@@ -65,14 +66,14 @@ impl std::error::Error for Stopped {}
 /// 给 7z.dll 读的文件。`zero` 里的区间按全零返回（边解边删时这些地方已经打洞释放）。
 #[implement(IInStream, ISequentialInStream)]
 struct InStream {
-    inner: Mutex<(File, u64)>,
+    inner: Mutex<(Src, u64)>,
     len: u64,
 }
 
 impl InStream {
     fn open(path: &Path) -> Result<IInStream> {
-        let file = File::open(path)?;
-        let len = file.metadata()?.len();
+        let file = Src::open(path)?;
+        let len = file.len()?;
         Ok(InStream {
             inner: Mutex::new((file, 0)),
             len,

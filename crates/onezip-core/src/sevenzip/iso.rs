@@ -18,6 +18,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result, bail, ensure};
 
+use super::fetch::Src;
 use super::{Journal, choose_output, flush_all, reported_output, target_of};
 use crate::{Confirm, Event, ExtractRequest, Observer, Outcome};
 
@@ -42,7 +43,7 @@ struct Image {
 }
 
 struct Reader {
-    f: File,
+    f: Src,
     len: u64,
     meta: Vec<(u64, u64)>,
 }
@@ -88,8 +89,8 @@ fn civil(year: i64, month: u32, day: u32, h: u32, mi: u32, s: u32) -> Option<Sys
 }
 
 fn open(path: &Path) -> Result<Image> {
-    let f = File::open(path)?;
-    let len = f.metadata()?.len();
+    let f = Src::open(path)?;
+    let len = f.len()?;
     let mut r = Reader { f, len, meta: Vec::new() };
     // 卷识别序列：有 NSR02 / NSR03 就是 UDF
     let mut udf = false;
@@ -463,7 +464,7 @@ fn units(img: &Image) -> Result<Vec<IsoUnit>> {
 
 // ---- 解出 ----
 
-fn copy_file(src: &mut File, f: &IsoFile, dest: &Path, observer: &Observer, stop: &AtomicBool) -> Result<bool> {
+fn copy_file(src: &mut Src, f: &IsoFile, dest: &Path, observer: &Observer, stop: &AtomicBool) -> Result<bool> {
     if let Some(parent) = dest.parent() {
         fs::create_dir_all(parent)?;
     }
@@ -549,7 +550,9 @@ pub(super) fn extract_in_place(
     let total: u64 = todo.iter().flat_map(|(_, u)| u.files.iter()).map(|&i| img.files[i].size).sum();
     observer(Event::Started { total, resuming });
 
-    let mut src = OpenOptions::new().read(true).write(true).open(archive)?;
+    let mut src = Src::open(archive)?;
+    // 打洞用另一个可写的句柄
+    let hole = OpenOptions::new().read(true).write(true).open(archive)?;
     let mut can_punch = true;
     let mut start = 0;
     while start < todo.len() {
@@ -581,7 +584,7 @@ pub(super) fn extract_in_place(
         #[cfg(windows)]
         if can_punch {
             for (s, e) in super::merged(batch.iter().flat_map(|(_, u)| u.ranges.iter())) {
-                if !super::punch::punch(&src, s, e)? {
+                if !super::punch::punch(&hole, s, e)? {
                     can_punch = false;
                     observer(Event::Note("这个磁盘不支持释放部分空间，镜像会在解压完成后删除".into()));
                     break;
@@ -597,6 +600,7 @@ pub(super) fn extract_in_place(
     }
     let _ = can_punch;
     drop(src);
+    drop(hole);
     let reported = reported_output(archive, &output, &paths);
     fs::remove_file(archive).with_context(|| format!("删除 {}", archive.display()))?;
     journal.remove();

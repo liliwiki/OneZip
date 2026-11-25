@@ -9,6 +9,7 @@
 //! 7z.dll 重新打开时只读文件头，不碰这些区间，所以中断后可以接着来。
 
 mod archive;
+mod fetch;
 mod ffi;
 mod iso;
 mod layout;
@@ -23,6 +24,7 @@ use std::sync::{Arc, Mutex};
 use anyhow::{Context, Result, anyhow, bail};
 
 pub(crate) use archive::{BadPassword, NeedPassword};
+pub(crate) use fetch::{extract_url, handles_url};
 use archive::{Sink, Stopped, Target};
 
 use crate::{Confirm, Entry, Event, ExtractRequest, Observer, Outcome, Placement};
@@ -295,6 +297,16 @@ mod punch {
         Ok(true)
     }
 
+    /// 设成稀疏文件：没写过的地方不占磁盘（边下载边解压的镜像文件用）。
+    pub fn set_sparse(file: &File) -> std::io::Result<()> {
+        let mut ret = 0u32;
+        // 不支持稀疏文件的磁盘（FAT32、exFAT）照样能下载，只是没写的地方也占空间。
+        let _ = unsafe {
+            DeviceIoControl(HANDLE(file.as_raw_handle()), FSCTL_SET_SPARSE, None, 0, None, 0, Some(&mut ret), None)
+        };
+        Ok(())
+    }
+
     /// 文件实际占用的磁盘空间。
     pub fn allocated(path: &std::path::Path) -> Option<u64> {
         use windows::Win32::Storage::FileSystem::GetCompressedFileSizeW;
@@ -403,12 +415,14 @@ pub(crate) fn extract(
     }
 
     let by_index: HashMap<u32, &archive::Item> = items.iter().map(|i| (i.index, i)).collect();
-    let todo: Vec<(u64, &layout::Unit)> = units
+    let mut todo: Vec<(u64, &layout::Unit)> = units
         .iter()
         .enumerate()
         .map(|(n, u)| (n as u64, u))
         .filter(|(n, _)| !journal.done.contains(n))
         .collect();
+    // 按数据在文件里的先后处理：边下载边解压时读取是顺序的，下载可以一直走在前面。
+    todo.sort_by_key(|(_, u)| u.ranges.first().map_or(0, |r| r.0));
     let unit_bytes = |u: &layout::Unit| -> u64 {
         u.items.iter().filter_map(|i| by_index.get(i)).filter(|i| !i.is_dir).map(|i| i.size).sum()
     };
