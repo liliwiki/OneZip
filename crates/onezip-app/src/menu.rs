@@ -10,9 +10,21 @@ use std::path::Path;
 use anyhow::Result;
 
 /// 出现在压缩包上的扩展名。`.001` 是分卷的第一卷。
+/// 与 onezip-shell 的同名列表一致。
 pub const ARCHIVE_EXTENSIONS: &[&str] = &[
-    "zip", "7z", "rar", "tar", "tgz", "gz", "tbz2", "tbz", "bz2", "txz", "xz", "zst", "tzst",
+    "zip", "7z", "rar", "r00", "tar", "tgz", "gz", "tbz2", "tbz", "bz2", "txz", "xz", "zst", "tzst",
     "lz4", "001",
+    // 以下由 7z.dll 解压
+    "iso", "img", "udf", "wim", "swm", "esd", "cab", "dmg", "vhd", "vhdx", "vmdk", "vdi", "qcow",
+    "qcow2", "msi", "msp", "msu", "arj", "lzh", "lha", "chm", "chi", "chw", "cpio", "rpm", "deb",
+    "xar", "pkg", "squashfs", "cramfs", "hfs", "hfsx", "apfs", "z", "taz", "lzma",
+];
+
+/// 只能普通解压、不能边解边删的扩展名（磁盘镜像、安装包等，见 onezip-core 的 sevenzip 模块）。
+pub const NO_IN_PLACE_EXTENSIONS: &[&str] = &[
+    "img", "swm", "dmg", "vhd", "vhdx", "vmdk", "vdi", "qcow", "qcow2", "msi", "msp", "msu", "chm",
+    "chi", "chw", "cpio", "rpm", "deb", "xar", "pkg", "squashfs", "cramfs", "hfs", "hfsx", "apfs",
+    "z", "taz", "lzma",
 ];
 
 pub struct Item {
@@ -52,6 +64,18 @@ pub const HASH_ITEMS: &[(&str, &str, &str)] = &[
     ("2md5", "MD5", "md5"),
     ("3sha256", "SHA-256", "sha256"),
     ("4all", "全部算法", "*"),
+];
+
+/// 不能边解边删的格式（磁盘镜像、安装包等）：去掉"解压后删除压缩包"。
+pub const EXTRACT_ITEMS_KEEP_ONLY: &[Item] = &[
+    item("01smart", "智能解压", "--extract-smart", false),
+    item("02folder", "解压到同名文件夹", "--extract-folder", false),
+    item("03here", "解压到当前位置", "--extract-here", false),
+    item("04to", "解压文件…", "--extract-to", false),
+    item("06test", "测试压缩包", "--test", true),
+    item("07add", "添加到压缩包…", "--compress", true),
+    item("08add7z", "添加到 7z 压缩包", "--compress-7z", false),
+    item("09addzip", "添加到 zip 压缩包", "--compress-zip", false),
 ];
 
 /// 其它文件和文件夹上的菜单。
@@ -128,7 +152,9 @@ mod imp {
     pub fn register(exe: &Path) -> Result<()> {
         unregister();
         for (base, archive) in bases() {
-            if archive {
+            if archive && NO_IN_PLACE_EXTENSIONS.iter().any(|e| base.ends_with(&format!(".{e}"))) {
+                add(&base, exe, EXTRACT_ITEMS_KEEP_ONLY)?;
+            } else if archive {
                 add(&base, exe, EXTRACT_ITEMS)?;
             } else {
                 add(&base, exe, COMPRESS_ITEMS)?;

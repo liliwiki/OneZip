@@ -247,6 +247,25 @@ fn wire(app: &Rc<App>) {
                 return;
             };
             let reclaim = app.window.get_reclaim();
+            if reclaim {
+                let no: Vec<String> = files
+                    .iter()
+                    .filter(|f| !onezip_core::can_extract_in_place(f))
+                    .filter_map(|f| f.file_name().map(|n| n.to_string_lossy().into_owned()))
+                    .collect();
+                if !no.is_empty() {
+                    message(app.window.window())
+                        .set_title("边解压边释放空间")
+                        .set_level(MessageLevel::Warning)
+                        .set_description(format!(
+                            "这些文件的格式（磁盘镜像、安装包等）不能边解压边删除，\
+                             请取消勾选“边解压边释放空间”后再解压：\n\n{}",
+                            no.join("\n")
+                        ))
+                        .show();
+                    return;
+                }
+            }
             if reclaim && !confirm_reclaim(app.window.window(), files.len()) {
                 return;
             }

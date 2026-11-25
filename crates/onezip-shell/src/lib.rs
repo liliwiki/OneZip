@@ -15,8 +15,19 @@ pub const CLSID_TEXT: &str = "3847becd-6a0c-43a7-b898-e1f2c38be845";
 
 /// 会出现"解压"类菜单项的扩展名（小写，不带点）。
 pub const ARCHIVE_EXTENSIONS: &[&str] = &[
-    "zip", "7z", "rar", "tar", "tgz", "gz", "tbz2", "tbz", "bz2", "txz", "xz", "zst", "tzst",
+    "zip", "7z", "rar", "r00", "tar", "tgz", "gz", "tbz2", "tbz", "bz2", "txz", "xz", "zst", "tzst",
     "lz4", "001",
+    // 以下由 7z.dll 解压
+    "iso", "img", "udf", "wim", "swm", "esd", "cab", "dmg", "vhd", "vhdx", "vmdk", "vdi", "qcow",
+    "qcow2", "msi", "msp", "msu", "arj", "lzh", "lha", "chm", "chi", "chw", "cpio", "rpm", "deb",
+    "xar", "pkg", "squashfs", "cramfs", "hfs", "hfsx", "apfs", "z", "taz", "lzma",
+];
+
+/// 只能普通解压、不能边解边删的扩展名（磁盘镜像、安装包等，见 onezip-core 的 sevenzip 模块）。
+pub const NO_IN_PLACE_EXTENSIONS: &[&str] = &[
+    "img", "swm", "dmg", "vhd", "vhdx", "vmdk", "vdi", "qcow", "qcow2", "msi", "msp", "msu", "chm",
+    "chi", "chw", "cpio", "rpm", "deb", "xar", "pkg", "squashfs", "cramfs", "hfs", "hfsx", "apfs",
+    "z", "taz", "lzma",
 ];
 
 /// 菜单里的一项。参照 7-Zip / NanaZip：解压一组、释放空间与测试一组、压缩一组，
@@ -31,6 +42,8 @@ pub enum Entry {
 pub enum Show {
     /// 选中的全是压缩包时才显示。
     Archives,
+    /// 选中的全是能边解边删的压缩包时才显示。
+    InPlace,
     Always,
 }
 
@@ -93,6 +106,7 @@ impl Command {
     pub fn show(self) -> Show {
         match self {
             Command::AddTo | Command::Add7z | Command::AddZip | Command::Hash(_) => Show::Always,
+            Command::ExtractAndDelete => Show::InPlace,
             _ => Show::Archives,
         }
     }
@@ -135,7 +149,19 @@ impl Command {
 
 /// 是否显示某一项：解压类只在选中的全是压缩包时出现。
 pub fn visible(entry: Entry, paths: &[String]) -> bool {
-    !paths.is_empty() && (entry.show() == Show::Always || paths.iter().all(|p| is_archive(p)))
+    !paths.is_empty()
+        && match entry.show() {
+            Show::Always => true,
+            Show::Archives => paths.iter().all(|p| is_archive(p)),
+            Show::InPlace => paths.iter().all(|p| is_archive(p) && in_place(p)),
+        }
+}
+
+/// 能不能边解边删（按扩展名）。
+pub fn in_place(path: &str) -> bool {
+    let lower = path.to_ascii_lowercase();
+    let ext = lower.rsplit_once('.').map_or("", |(_, e)| e);
+    !NO_IN_PLACE_EXTENSIONS.contains(&ext)
 }
 
 fn file_name(path: &str) -> &str {
@@ -245,5 +271,10 @@ mod tests {
         assert!(!visible(Entry::Separator(Show::Archives), &mixed));
         assert!(visible(add, &mixed));
         assert!(!visible(add, &[]));
+        let delete = Entry::Command(Command::ExtractAndDelete);
+        assert!(visible(delete, &[r"C:\a.iso".to_string()]));
+        assert!(visible(delete, &[r"C:\a.cab".to_string()]));
+        assert!(!visible(delete, &[r"C:\a.dmg".to_string()]));
+        assert!(visible(extract, &[r"C:\a.dmg".to_string()]));
     }
 }
