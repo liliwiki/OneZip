@@ -49,12 +49,9 @@ pub const EXTRACT_ITEMS: &[Item] = &[
 /// "CRC SHA" 二级菜单：（键名，菜单文字，算法）。与 onezip-shell 的 HASH_ITEMS 一致。
 pub const HASH_ITEMS: &[(&str, &str, &str)] = &[
     ("1crc32", "CRC-32", "crc32"),
-    ("2crc64", "CRC-64", "crc64"),
-    ("3md5", "MD5", "md5"),
-    ("4sha1", "SHA-1", "sha1"),
-    ("5sha256", "SHA-256", "sha256"),
-    ("6sha512", "SHA-512", "sha512"),
-    ("7all", "*（全部）", "*"),
+    ("2md5", "MD5", "md5"),
+    ("3sha256", "SHA-256", "sha256"),
+    ("4all", "全部算法", "*"),
 ];
 
 /// 其它文件和文件夹上的菜单。

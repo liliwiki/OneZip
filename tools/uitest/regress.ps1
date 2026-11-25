@@ -84,7 +84,7 @@ Check '添加到压缩包…（对话框在最前，加密 7z）' ($fg -and (Wai
 # ---- 校验值（平铺在 OneZip 子菜单里）----
 # 结果窗口里的文字通过“复制”按钮取出来核对。
 $m = & powershell -NoProfile -ExecutionPolicy Bypass -File "$here\menu.ps1" -Folder $Dir -Items '笔记.txt'
-Check 'OneZip 子菜单里有校验值各项' (($m -match '^\s+CRC-32$') -and ($m -match '^\s+SHA-512$') -and ($m -match '校验值（全部算法）'))
+Check 'OneZip 子菜单里有校验值各项' (($m -match '^\s+CRC-32$') -and ($m -match '^\s+SHA-256$') -and ($m -match '校验值（全部算法）') -and -not ($m -match '^\s+SHA-512$'))
 Set-Clipboard 'x'
 MN -Folder $Dir -Items '笔记.txt' -Command 'SHA-256'
 $want = (Get-FileHash "$Dir\笔记.txt" -Algorithm SHA256).Hash

@@ -52,14 +52,12 @@ pub enum Command {
     Hash(usize),
 }
 
-/// 校验值各项：（菜单文字，传给 `--hash` 的参数）。
+/// 校验值各项：（菜单文字，传给 `--hash` 的参数）。只列最常用的三种，
+/// 其余（CRC-64、SHA-1、SHA-512）在"全部算法"里一起算。
 pub const HASH_ITEMS: &[(&str, [&str; 2])] = &[
     ("CRC-32", ["--hash", "crc32"]),
-    ("CRC-64", ["--hash", "crc64"]),
     ("MD5", ["--hash", "md5"]),
-    ("SHA-1", ["--hash", "sha1"]),
     ("SHA-256", ["--hash", "sha256"]),
-    ("SHA-512", ["--hash", "sha512"]),
     ("校验值（全部算法）", ["--hash", "*"]),
 ];
 
@@ -80,9 +78,6 @@ pub const MENU: &[Entry] = &[
     Entry::Command(Command::Hash(1)),
     Entry::Command(Command::Hash(2)),
     Entry::Command(Command::Hash(3)),
-    Entry::Command(Command::Hash(4)),
-    Entry::Command(Command::Hash(5)),
-    Entry::Command(Command::Hash(6)),
 ];
 
 impl Entry {
