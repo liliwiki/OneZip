@@ -151,7 +151,12 @@ fn smart_placement_single_root_goes_beside_archive() {
         keep_free: 0,
         ..Default::default()
     };
-    onezip_core::extract(&req, quiet(), &stop(), &mut |_| true).unwrap();
+    let r = onezip_core::extract(&req, quiet(), &stop(), &mut |_| true).unwrap();
+    // 报告的是解出的那一项，"打开"会定位到它。
+    let Outcome::Finished { output, .. } = r else {
+        panic!()
+    };
+    assert_eq!(output, dir.path().join("资料"));
     // 顶层只有一个"资料"文件夹：直接放在压缩包旁边，不再多套一层 pack/。
     assert_eq!(common::read_tree(&dir.path().join("资料")), common::sample_files());
     assert!(!dir.path().join("pack").exists());

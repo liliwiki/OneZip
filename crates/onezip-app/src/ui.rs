@@ -53,7 +53,9 @@ pub fn run(first: Request, incoming: Receiver<Request>) -> anyhow::Result<()> {
 }
 
 fn status_text() -> String {
-    if menu::is_registered() {
+    if menu::shell_package_installed() {
+        "右键菜单已启用（Windows 11 第一层菜单）。".into()
+    } else if menu::is_registered() {
         "右键菜单已启用。".into()
     } else {
         "右键菜单尚未启用：点右上角“右键菜单…”启用。".into()
@@ -228,6 +230,17 @@ fn wire(app: &Rc<App>) {
 }
 
 fn toggle_menu() {
+    if menu::shell_package_installed() {
+        // 第一层菜单由安装程序注册；再写传统菜单只会在"显示更多选项"里重复一份。
+        MessageDialog::new()
+            .set_title("右键菜单")
+            .set_description(
+                "Windows 11 第一层右键菜单已由安装程序启用。\n要移除它，请在“设置 → 应用 → 已安装的应用”里卸载 OneZip。",
+            )
+            .set_buttons(MessageButtons::Ok)
+            .show();
+        return;
+    }
     let registered = menu::is_registered();
     let question = if registered {
         "右键菜单已启用。要移除它吗？"

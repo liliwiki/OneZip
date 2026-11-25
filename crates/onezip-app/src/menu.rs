@@ -139,6 +139,19 @@ mod imp {
             .is_ok()
     }
 
+    /// 安装程序是否已注册 Windows 11 第一层菜单用的稀疏包（OneZip.ShellExtension）。
+    pub fn shell_package_installed() -> bool {
+        const PACKAGES: &str = r"Software\Classes\Local Settings\Software\Microsoft\Windows\CurrentVersion\AppModel\Repository\Packages";
+        RegKey::predef(HKEY_CURRENT_USER)
+            .open_subkey(PACKAGES)
+            .map(|k| {
+                k.enum_keys()
+                    .flatten()
+                    .any(|name| name.starts_with("OneZip.ShellExtension_"))
+            })
+            .unwrap_or(false)
+    }
+
     /// 让资源管理器重新读取文件关联。
     fn notify() {
         #[link(name = "shell32")]
@@ -160,6 +173,9 @@ mod imp {
     pub fn is_registered() -> bool {
         false
     }
+    pub fn shell_package_installed() -> bool {
+        false
+    }
 }
 
-pub use imp::{is_registered, register, unregister};
+pub use imp::{is_registered, register, shell_package_installed, unregister};

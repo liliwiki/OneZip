@@ -224,7 +224,18 @@ fn extract_one(
     };
 
     let nested = sole_archive(&job, &journal.output);
+    // 直接解到压缩包旁边、且只有一个顶层项时，报告那一项本身，"打开"才会定位到它。
+    let beside = (Some(journal.output.as_path()) == primary.parent())
+        .then(|| top_item(&job))
+        .flatten()
+        .map(|top| journal.output.join(top));
     let outcome = run(job, journal, paths, resuming, req.keep_free, observer, stop)?;
+    let outcome = match (outcome, beside) {
+        (Outcome::Finished { warning, .. }, Some(output)) if output.exists() => {
+            Outcome::Finished { output, warning }
+        }
+        (outcome, _) => outcome,
+    };
     let nested = matches!(outcome, Outcome::Finished { .. })
         .then_some(nested)
         .flatten();
@@ -246,6 +257,17 @@ fn place(job: &Job, primary: &Path, folder: PathBuf, placement: Placement) -> Re
         }
         Placement::Smart => Ok(folder),
     }
+}
+
+/// 所有条目都在同一个顶层名字下时返回这个名字。
+fn top_item(job: &Job) -> Option<PathBuf> {
+    let mut tops = job
+        .units
+        .iter()
+        .flat_map(|u| &u.items)
+        .filter_map(|i| i.path.components().next());
+    let first = tops.next()?;
+    tops.all(|c| c == first).then(|| PathBuf::from(first.as_os_str()))
 }
 
 /// 压缩包里只有一个文件、并且它本身像压缩包时，返回它解出后的路径。
