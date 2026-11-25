@@ -12,13 +12,9 @@ An all-in-one archive tool for Windows: compress, extract smartly, extract in pl
 
 ## Download
 
-Get `OneZip-<version>-x64.zip` from the [Releases](https://github.com/liliwiki/OneZip/releases) page, extract it, and run in that folder:
+Download `OneZip-<version>-Setup.exe` from the [Releases](https://github.com/liliwiki/OneZip/releases) page and run it.
 
-```powershell
-powershell -ExecutionPolicy Bypass -File install.ps1
-```
-
-It installs to `%LOCALAPPDATA%\Programs\OneZip` for the current user. On Windows 11 the context menu is registered through a sparse package; release builds are signed with a self-signed certificate, so the installer asks once for administrator approval to add it to "Trusted People". On Windows 10 the classic per-user context menu is used. To uninstall, use "Installed apps" in Windows Settings or run `uninstall.ps1`.
+It installs to `%LOCALAPPDATA%\Programs\OneZip` for the current user and needs no administrator rights, with one exception: on Windows 11 the context menu is registered through a sparse package signed with a self-signed certificate, so the first installation asks once for administrator approval to add that certificate to "Trusted People". On Windows 10 the classic per-user context menu is used. The installer is unsigned, so SmartScreen may warn about it; choose "More info" → "Run anyway". To uninstall, use "Installed apps" in Windows Settings.
 
 Requires Windows 10 or 11 (x64). Verify the SHA-256 published on the Release page before running it.
 
@@ -28,8 +24,10 @@ Requires Windows 10 or 11 (x64). Verify the SHA-256 published on the Release pag
 |---|---|---|
 | Compress | 7z (LZMA2, multi-threaded, solid, AES-256 with encrypted file names), zip (Deflate, AES-256), tar.zst, tar.xz, tar.gz. Written to a temporary file and renamed only when complete | sevenz-rust2, zip, zstd, lzma-rust2, flate2 |
 | Extract | zip, 7z, tar, tar.gz, tar.bz2, tar.xz, split archives (.001, .z01) | HatchZip |
-| Extract | tar.zst, tar.lz4, .zst, .lz4, rar (RAR5 and RAR4, unencrypted) | Peel |
-| Extract in place | Frees the archive's space batch by batch while extracting; resumes after a power cut or a crash | HatchZip, Peel |
+| Extract | rar: RAR5 and RAR4, multi-volume, passwords, encrypted file names | HatchZip (UnRAR) |
+| Extract | tar.zst, tar.lz4, .zst, .lz4 | Peel |
+| Extract | iso, udf, wim, esd, cab, arj, lzh, dmg, vhd, vhdx, vmdk, vdi, qcow2, msi, chm, cpio, rpm, deb, xar, squashfs, cramfs, hfs, apfs, z, lzma | 7-Zip (7z.dll) |
+| Extract in place | Frees the archive's space batch by batch while extracting; resumes after a power cut or a crash. Works for every format above except disk images and installers (dmg, vhd, vhdx, vmdk, vdi, qcow2, msi, chm and similar), whose layout does not allow it | HatchZip, Peel, OneZip |
 | Extract while downloading | Parallel ranged download, streaming decode, used data released at once, resumable | Peel |
 | Smart extraction | A single top-level item goes next to the archive, otherwise into a folder named after it; nested archives are unpacked too | OneZip |
 | List, test, checksums | CRC-32, CRC-64, MD5, SHA-1, SHA-256, SHA-512 for files and folders | OneZip, HatchZip |
@@ -44,7 +42,7 @@ Right-clicking an archive opens the OneZip submenu:
 - Add to archive… / Add to "name.7z" / Add to "name.zip"
 - CRC-32 / MD5 / SHA-256 / all algorithms
 
-Other files and folders show only the compression and checksum items. Each operation opens its own progress window with elapsed time, remaining time, speed, pause and cancel; it closes when the work is done. The main window opens only when you start OneZip directly.
+"Extract and delete the archive" appears only for formats that support it. Other files and folders show only the compression and checksum items. Each operation opens its own progress window with elapsed time, remaining time, speed, pause and cancel; it closes when the work is done. The main window opens only when you start OneZip directly.
 
 ## Safety
 
@@ -59,8 +57,9 @@ crates/onezip-core/    Engine: extract(), compress(), list(), test(), hash()
 crates/onezip-cli/     onezipc.exe command line
 crates/onezip-app/     OneZip.exe window (Slint), single instance, task queue, progress windows
 crates/onezip-shell/   onezip_shell.dll, Windows 11 context menu (IExplorerCommand)
+crates/onezip-setup/   OneZip-<version>-Setup.exe installer
 packaging/             Sparse package manifest, build and signing script, install and uninstall scripts
-third_party/           Modified copies of hatchzip-core and lzma-rust2
+third_party/           Modified copies of hatchzip-core and lzma-rust2; 7-Zip's 7z.dll
 tools/uitest/          Context menu and window tests driven by UI Automation
 docs/                  Original design notes (Chinese)
 ```
@@ -72,7 +71,7 @@ Requires Rust 1.93 or later with the MSVC toolchain, and Visual Studio Build Too
 ```powershell
 cargo build --release
 cargo test --workspace
-powershell -ExecutionPolicy Bypass -File packaging\build-package.ps1   # target\dist\OneZip-<version>-x64.zip
+powershell -ExecutionPolicy Bypass -File packaging\build-package.ps1   # target\dist\OneZip-<version>-Setup.exe
 ```
 
 Command line:

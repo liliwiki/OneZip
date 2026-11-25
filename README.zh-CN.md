@@ -12,13 +12,9 @@ Windows 一体化压缩工具：常规压缩、智能解压、本地边解压边
 
 ## 下载
 
-在 [Releases](https://github.com/liliwiki/OneZip/releases) 页面下载 `OneZip-<版本>-x64.zip`，解压后在该文件夹里运行：
+在 [Releases](https://github.com/liliwiki/OneZip/releases) 页面下载 `OneZip-<版本>-Setup.exe`，双击运行即可。
 
-```powershell
-powershell -ExecutionPolicy Bypass -File install.ps1
-```
-
-安装到 `%LOCALAPPDATA%\Programs\OneZip`，只给当前用户安装。Windows 11 上通过稀疏包注册右键菜单；发布包用的是自签名证书，安装时会弹一次管理员确认，把证书加入"受信任的人"。Windows 10 上使用传统的按用户右键菜单。要卸载的话，在系统设置的「已安装的应用」里卸载，或者运行 `uninstall.ps1`。
+安装到 `%LOCALAPPDATA%\Programs\OneZip`，只给当前用户安装，不需要管理员权限。唯一的例外：Windows 11 上通过稀疏包注册右键菜单，这个包用的是自签名证书，第一次安装时会弹一次管理员确认，把证书加入"受信任的人"。Windows 10 上使用传统的按用户右键菜单。安装程序没有签名，SmartScreen 可能会拦一下，点「更多信息」→「仍要运行」。要卸载的话，在系统设置的「已安装的应用」里卸载。
 
 需要 Windows 10 或 11（x64）。运行前请核对 Release 页面公布的 SHA-256。
 
@@ -28,8 +24,10 @@ powershell -ExecutionPolicy Bypass -File install.ps1
 |---|---|---|
 | 压缩 | 7z（LZMA2，多线程，可固实，AES-256 含文件名加密）、zip（Deflate，AES-256）、tar.zst、tar.xz、tar.gz；先写临时文件，完成后才改名 | sevenz-rust2、zip、zstd、lzma-rust2、flate2 |
 | 解压 | zip、7z、tar、tar.gz、tar.bz2、tar.xz、分卷（.001、.z01） | HatchZip |
-| 解压 | tar.zst、tar.lz4、.zst、.lz4、rar（RAR5、RAR4，不含加密） | Peel |
-| 边解压边删除 | 解压过程中逐批释放原压缩包的空间；断电、崩溃后可以接着解 | HatchZip、Peel |
+| 解压 | rar：RAR5、RAR4、分卷、密码、加密文件名 | HatchZip（UnRAR） |
+| 解压 | tar.zst、tar.lz4、.zst、.lz4 | Peel |
+| 解压 | iso、udf、wim、esd、cab、arj、lzh、dmg、vhd、vhdx、vmdk、vdi、qcow2、msi、chm、cpio、rpm、deb、xar、squashfs、cramfs、hfs、apfs、z、lzma | 7-Zip（7z.dll） |
+| 边解压边删除 | 解压过程中逐批释放原压缩包的空间；断电、崩溃后可以接着解。上面所有格式都支持，只有磁盘镜像和安装包（dmg、vhd、vhdx、vmdk、vdi、qcow2、msi、chm 等）因为结构不允许而不支持 | HatchZip、Peel、OneZip |
 | 边下载边解压 | 并行分段下载、流式解码、用过的数据立即释放、断点续传 | Peel |
 | 智能解压 | 只有一个顶层项时直接放在压缩包旁边，否则放进同名文件夹；嵌套的压缩包也会接着解开 | OneZip |
 | 列表、测试、校验值 | 文件和文件夹的 CRC-32、CRC-64、MD5、SHA-1、SHA-256、SHA-512 | OneZip、HatchZip |
@@ -44,7 +42,7 @@ powershell -ExecutionPolicy Bypass -File install.ps1
 - 添加到压缩包… / 添加到 "名字.7z" / 添加到 "名字.zip"
 - CRC-32 / MD5 / SHA-256 / 校验值（全部算法）
 
-其他文件和文件夹只显示压缩和校验值这几项。每个操作弹出一个自己的进度窗口，显示已用时间、剩余时间、速度，可以暂停、取消，做完自动关闭。只有直接打开 OneZip 时才会出现主窗口。
+"解压后删除压缩包"只在支持的格式上出现。其他文件和文件夹只显示压缩和校验值这几项。每个操作弹出一个自己的进度窗口，显示已用时间、剩余时间、速度，可以暂停、取消，做完自动关闭。只有直接打开 OneZip 时才会出现主窗口。
 
 ## 安全
 
@@ -59,8 +57,9 @@ crates/onezip-core/    引擎：extract()、compress()、list()、test()、hash(
 crates/onezip-cli/     onezipc.exe 命令行
 crates/onezip-app/     OneZip.exe 窗口（Slint），单实例、任务队列、进度窗口
 crates/onezip-shell/   onezip_shell.dll，Windows 11 右键菜单（IExplorerCommand）
+crates/onezip-setup/   安装程序 OneZip-<版本>-Setup.exe
 packaging/             稀疏包清单、打包签名脚本、安装与卸载脚本
-third_party/           改过的 hatchzip-core、lzma-rust2
+third_party/           改过的 hatchzip-core、lzma-rust2；7-Zip 的 7z.dll
 tools/uitest/          用 UI 自动化测试右键菜单和窗口
 docs/                  最初的设计草案
 ```
@@ -72,7 +71,7 @@ docs/                  最初的设计草案
 ```powershell
 cargo build --release
 cargo test --workspace
-powershell -ExecutionPolicy Bypass -File packaging\build-package.ps1   # 生成 target\dist\OneZip-<版本>-x64.zip
+powershell -ExecutionPolicy Bypass -File packaging\build-package.ps1   # 生成 target\dist\OneZip-<版本>-Setup.exe
 ```
 
 命令行：

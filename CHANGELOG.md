@@ -13,13 +13,16 @@ First release.
 ### Added
 
 - One engine over HatchZip (local in-place extraction) and Peel (extract while downloading), with smart placement, nested archive unpacking, listing, testing, and resume after interruption.
+- RAR extraction through HatchZip's UnRAR support: RAR5 and RAR4, volumes, passwords, and encrypted file names.
+- Extraction of iso, udf, wim, esd, cab, arj, lzh, dmg, vhd, vhdx, vmdk, vdi, qcow2, msi, chm, cpio, rpm, deb, xar, squashfs, hfs, apfs, and more through 7-Zip's 7z.dll (26.06).
+- In-place extraction for iso (ISO9660, Joliet, UDF), wim/esd, cab, arj, and lzh: OneZip reads each format's layout, checks it against 7z.dll, and frees the archive's space batch by batch with resume after interruption. The context menu offers it only for formats that support it.
 - Compression to 7z, zip, tar.zst, tar.xz, and tar.gz, with AES-256 for 7z and zip. Multi-threaded 7z and tar.xz report real progress and stop promptly when cancelled.
 - Checksums: CRC-32, CRC-64, MD5, SHA-1, SHA-256, and SHA-512 for files and folders.
 - `OneZip.exe` window with a task queue, pause and resume, password prompts, and compression options.
 - Progress windows for context menu operations, in the style of 7-Zip; they close when the work is done.
 - Windows 11 first-level context menu through a sparse package and `IExplorerCommand`, with the classic menu on Windows 10.
 - `onezipc.exe` command line.
-- Install and uninstall scripts, and a packaging script that builds and signs the sparse package.
+- `OneZip-<version>-Setup.exe` installer (per user, no administrator rights except trusting the sparse package certificate once on Windows 11), and a packaging script that builds and signs the sparse package.
 - Context menu regression tests driven by UI Automation.
 
 ### Changed

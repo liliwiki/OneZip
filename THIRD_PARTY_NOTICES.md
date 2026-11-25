@@ -13,7 +13,7 @@ The root MIT License applies only to original OneZip source and documentation cr
 - License: MIT OR Apache-2.0 — `third_party/hatchzip-core/LICENSE-MIT`, `third_party/hatchzip-core/LICENSE-APACHE`
 - Changes: on Windows, files are flushed to disk in parallel when a batch commits instead of one at a time. See `third_party/hatchzip-core/ONEZIP-CHANGES.md`.
 
-The optional `rar` feature of HatchZip compiles UnRAR source code, which has its own license (`LICENSE-UNRAR` in the HatchZip repository). OneZip does not enable it.
+OneZip enables HatchZip's `rar` feature, which compiles the UnRAR source code by Alexander Roshal into OneZip.exe and onezipc.exe. UnRAR has its own license: `third_party/hatchzip-core/LICENSE-UNRAR`, shipped as `UnRAR-License.txt`. In short, the UnRAR code may be used freely to extract RAR archives, but it may not be used to re-create the RAR compression algorithm.
 
 ### lzma-rust2 0.23
 
@@ -22,6 +22,18 @@ The optional `rar` feature of HatchZip compiles UnRAR source code, which has its
 - Location: `third_party/lzma-rust2/`
 - License: Apache-2.0 — `third_party/lzma-rust2/LICENSE`
 - Changes: the multi-threaded LZMA2 and XZ encoders report progress and honour a cancel flag. See `third_party/lzma-rust2/ONEZIP-CHANGES.md`.
+
+## Redistributed binaries
+
+### 7-Zip (7z.dll)
+
+- Project: 7-Zip — https://www.7-zip.org
+- Version: 26.06, x64, unmodified `7z.dll` from the official distribution
+- Location: `third_party/7zip/7z.dll`, installed next to OneZip.exe
+- Copyright: (C) 1999-2026 Igor Pavlov
+- License: GNU LGPL 2.1 or later, with parts under the BSD 3-Clause and BSD 2-Clause licenses, and the unRAR license restriction for its RAR code — `third_party/7zip/License.txt`, shipped as `7-Zip-License.txt`
+- Source code: https://www.7-zip.org/download.html. OneZip loads 7z.dll at run time; you can replace it with your own build of the same version.
+- Use: listing, testing and extracting ISO, UDF, WIM/ESD, CAB, DMG, VHD/VHDX, VMDK, VDI, QCOW2, MSI, ARJ, LZH, CHM, CPIO, RPM, DEB, XAR, SquashFS, CramFS, HFS, APFS, Z and LZMA archives.
 
 ## Libraries linked into OneZip
 
@@ -66,11 +78,17 @@ Release builds also include these crates, each under its own license:
 
 The complete list, including indirect dependencies, is in `Cargo.lock`; `cargo metadata` prints the license of each one.
 
+## Test files
+
+- `crates/onezip-core/tests/fixtures/rar/`: from the HatchZip test suite (MIT OR Apache-2.0).
+- `crates/onezip-core/tests/fixtures/sevenzip/lzh/`: from the libarchive test suite (BSD 2-Clause), https://github.com/libarchive/libarchive.
+- Other test archives were generated for this repository (Windows IMAPI2, makecab, 7-Zip; see `crates/onezip-core/tests/fixtures/sevenzip/make.ps1` and `arj/make_arj.py`) and are covered by the root license.
+
 ## Tools used to build
 
 - Microsoft Windows SDK (`makeappx`, `makepri`, `signtool`) packages and signs the sparse package. Nothing from the SDK is redistributed.
-- winresource 0.1.34 (MIT) embeds the program icon at build time.
+- winresource 0.1.34 (MIT) embeds the program icon and the installer manifest at build time.
 
 ## Names and marks
 
-NanaZip, 7-Zip, HatchZip, Peel, Windows, and related names belong to their respective owners. OneZip is not affiliated with or endorsed by them.
+NanaZip, 7-Zip, WinRAR, RAR, HatchZip, Peel, Windows, and related names belong to their respective owners. OneZip is not affiliated with or endorsed by them.
