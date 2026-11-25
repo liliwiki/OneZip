@@ -1,72 +1,111 @@
-# OneZip（暂定名）
+# OneZip
 
-Windows 一体化压缩管理工具：常规压缩/解压、智能解压、本地边解压边释放空间、边下载边解压边释放空间，统一图形界面与右键菜单（Windows 11 第一层菜单）。
+[![Windows](https://img.shields.io/badge/Windows-10%20%7C%2011-0078D4)](https://github.com/liliwiki/OneZip)
+[![Rust](https://img.shields.io/badge/Rust-1.93+-B7410E)](https://www.rust-lang.org/)
+[![License: MIT](https://img.shields.io/badge/License-MIT-green.svg)](LICENSE)
 
-设计见 [docs/设计方案.md](docs/设计方案.md)。
+**English** | [简体中文](README.zh-CN.md)
 
-## 功能
+An all-in-one archive tool for Windows: compress, extract smartly, extract in place while freeing the archive's space, and extract while downloading. It builds on the [HatchZip](https://github.com/xevrion/hatchzip) and [Peel](https://github.com/agouin/peel) engines and adds its menu to the first level of the Windows 11 context menu. The interface is in Simplified Chinese.
 
-| 功能 | 说明 | 引擎 |
-|---|---|---|
-| 压缩 | 7z（LZMA2，多线程，可固实，AES-256 含文件名加密）、zip（Deflate，AES-256）、tar.zst、tar.xz、tar.gz；先写临时文件，完成后才改名 | sevenz-rust2 / zip / zstd / lzma-rust2 / flate2 |
-| 解压 | zip、7z、tar、tar.gz、tar.bz2、tar.xz、分卷（.001 / .z01）| [HatchZip](https://github.com/xevrion/hatchzip) `hatchzip-core` |
-| 解压 | tar.zst、tar.lz4、.zst、.lz4、rar（RAR5/RAR4，无加密）| [Peel](https://github.com/agouin/peel) |
-| 边解压边删除 | 逆序截断或打洞，逐批释放原压缩包空间；断电、被杀后可继续 | 两者 |
-| 边下载边解压 | 并行分段下载、流式解码、已用数据立即打洞释放、断点续传 | Peel |
-| 智能解压 | 只有一个顶层项时直接放旁边，否则建同名文件夹；嵌套包自动继续拆 | OneZip |
-| 列表 / 测试 | 不改动压缩包 | HatchZip |
+> OneZip is an independent project. It is not affiliated with NanaZip, 7-Zip, HatchZip, or Peel.
 
-## 组成
+## Download
 
-- `crates/onezip-core`：统一引擎，`extract()` / `compress()` / `list()` / `test()`
-- `crates/onezip-cli`：`onezipc.exe` 命令行
-- `crates/onezip-app`：`OneZip.exe` 图形界面（Slint），单实例 + 任务队列（同时两个任务，可暂停/继续）
-- `crates/onezip-shell`：`onezip_shell.dll`，Windows 11 第一层右键菜单（`IExplorerCommand`）
-- `packaging/`：稀疏包清单、打包签名脚本、安装/卸载脚本
+Get `OneZip-<version>-x64.zip` from the [Releases](https://github.com/liliwiki/OneZip/releases) page, extract it, and run in that folder:
 
-## 命令行
-
-```
-onezipc x D:\Downloads\big.zip              # 智能解压，保留原包确认后边解边删
-onezipc x D:\Downloads\big.zip --keep       # 普通解压，保留原包
-onezipc x https://example.com/data.tar.zst -o D:\data
-onezipc a D:\backup.7z D:\资料 -l 7 -p 密码
-onezipc l D:\backup.7z
-onezipc t D:\backup.7z
-```
-
-Ctrl+C 暂停解压并保存进度，再运行同样的命令即可继续。
-
-## 安装
-
-运行 `packaging\build-package.ps1` 生成 `target\dist\OneZip-<版本>-x64.zip`，解压后运行：
-
-```
+```powershell
 powershell -ExecutionPolicy Bypass -File install.ps1
 ```
 
-- 安装到 `%LOCALAPPDATA%\Programs\OneZip`，只对当前用户生效。
-- Windows 11：注册稀疏包，右键菜单出现在第一层。开发版用自签名证书，安装时会弹一次管理员确认，把证书导入"受信任的人"。
-- Windows 10：写入按用户的传统右键菜单。
-- 卸载：在"应用和功能"里卸载，或运行 `uninstall.ps1`。
+It installs to `%LOCALAPPDATA%\Programs\OneZip` for the current user. On Windows 11 the context menu is registered through a sparse package; release builds are signed with a self-signed certificate, so the installer asks once for administrator approval to add it to "Trusted People". On Windows 10 the classic per-user context menu is used. To uninstall, use "Installed apps" in Windows Settings or run `uninstall.ps1`.
 
-## 构建
+Requires Windows 10 or 11 (x64). Verify the SHA-256 published on the Release page before running it.
 
-需要 Rust（MSVC 工具链）和 Visual Studio Build Tools（C++、Windows SDK）。
+No release has been published yet. Until then, build from source as described under [Development](#development).
 
+## Features
+
+| Feature | Details | Engine |
+|---|---|---|
+| Compress | 7z (LZMA2, multi-threaded, solid, AES-256 with encrypted file names), zip (Deflate, AES-256), tar.zst, tar.xz, tar.gz. Written to a temporary file and renamed only when complete | sevenz-rust2, zip, zstd, lzma-rust2, flate2 |
+| Extract | zip, 7z, tar, tar.gz, tar.bz2, tar.xz, split archives (.001, .z01) | HatchZip |
+| Extract | tar.zst, tar.lz4, .zst, .lz4, rar (RAR5 and RAR4, unencrypted) | Peel |
+| Extract in place | Frees the archive's space batch by batch while extracting; resumes after a power cut or a crash | HatchZip, Peel |
+| Extract while downloading | Parallel ranged download, streaming decode, used data released at once, resumable | Peel |
+| Smart extraction | A single top-level item goes next to the archive, otherwise into a folder named after it; nested archives are unpacked too | OneZip |
+| List, test, checksums | CRC-32, CRC-64, MD5, SHA-1, SHA-256, SHA-512 for files and folders | OneZip, HatchZip |
+
+## Context menu
+
+Right-clicking an archive opens the OneZip submenu:
+
+- Smart extraction / Extract to "name\" / Extract here / Extract files…
+- Extract and delete the archive (frees space while extracting)
+- Test archive
+- Add to archive… / Add to "name.7z" / Add to "name.zip"
+- CRC-32 / MD5 / SHA-256 / all algorithms
+
+Other files and folders show only the compression and checksum items. Each operation opens its own progress window with elapsed time, remaining time, speed, pause and cancel; it closes when the work is done. The main window opens only when you start OneZip directly.
+
+## Safety
+
+"Extract and delete the archive" removes the archive while it extracts and cannot be undone. Progress is saved on disk, so an interrupted extraction continues from where it stopped, but keep a backup of anything you cannot replace. Extracting while downloading releases downloaded data as it is used, so it cannot be extracted again without downloading again.
+
+Report security problems privately as described in [SECURITY.md](SECURITY.md).
+
+## Layout
+
+```text
+crates/onezip-core/    Engine: extract(), compress(), list(), test(), hash()
+crates/onezip-cli/     onezipc.exe command line
+crates/onezip-app/     OneZip.exe window (Slint), single instance, task queue, progress windows
+crates/onezip-shell/   onezip_shell.dll, Windows 11 context menu (IExplorerCommand)
+packaging/             Sparse package manifest, build and signing script, install and uninstall scripts
+third_party/           Modified copies of hatchzip-core and lzma-rust2
+tools/uitest/          Context menu and window tests driven by UI Automation
+docs/                  Original design notes (Chinese)
 ```
+
+## Development
+
+Requires Rust 1.93 or later with the MSVC toolchain, and Visual Studio Build Tools with the C++ workload and the Windows SDK.
+
+```powershell
 cargo build --release
 cargo test --workspace
+powershell -ExecutionPolicy Bypass -File packaging\build-package.ps1   # target\dist\OneZip-<version>-x64.zip
 ```
 
-装好之后可以跑右键菜单的界面回归测试（会操作鼠标键盘，运行时别动电脑；测试文件放在 `D:\OZT`）：
+Command line:
 
+```powershell
+onezipc x D:\Downloads\big.zip              # smart extraction; asks before deleting the archive
+onezipc x D:\Downloads\big.zip --keep       # keep the archive
+onezipc x https://example.com/data.tar.zst -o D:\data
+onezipc a D:\backup.7z D:\Data -l 7 -p secret
+onezipc t D:\backup.7z
+onezipc h D:\file.iso -a sha256
 ```
-powershell -ExecutionPolicy Bypass -File tools\uitest\regress.ps1
-```
 
-改了 `assets/onezip-256.png` 后，用 `python tools/make-assets.py` 重新生成稀疏包的各尺寸图标。
+Ctrl+C pauses an extraction at a safe point; run the same command again to continue.
 
-## 许可
+With OneZip installed, `tools\uitest\regress.ps1` exercises every context menu item and the progress windows. It moves the mouse and types, so leave the computer alone while it runs.
 
-MIT OR Apache-2.0。依赖的上游项目及其许可见 [NOTICE](NOTICE)。
+## Versioning
+
+The version is in the workspace `Cargo.toml`. Releases follow [Semantic Versioning](https://semver.org/); changes are recorded in [CHANGELOG.md](CHANGELOG.md).
+
+## Signing
+
+Release builds are produced by the [Build workflow](.github/workflows/build.yml) on GitHub Actions from the tagged source in this repository. The sparse package that registers the Windows 11 context menu is signed with a self-signed certificate (`CN=OneZip Dev`), which is why installation asks to trust it. The executables are unsigned.
+
+### Privacy
+
+OneZip does not collect or send personal data. It contacts the network only when you extract an `http(s)://` address, and only that address.
+
+## License and third-party content
+
+Original source and documentation are under the [MIT License](LICENSE). Third-party content, including the modified copies in `third_party/`, keeps its own terms; see [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md).
+
+[![Made with Slint](https://raw.githubusercontent.com/slint-ui/slint/master/logo/MadeWithSlint-logo-light.svg)](https://slint.dev)
