@@ -16,14 +16,15 @@ use windows::Win32::System::Com::{
 };
 use windows::Win32::System::LibraryLoader::GetModuleFileNameW;
 use windows::Win32::System::SystemServices::DLL_PROCESS_ATTACH;
+use windows::Win32::UI::WindowsAndMessaging::{ASFW_ANY, AllowSetForegroundWindow};
 use windows::Win32::UI::Shell::{
-    ECF_DEFAULT, ECF_HASSUBCOMMANDS, ECS_ENABLED, ECS_HIDDEN, IEnumExplorerCommand,
+    ECF_DEFAULT, ECF_HASSUBCOMMANDS, ECF_ISSEPARATOR, ECS_ENABLED, ECS_HIDDEN, IEnumExplorerCommand,
     IEnumExplorerCommand_Impl, IExplorerCommand, IExplorerCommand_Impl, IShellItemArray,
     SHStrDupW, SIGDN_FILESYSPATH,
 };
 use windows_core::{BOOL, GUID, HRESULT, HSTRING, Interface, PWSTR, Ref, Result, implement};
 
-use crate::{CLSID_TEXT, ITEMS, Item, is_archive};
+use crate::{CLSID_TEXT, Entry, MENU, visible};
 
 static MODULE: OnceLock<usize> = OnceLock::new();
 
@@ -109,7 +110,7 @@ impl IExplorerCommand_Impl for Root_Impl {
     }
 
     fn EnumSubCommands(&self) -> Result<IEnumExplorerCommand> {
-        let subs: Vec<IExplorerCommand> = ITEMS.iter().map(|item| Sub { item }.into()).collect();
+        let subs: Vec<IExplorerCommand> = MENU.iter().map(|&entry| Sub { entry }.into()).collect();
         Ok(Enum {
             subs,
             pos: AtomicUsize::new(0),
@@ -120,12 +121,19 @@ impl IExplorerCommand_Impl for Root_Impl {
 
 #[implement(IExplorerCommand)]
 struct Sub {
-    item: &'static Item,
+    entry: Entry,
+}
+
+fn is_dir(path: &str) -> bool {
+    std::path::Path::new(path).is_dir()
 }
 
 impl IExplorerCommand_Impl for Sub_Impl {
-    fn GetTitle(&self, _items: Ref<IShellItemArray>) -> Result<PWSTR> {
-        dup(self.item.label)
+    fn GetTitle(&self, items: Ref<IShellItemArray>) -> Result<PWSTR> {
+        match self.entry {
+            Entry::Separator(_) => dup(""),
+            Entry::Command(c) => dup(&c.title(&paths(items.as_ref()), is_dir)),
+        }
     }
 
     fn GetIcon(&self, _items: Ref<IShellItemArray>) -> Result<PWSTR> {
@@ -141,13 +149,14 @@ impl IExplorerCommand_Impl for Sub_Impl {
     }
 
     fn GetState(&self, items: Ref<IShellItemArray>, _slow: BOOL) -> Result<u32> {
-        let paths = paths(items.as_ref());
-        let show = !paths.is_empty()
-            && (!self.item.archives_only || paths.iter().all(|p| is_archive(p)));
+        let show = visible(self.entry, &paths(items.as_ref()));
         Ok(if show { ECS_ENABLED.0 } else { ECS_HIDDEN.0 } as u32)
     }
 
     fn Invoke(&self, items: Ref<IShellItemArray>, _ctx: Ref<IBindCtx>) -> Result<()> {
+        let Entry::Command(command) = self.entry else {
+            return Ok(());
+        };
         let paths = paths(items.as_ref());
         if paths.is_empty() {
             return Ok(());
@@ -155,16 +164,29 @@ impl IExplorerCommand_Impl for Sub_Impl {
         let Some(exe) = exe_path() else {
             return Err(E_POINTER.into());
         };
+        // 资源管理器把前台权限交给了我们；转交给 OneZip.exe，它的窗口才能出现在最前面，
+        // 而不是被压在资源管理器后面。
+        unsafe {
+            let _ = AllowSetForegroundWindow(ASFW_ANY);
+        }
         std::process::Command::new(exe)
-            .args(self.item.args)
+            .args(command.args())
             .args(&paths)
             .spawn()
-            .map_err(|e| windows_core::Error::new(HRESULT::from_win32(e.raw_os_error().unwrap_or(0) as u32), "OneZip.exe"))?;
+            .map_err(|e| {
+                windows_core::Error::new(
+                    HRESULT::from_win32(e.raw_os_error().unwrap_or(0) as u32),
+                    "OneZip.exe",
+                )
+            })?;
         Ok(())
     }
 
     fn GetFlags(&self) -> Result<u32> {
-        Ok(ECF_DEFAULT.0 as u32)
+        Ok(match self.entry {
+            Entry::Separator(_) => ECF_ISSEPARATOR.0 as u32,
+            Entry::Command(_) => ECF_DEFAULT.0 as u32,
+        })
     }
 
     fn EnumSubCommands(&self) -> Result<IEnumExplorerCommand> {

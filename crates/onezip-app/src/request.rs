@@ -174,6 +174,9 @@ pub fn forward(req: &Request) -> bool {
     let Ok(conn) = Stream::connect(name) else {
         return false;
     };
+    // 我们是刚被资源管理器启动的前台进程；把前台权限让给已在运行的实例，
+    // 它的窗口才能出现在最前面。
+    crate::win::allow_any_foreground();
     let mut conn = BufReader::new(conn);
     if conn.get_mut().write_all(req.encode().as_bytes()).is_err() {
         return false;

@@ -19,59 +19,38 @@ pub struct Item {
     pub id: &'static str,
     pub label: &'static str,
     pub args: &'static str,
+    /// 在这一项上方画分隔线。
+    pub separator_before: bool,
 }
 
-/// 压缩包上的菜单。
+const fn item(id: &'static str, label: &'static str, args: &'static str, sep: bool) -> Item {
+    Item {
+        id,
+        label,
+        args,
+        separator_before: sep,
+    }
+}
+
+/// 压缩包上的菜单：和 Windows 11 第一层菜单（onezip-shell）同样的分组和顺序。
+/// 注册表菜单是静态的，写不出具体文件名，所以用通用说法。
 pub const EXTRACT_ITEMS: &[Item] = &[
-    Item {
-        id: "1smart",
-        label: "智能解压",
-        args: "--extract-smart",
-    },
-    Item {
-        id: "2reclaim",
-        label: "智能解压并释放空间（边解边删原包）",
-        args: "--reclaim --extract-smart",
-    },
-    Item {
-        id: "3here",
-        label: "解压到当前文件夹",
-        args: "--extract-here",
-    },
-    Item {
-        id: "4folder",
-        label: "解压到同名文件夹",
-        args: "--extract-folder",
-    },
-    Item {
-        id: "5to",
-        label: "解压到…",
-        args: "--extract-to",
-    },
-    Item {
-        id: "6test",
-        label: "测试压缩包",
-        args: "--test",
-    },
+    item("01smart", "智能解压", "--extract-smart", false),
+    item("02folder", "解压到同名文件夹", "--extract-folder", false),
+    item("03here", "解压到当前位置", "--extract-here", false),
+    item("04to", "解压文件…", "--extract-to", false),
+    item("05reclaim", "解压后删除压缩包（边解压边释放空间）", "--reclaim --extract-smart", true),
+    item("06test", "测试压缩包", "--test", false),
+    item("07add", "添加到压缩包…", "--compress", true),
+    item("08add7z", "添加到 7z 压缩包", "--compress-7z", false),
+    item("09addzip", "添加到 zip 压缩包", "--compress-zip", false),
 ];
 
-/// 任意文件和文件夹上的菜单。
+/// 其它文件和文件夹上的菜单。
 pub const COMPRESS_ITEMS: &[Item] = &[
-    Item {
-        id: "7add7z",
-        label: "添加到 7z 压缩包",
-        args: "--compress-7z",
-    },
-    Item {
-        id: "8addzip",
-        label: "添加到 zip 压缩包",
-        args: "--compress-zip",
-    },
-    Item {
-        id: "9add",
-        label: "添加到压缩包…",
-        args: "--compress",
-    },
+    item("07add", "添加到压缩包…", "--compress", false),
+    item("08add7z", "添加到 7z 压缩包", "--compress-7z", false),
+    item("09addzip", "添加到 zip 压缩包", "--compress-zip", false),
 ];
 
 #[cfg(windows)]
@@ -92,6 +71,10 @@ mod imp {
         for item in items {
             let (k, _) = verb.create_subkey(format!(r"shell\{}", item.id))?;
             k.set_value("MUIVerb", &item.label)?;
+            if item.separator_before {
+                // ECF_SEPARATORBEFORE
+                k.set_value("CommandFlags", &0x20u32)?;
+            }
             let (cmd, _) = k.create_subkey("command")?;
             cmd.set_value("", &format!("\"{}\" {} \"%1\"", exe.display(), item.args))?;
         }

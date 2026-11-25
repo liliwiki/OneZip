@@ -100,6 +100,7 @@ component TaskItem inherits Rectangle {
 
 export component MainWindow inherits Window {
     title: "OneZip";
+    icon: @image-url("../../../assets/onezip-256.png");
     preferred-width: 760px;
     preferred-height: 520px;
     min-width: 520px;
@@ -209,6 +210,7 @@ export component MainWindow inherits Window {
 
 export component CompressDialog inherits Window {
     title: "添加到压缩包";
+    icon: @image-url("../../../assets/onezip-256.png");
     preferred-width: 520px;
 
     in property <string> inputs-label;
@@ -302,6 +304,7 @@ export component CompressDialog inherits Window {
 
 export component PasswordDialog inherits Window {
     title: "需要密码";
+    icon: @image-url("../../../assets/onezip-256.png");
     preferred-width: 420px;
 
     in property <string> archive;

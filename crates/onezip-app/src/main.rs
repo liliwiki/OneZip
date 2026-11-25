@@ -9,6 +9,7 @@ mod menu;
 mod request;
 mod tasks;
 mod ui;
+mod win;
 
 use std::sync::mpsc;
 

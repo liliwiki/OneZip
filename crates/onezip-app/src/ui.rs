@@ -13,7 +13,7 @@ use slint::{ComponentHandle, ModelRc, SharedString, Timer, TimerMode, VecModel};
 
 use crate::request::{Action, Request};
 use crate::tasks::{Kind, Manager, Status, file_name};
-use crate::{CompressDialog, MainWindow, PasswordDialog, TaskRow, menu};
+use crate::{CompressDialog, MainWindow, PasswordDialog, TaskRow, menu, win};
 
 struct App {
     window: MainWindow,
@@ -46,10 +46,27 @@ pub fn run(first: Request, incoming: Receiver<Request>) -> anyhow::Result<()> {
         });
     }
 
-    handle(&app, first);
-    refresh(&app);
+    // 事件循环开始后再处理第一个请求：那时窗口已创建，才能提到最前、给对话框指定归属。
+    {
+        let app = app.clone();
+        Timer::single_shot(Duration::ZERO, move || {
+            handle(&app, first);
+            refresh(&app);
+        });
+    }
     app.window.run()?;
     Ok(())
+}
+
+/// 归属 `parent` 的提示框：始终在它上面，不会跑到别的窗口后面让人以为程序卡死。
+fn message(parent: &slint::Window) -> MessageDialog {
+    MessageDialog::new()
+        .set_title("OneZip")
+        .set_parent(&parent.window_handle())
+}
+
+fn file_dialog(parent: &slint::Window) -> FileDialog {
+    FileDialog::new().set_parent(&parent.window_handle())
 }
 
 fn status_text() -> String {
@@ -129,7 +146,7 @@ fn wire(app: &Rc<App>) {
         let app = Rc::downgrade(app);
         move || {
             let Some(app) = app.upgrade() else { return };
-            let Some(files) = FileDialog::new()
+            let Some(files) = file_dialog(app.window.window())
                 .set_title("选择要解压的压缩包")
                 .add_filter("压缩包", menu::ARCHIVE_EXTENSIONS)
                 .add_filter("所有文件", &["*"])
@@ -138,7 +155,7 @@ fn wire(app: &Rc<App>) {
                 return;
             };
             let reclaim = app.window.get_reclaim();
-            if reclaim && !confirm_reclaim(files.len()) {
+            if reclaim && !confirm_reclaim(app.window.window(), files.len()) {
                 return;
             }
             handle(
@@ -176,7 +193,9 @@ fn wire(app: &Rc<App>) {
         let app = Rc::downgrade(app);
         move || {
             let Some(app) = app.upgrade() else { return };
-            if let Some(files) = FileDialog::new().set_title("选择要压缩的文件").pick_files() {
+            if let Some(files) = file_dialog(app.window.window())
+                .set_title("选择要压缩的文件")
+                .pick_files() {
                 open_compress_dialog(&app, files);
             }
         }
@@ -185,7 +204,9 @@ fn wire(app: &Rc<App>) {
         let app = Rc::downgrade(app);
         move || {
             let Some(app) = app.upgrade() else { return };
-            if let Some(dir) = FileDialog::new().set_title("选择要压缩的文件夹").pick_folder() {
+            if let Some(dir) = file_dialog(app.window.window())
+                .set_title("选择要压缩的文件夹")
+                .pick_folder() {
                 open_compress_dialog(&app, vec![dir]);
             }
         }
@@ -194,7 +215,7 @@ fn wire(app: &Rc<App>) {
         let app = Rc::downgrade(app);
         move || {
             let Some(app) = app.upgrade() else { return };
-            toggle_menu();
+            toggle_menu(app.window.window());
             app.window.set_status(status_text().into());
         }
     });
@@ -202,10 +223,13 @@ fn wire(app: &Rc<App>) {
     // 关窗口时还有任务：解压暂停在安全点（进度已保存），压缩取消。
     w.window().on_close_requested({
         let tasks = tasks.clone();
+        let weak = w.as_weak();
         move || {
             if tasks.busy() {
-                let r = MessageDialog::new()
-                    .set_title("OneZip")
+                let Some(w) = weak.upgrade() else {
+                    return slint::CloseRequestResponse::HideWindow;
+                };
+                let r = message(w.window())
                     .set_level(MessageLevel::Warning)
                     .set_description(
                         "还有任务在进行。退出后，解压任务会在安全点暂停并保存进度，下次可以继续；\
@@ -229,10 +253,10 @@ fn wire(app: &Rc<App>) {
     });
 }
 
-fn toggle_menu() {
+fn toggle_menu(parent: &slint::Window) {
     if menu::shell_package_installed() {
         // 第一层菜单由安装程序注册；再写传统菜单只会在"显示更多选项"里重复一份。
-        MessageDialog::new()
+        message(parent)
             .set_title("右键菜单")
             .set_description(
                 "Windows 11 第一层右键菜单已由安装程序启用。\n要移除它，请在“设置 → 应用 → 已安装的应用”里卸载 OneZip。",
@@ -247,7 +271,7 @@ fn toggle_menu() {
     } else {
         "在资源管理器的右键菜单中加入 OneZip（只对当前用户生效，不需要管理员权限）？"
     };
-    let r = MessageDialog::new()
+    let r = message(parent)
         .set_title("右键菜单")
         .set_description(question)
         .set_buttons(MessageButtons::OkCancel)
@@ -264,12 +288,12 @@ fn toggle_menu() {
             .and_then(|exe| menu::register(&exe))
     };
     if let Err(e) = result {
-        error(&format!("设置右键菜单失败：{e:#}"));
+        error(parent, &format!("设置右键菜单失败：{e:#}"));
     }
 }
 
-fn confirm_reclaim(n: usize) -> bool {
-    MessageDialog::new()
+fn confirm_reclaim(parent: &slint::Window, n: usize) -> bool {
+    message(parent)
         .set_title("边解压边释放空间")
         .set_level(MessageLevel::Warning)
         .set_description(format!(
@@ -281,9 +305,8 @@ fn confirm_reclaim(n: usize) -> bool {
         == MessageDialogResult::Ok
 }
 
-fn error(msg: &str) {
-    MessageDialog::new()
-        .set_title("OneZip")
+fn error(parent: &slint::Window, msg: &str) {
+    message(parent)
         .set_level(MessageLevel::Error)
         .set_description(msg)
         .set_buttons(MessageButtons::Ok)
@@ -293,11 +316,10 @@ fn error(msg: &str) {
 /// 处理一个请求：来自命令行、右键菜单、或窗口按钮。
 fn handle(app: &Rc<App>, req: Request) {
     let w = &app.window;
+    // 先把主窗口亮出来、提到最前，后面的对话框都归属它。
+    win::present(w);
     match req.action {
-        Action::Show => {
-            let _ = w.show();
-            w.window().set_minimized(false);
-        }
+        Action::Show => {}
         Action::Extract {
             placement,
             ask_folder,
@@ -305,7 +327,7 @@ fn handle(app: &Rc<App>, req: Request) {
         } => {
             let output_root = if ask_folder {
                 let start = req.paths.first().and_then(|p| p.parent()).map(Path::to_path_buf);
-                let mut d = FileDialog::new().set_title("解压到哪个文件夹");
+                let mut d = file_dialog(w.window()).set_title("解压到哪个文件夹");
                 if let Some(s) = start {
                     d = d.set_directory(s);
                 }
@@ -354,7 +376,7 @@ fn handle(app: &Rc<App>, req: Request) {
         Action::Url(url) => {
             let downloads = std::env::var_os("USERPROFILE")
                 .map(|h| PathBuf::from(h).join("Downloads"));
-            let mut d = FileDialog::new().set_title("下载并解压到哪个文件夹");
+            let mut d = file_dialog(w.window()).set_title("下载并解压到哪个文件夹");
             if let Some(dl) = downloads {
                 d = d.set_directory(dl);
             }
@@ -390,9 +412,8 @@ fn handle(app: &Rc<App>, req: Request) {
                 open_compress_dialog(app, req.paths);
             }
         }
-        Action::RegisterMenu | Action::UnregisterMenu => toggle_menu(),
+        Action::RegisterMenu | Action::UnregisterMenu => toggle_menu(w.window()),
     }
-    let _ = w.show();
 }
 
 /// 去掉压缩扩展名后的名字，用作文件夹名。
@@ -481,7 +502,7 @@ fn open_compress_dialog(app: &Rc<App>, inputs: Vec<PathBuf>) {
         move || {
             let Some(d) = d.upgrade() else { return };
             let current = PathBuf::from(d.get_output().to_string());
-            let mut fd = FileDialog::new().set_title("保存压缩包");
+            let mut fd = file_dialog(d.window()).set_title("保存压缩包");
             if let Some(dir) = current.parent() {
                 fd = fd.set_directory(dir);
             }
@@ -521,8 +542,7 @@ fn open_compress_dialog(app: &Rc<App>, inputs: Vec<PathBuf>) {
             r.password = (!pw.is_empty() && format.supports_password()).then_some(pw);
             r.solid = d.get_solid();
             if output.exists() {
-                let ok = MessageDialog::new()
-                    .set_title("OneZip")
+                let ok = message(d.window())
                     .set_description(format!("{} 已存在，要替换它吗？", output.display()))
                     .set_buttons(MessageButtons::OkCancel)
                     .show()
@@ -538,7 +558,11 @@ fn open_compress_dialog(app: &Rc<App>, inputs: Vec<PathBuf>) {
                 .add(format!("压缩为 {}", file_name(&output)), Kind::Compress(r));
         }
     });
-    let _ = d.show();
+    // 之前打开、还没处理的对话框先关掉，免得藏在后面。
+    if let Some(old) = app.compress.borrow_mut().take() {
+        let _ = old.hide();
+    }
+    win::present_owned(&d, &app.window);
     *app.compress.borrow_mut() = Some(d);
 }
 
@@ -571,6 +595,9 @@ fn ask_password(app: &Rc<App>, id: u64) {
             }
         }
     });
-    let _ = d.show();
+    if let Some(old) = app.password.borrow_mut().take() {
+        let _ = old.hide();
+    }
+    win::present_owned(&d, &app.window);
     *app.password.borrow_mut() = Some(d);
 }

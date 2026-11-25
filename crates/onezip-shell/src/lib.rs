@@ -16,60 +16,154 @@ pub const ARCHIVE_EXTENSIONS: &[&str] = &[
     "lz4", "001",
 ];
 
-pub struct Item {
-    pub label: &'static str,
-    pub args: &'static [&'static str],
-    /// 只在选中的全是压缩包时显示。
-    pub archives_only: bool,
+/// 菜单里的一项。参照 7-Zip / NanaZip：解压一组、释放空间与测试一组、压缩一组，
+/// 组之间用分隔线隔开；"解压到 / 添加到"直接写出目标名字。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Entry {
+    Separator(Show),
+    Command(Command),
 }
 
-pub const ITEMS: &[Item] = &[
-    Item {
-        label: "智能解压",
-        args: &["--extract-smart"],
-        archives_only: true,
-    },
-    Item {
-        label: "智能解压并释放空间（边解边删原包）",
-        args: &["--reclaim", "--extract-smart"],
-        archives_only: true,
-    },
-    Item {
-        label: "解压到当前文件夹",
-        args: &["--extract-here"],
-        archives_only: true,
-    },
-    Item {
-        label: "解压到同名文件夹",
-        args: &["--extract-folder"],
-        archives_only: true,
-    },
-    Item {
-        label: "解压到…",
-        args: &["--extract-to"],
-        archives_only: true,
-    },
-    Item {
-        label: "测试压缩包",
-        args: &["--test"],
-        archives_only: true,
-    },
-    Item {
-        label: "添加到 7z 压缩包",
-        args: &["--compress-7z"],
-        archives_only: false,
-    },
-    Item {
-        label: "添加到 zip 压缩包",
-        args: &["--compress-zip"],
-        archives_only: false,
-    },
-    Item {
-        label: "添加到压缩包…",
-        args: &["--compress"],
-        archives_only: false,
-    },
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Show {
+    /// 选中的全是压缩包时才显示。
+    Archives,
+    Always,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Command {
+    SmartExtract,
+    ExtractToFolder,
+    ExtractHere,
+    ExtractTo,
+    ExtractAndDelete,
+    Test,
+    AddTo,
+    Add7z,
+    AddZip,
+}
+
+pub const MENU: &[Entry] = &[
+    Entry::Command(Command::SmartExtract),
+    Entry::Command(Command::ExtractToFolder),
+    Entry::Command(Command::ExtractHere),
+    Entry::Command(Command::ExtractTo),
+    Entry::Separator(Show::Archives),
+    Entry::Command(Command::ExtractAndDelete),
+    Entry::Command(Command::Test),
+    Entry::Separator(Show::Archives),
+    Entry::Command(Command::AddTo),
+    Entry::Command(Command::Add7z),
+    Entry::Command(Command::AddZip),
 ];
+
+impl Entry {
+    pub fn show(self) -> Show {
+        match self {
+            Entry::Separator(s) => s,
+            Entry::Command(c) => c.show(),
+        }
+    }
+}
+
+impl Command {
+    pub fn show(self) -> Show {
+        match self {
+            Command::AddTo | Command::Add7z | Command::AddZip => Show::Always,
+            _ => Show::Archives,
+        }
+    }
+
+    /// 传给 OneZip.exe 的参数。
+    pub fn args(self) -> &'static [&'static str] {
+        match self {
+            Command::SmartExtract => &["--extract-smart"],
+            Command::ExtractToFolder => &["--extract-folder"],
+            Command::ExtractHere => &["--extract-here"],
+            Command::ExtractTo => &["--extract-to"],
+            Command::ExtractAndDelete => &["--reclaim", "--extract-smart"],
+            Command::Test => &["--test"],
+            Command::AddTo => &["--compress"],
+            Command::Add7z => &["--compress-7z"],
+            Command::AddZip => &["--compress-zip"],
+        }
+    }
+
+    /// 菜单文字。`paths` 是选中的项，`is_dir` 判断某个路径是否文件夹。
+    pub fn title(self, paths: &[String], is_dir: impl Fn(&str) -> bool) -> String {
+        match self {
+            Command::SmartExtract => "智能解压".into(),
+            Command::ExtractToFolder => match paths {
+                [one] => format!("解压到 \"{}\\\"", archive_stem(file_name(one))),
+                _ => "解压到各自的同名文件夹".into(),
+            },
+            Command::ExtractHere => "解压到当前位置".into(),
+            Command::ExtractTo => "解压文件…".into(),
+            Command::ExtractAndDelete => "解压后删除压缩包（边解压边释放空间）".into(),
+            Command::Test => "测试压缩包".into(),
+            Command::AddTo => "添加到压缩包…".into(),
+            Command::Add7z => format!("添加到 \"{}.7z\"", compress_stem(paths, is_dir)),
+            Command::AddZip => format!("添加到 \"{}.zip\"", compress_stem(paths, is_dir)),
+        }
+    }
+}
+
+/// 是否显示某一项：解压类只在选中的全是压缩包时出现。
+pub fn visible(entry: Entry, paths: &[String]) -> bool {
+    !paths.is_empty() && (entry.show() == Show::Always || paths.iter().all(|p| is_archive(p)))
+}
+
+fn file_name(path: &str) -> &str {
+    let trimmed = path.trim_end_matches(['\\', '/']);
+    trimmed.rsplit(['\\', '/']).next().unwrap_or(trimmed)
+}
+
+fn parent_name(path: &str) -> &str {
+    let trimmed = path.trim_end_matches(['\\', '/']);
+    match trimmed.rsplit_once(['\\', '/']) {
+        Some((parent, _)) => file_name(parent),
+        None => "",
+    }
+}
+
+/// 压缩包名去掉压缩扩展名，用作解压出的文件夹名（与 OneZip.exe 一致）。
+pub fn archive_stem(name: &str) -> String {
+    let lower = name.to_ascii_lowercase();
+    for ext in [
+        ".tar.zst", ".tar.gz", ".tar.xz", ".tar.bz2", ".tar.lz4", ".7z.001", ".zip.001", ".tgz",
+        ".txz", ".tbz2", ".tbz", ".tzst", ".tar", ".zip", ".7z", ".rar", ".zst", ".gz", ".xz",
+        ".bz2", ".lz4", ".001",
+    ] {
+        if lower.ends_with(ext) && name.len() > ext.len() {
+            return name[..name.len() - ext.len()].to_string();
+        }
+    }
+    format!("{name}-extracted")
+}
+
+/// 压缩包默认名（不含扩展名），与 onezip_core::compress::default_output 一致：
+/// 一个文件取主名，一个文件夹取文件夹名，多项取所在文件夹名。
+pub fn compress_stem(paths: &[String], is_dir: impl Fn(&str) -> bool) -> String {
+    let name = match paths {
+        [one] if is_dir(one) => file_name(one).to_string(),
+        [one] => {
+            let n = file_name(one);
+            match n.rsplit_once('.') {
+                Some((stem, _)) if !stem.is_empty() => stem.to_string(),
+                _ => n.to_string(),
+            }
+        }
+        [first, ..] => parent_name(first).to_string(),
+        [] => String::new(),
+    };
+    // 盘符根目录（如 D:）没有文件夹名。
+    if name.is_empty() || name.ends_with(':') {
+        "压缩包".into()
+    } else {
+        name
+    }
+}
 
 /// 是否像压缩包（按扩展名）。
 pub fn is_archive(path: &str) -> bool {
@@ -94,5 +188,38 @@ mod tests {
         assert!(is_archive(r"C:\a\b.7z.001"));
         assert!(!is_archive(r"C:\a\b.txt"));
         assert!(!is_archive(r"C:\a\dir"));
+    }
+
+    fn not_dir(_: &str) -> bool {
+        false
+    }
+
+    #[test]
+    fn titles_name_the_target() {
+        let one = vec![r"D:\下载\资料.tar.gz".to_string()];
+        assert_eq!(Command::ExtractToFolder.title(&one, not_dir), "解压到 \"资料\\\"");
+        assert_eq!(Command::Add7z.title(&one, not_dir), "添加到 \"资料.tar.7z\"");
+        let file = vec![r"D:\下载\报告.docx".to_string()];
+        assert_eq!(Command::AddZip.title(&file, not_dir), "添加到 \"报告.zip\"");
+        let dir = vec![r"D:\下载\照片 2024".to_string()];
+        assert_eq!(Command::Add7z.title(&dir, |_| true), "添加到 \"照片 2024.7z\"");
+        let many = vec![r"D:\下载\a.txt".to_string(), r"D:\下载\b.txt".to_string()];
+        assert_eq!(Command::Add7z.title(&many, not_dir), "添加到 \"下载.7z\"");
+        assert_eq!(Command::ExtractToFolder.title(&many, not_dir), "解压到各自的同名文件夹");
+        let root = vec![r"D:\a.txt".to_string(), r"D:\b.txt".to_string()];
+        assert_eq!(Command::Add7z.title(&root, not_dir), "添加到 \"压缩包.7z\"");
+    }
+
+    #[test]
+    fn extraction_only_on_archives() {
+        let zip = vec![r"C:\a.zip".to_string()];
+        let mixed = vec![r"C:\a.zip".to_string(), r"C:\b.txt".to_string()];
+        let extract = Entry::Command(Command::SmartExtract);
+        let add = Entry::Command(Command::Add7z);
+        assert!(visible(extract, &zip));
+        assert!(!visible(extract, &mixed));
+        assert!(!visible(Entry::Separator(Show::Archives), &mixed));
+        assert!(visible(add, &mixed));
+        assert!(!visible(add, &[]));
     }
 }
