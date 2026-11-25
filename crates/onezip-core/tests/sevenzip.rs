@@ -116,7 +116,13 @@ fn check_sample(t: &BTreeMap<String, Vec<u8>>, rel: &str) {
     assert_eq!(t["docs/readme.txt"], b"OneZip fixture\r\n".repeat(200), "{rel}");
     // make.ps1 用 .NET 的 UTF8 编码写这个文件，带 BOM
     let hello = [&[0xEF, 0xBB, 0xBF][..], "你好，OneZip\n".repeat(50).as_bytes()].concat();
-    assert_eq!(t["中文目录/你好.txt"], hello, "{rel}");
+    if rel.contains("cab") {
+        // CAB 的文件名按系统代码页存（makecab 不写 UTF-8 标志），在别的语言的 Windows 上
+        // 会解成别的字，所以这里按内容找
+        assert!(t.values().any(|v| *v == hello), "{rel}: 没有找到 你好.txt");
+    } else {
+        assert_eq!(t["中文目录/你好.txt"], hello, "{rel}");
+    }
     assert_eq!(t["empty.txt"].len(), 0, "{rel}");
     assert_eq!(t["sub/deep/data.bin"].len(), 100_000, "{rel}");
     assert_eq!(t["big file.bin"].len(), 400_000, "{rel}");
