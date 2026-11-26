@@ -20,7 +20,7 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and
 - Compression to 7z and zip goes through 7-Zip's 7z.dll, with the same encoder and multi-threading as 7-Zip.
 ### Fixed
 
-- Smart extraction while downloading, and in-place smart extraction of tar.zst, tar.lz4, .zst, and .lz4, put a single top-level item in an extra folder named after the archive; that item now goes next to the archive as with other formats.
+- Smart extraction while downloading wrapped an archive's single top-level folder in an extra folder named after the archive (for example `Downloads\pack\data\` instead of `Downloads\data\`). OneZip can't see an archive's contents before downloading it, so it now extracts into that new folder and, when only one item came out, moves it up into the save folder. In-place smart extraction of local tar.zst, tar.lz4, .zst, and .lz4 archives had the same problem and is fixed the same way.
 
 ## [0.1.0] - 2026-11-26
 
