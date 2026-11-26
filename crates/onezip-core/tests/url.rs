@@ -163,3 +163,29 @@ fn encrypted_zip_and_7z_from_url() {
         assert_eq!(got, common::sample_files(), "{format:?}");
     }
 }
+
+/// 智能解压：压缩包里只有一个顶层文件夹时，不再多套一层以压缩包命名的文件夹。
+#[test]
+fn single_root_from_url_is_not_nested() {
+    for format in [Format::Zip, Format::SevenZ, Format::TarZst] {
+        let dir = tempfile::tempdir().unwrap();
+        let src = dir.path().join("资料");
+        for (name, bytes) in common::sample_files() {
+            let p = src.join(&name);
+            fs::create_dir_all(p.parent().unwrap()).unwrap();
+            fs::write(p, bytes).unwrap();
+        }
+        let archive = dir.path().join(format!("pack.{}", format.extension()));
+        onezip_core::compress(&CompressRequest::new(vec![src.clone()], archive.clone(), format), quiet(), &Arc::new(AtomicBool::new(false))).unwrap();
+        fs::remove_dir_all(&src).unwrap();
+        let url = common::http::serve(Arc::new(fs::read(&archive).unwrap()), &format!("pack.{}", format.extension()), 0);
+
+        let out = dir.path().join("pack");
+        let r = from_url(&url, &out, None, quiet(), &Arc::new(AtomicBool::new(false))).unwrap();
+        let listing: Vec<String> = fs::read_dir(dir.path()).unwrap().map(|e| e.unwrap().file_name().to_string_lossy().into_owned()).collect();
+        let Outcome::Finished { output, .. } = r else { panic!("{format:?}: 应该完成") };
+        assert_eq!(output, src, "{format:?}: {listing:?}");
+        assert!(!out.exists(), "{format:?}: 多套了一层 {listing:?}");
+        assert_eq!(common::read_tree(&src), common::sample_files(), "{format:?}");
+    }
+}

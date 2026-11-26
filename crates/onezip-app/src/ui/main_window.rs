@@ -111,6 +111,21 @@ pub(super) fn wire(app: &Rc<App>) {
             );
         }
     });
+    w.on_open_archive({
+        let app = Rc::downgrade(app);
+        move || {
+            let Some(app) = app.upgrade() else { return };
+            let Some(files) = file_dialog(app.window.window())
+                .set_title("打开压缩包，看看里面有什么")
+                .add_filter("压缩包", &onezip_formats::archive_extensions().collect::<Vec<_>>())
+                .add_filter("所有文件", &["*"])
+                .pick_files()
+            else {
+                return;
+            };
+            requests::handle_from_window(&app, Request { action: Action::Open, paths: files });
+        }
+    });
     w.on_extract_url({
         let app = Rc::downgrade(app);
         move |url| {

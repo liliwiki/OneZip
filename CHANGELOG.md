@@ -6,6 +6,22 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and
 
 ## [Unreleased]
 
+## [0.2.0] - 2026-11-26
+
+### Added
+
+- Archive browser window, in the style of 7-Zip's file manager: open an archive with "Open archive…" in the main window or by double-clicking it, go through its folders, open a file with its default program, extract the selected items or everything, and drag items straight into Explorer. Archives with encrypted file names ask for the password first.
+- File associations: Settings → File associations lets you choose which archive and disk image types open in OneZip when double-clicked. OneZip registers itself under "Default apps", remembers each type's previous handler and restores it when the association is removed or OneZip is uninstalled. Windows asks the user to confirm the new default; the page lists the types it hasn't confirmed yet and opens the Windows settings page.
+- Saved passwords: the password prompt has "Remember this password". Saved passwords are encrypted with Windows DPAPI for the current user and tried automatically before OneZip asks. Settings → Passwords adds, deletes, and shows them; showing them requires Windows Hello or the Windows sign-in password. Uninstalling can delete them together with the settings.
+- "Ask every time" for files that already exist: before extracting, one window lists the files with the same names and offers to keep both (rename the new ones), replace all, or skip all.
+
+### Changed
+
+- Compression to 7z and zip goes through 7-Zip's 7z.dll, with the same encoder and multi-threading as 7-Zip.
+### Fixed
+
+- Smart extraction while downloading, and in-place smart extraction of tar.zst, tar.lz4, .zst, and .lz4, put a single top-level item in an extra folder named after the archive; that item now goes next to the archive as with other formats.
+
 ## [0.1.0] - 2026-11-26
 
 First release.
@@ -40,5 +56,6 @@ First release.
 - Modified copy of Peel 0.8.0: WinZip AE-2 encrypted zip entries no longer fail the CRC check, and 7z archives with encrypted file names decrypt their header.
 - Modified copy of lzma-rust2 0.23: the multi-threaded encoders report progress and honour cancellation.
 
-[Unreleased]: https://github.com/liliwiki/OneZip/compare/v0.1.0...HEAD
+[Unreleased]: https://github.com/liliwiki/OneZip/compare/v0.2.0...HEAD
+[0.2.0]: https://github.com/liliwiki/OneZip/compare/v0.1.0...v0.2.0
 [0.1.0]: https://github.com/liliwiki/OneZip/releases/tag/v0.1.0

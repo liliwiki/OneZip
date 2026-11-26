@@ -1,5 +1,5 @@
-//! 卸载：只删安装时放进去的文件，文件夹空了才删。解压、压缩出来的文件、未完成任务的进度都不动；
-//! 设置和出错记录只在用户勾选时删除。导入"受信任的人"的签名证书保留。
+//! 卸载：只删安装时放进去的文件，文件夹空了才删；文件关联总是还原。解压、压缩出来的文件、未完成任务的进度都不动；
+//! 设置、保存的密码和出错记录只在用户勾选时删除。导入"受信任的人"的签名证书保留。
 
 use std::path::{Path, PathBuf};
 use std::time::Duration;
@@ -36,6 +36,9 @@ pub fn uninstall(dest: &Path, delete_settings: bool, say: &dyn Fn(&str)) -> Resu
     }
     // dllhost 可能刚又加载了 DLL
     sys::release_menu_dll();
+    // 文件关联：还原成关联之前的打开方式。
+    let _ = onezip_settings::assoc::remove_all();
+    onezip_settings::assoc::notify();
     if let Ok(lnk) = sys::shortcut_path() {
         let _ = std::fs::remove_file(lnk);
     }

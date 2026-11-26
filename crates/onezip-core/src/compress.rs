@@ -100,6 +100,8 @@ struct Item {
     dir: bool,
     size: u64,
     modified: Option<SystemTime>,
+    /// Windows 文件属性（7z.dll 写进压缩包）。
+    attrib: u32,
 }
 
 /// 默认输出名：单个输入用它自己的名字，多个输入用它们所在文件夹的名字。
@@ -131,6 +133,11 @@ pub fn compress(req: &CompressRequest, observer: Observer, stop: &Arc<AtomicBool
 
     let tmp = temp_path(&output);
     let result = (|| -> Result<()> {
+        #[cfg(windows)]
+        if let Some(name) = sevenzip_format(req) {
+            crate::sevenzip::compress(&tmp, name, sevenzip_items(&items), &sevenzip_options(req), &observer, stop)?;
+            return finish_rename(req, &output, &tmp, stop);
+        }
         let file = File::create(&tmp).with_context(|| format!("创建 {}", tmp.display()))?;
         // 多线程 LZMA2/XZ：进度由编码器按块报告。
         let threads = threads(req.threads);
@@ -171,14 +178,7 @@ pub fn compress(req: &CompressRequest, observer: Observer, stop: &Arc<AtomicBool
                 finish(enc.finish()?)?;
             }
         }
-        if stop.load(Ordering::Relaxed) {
-            bail!(Cancelled);
-        }
-        if req.overwrite && output.exists() {
-            fs::remove_file(&output)?;
-        }
-        fs::rename(&tmp, &output)?;
-        Ok(())
+        finish_rename(req, &output, &tmp, stop)
     })();
     if result.is_err() {
         let _ = fs::remove_file(&tmp);
@@ -188,6 +188,65 @@ pub fn compress(req: &CompressRequest, observer: Observer, stop: &Arc<AtomicBool
         }
     }
     result
+}
+
+/// 写完的临时文件改成目标名。
+fn finish_rename(req: &CompressRequest, output: &Path, tmp: &Path, stop: &AtomicBool) -> Result<()> {
+    if stop.load(Ordering::Relaxed) {
+        bail!(Cancelled);
+    }
+    if req.overwrite && output.exists() {
+        fs::remove_file(output)?;
+    }
+    fs::rename(tmp, output)?;
+    Ok(())
+}
+
+/// 7z 和 zip 交给 7z.dll（和 7-Zip 同一个多线程编码器，快得多）。
+/// 环境变量 `ONEZIP_NO_7Z_COMPRESS` 或 7z.dll 加载不了时用内置的编码器。
+/// 7z.dll 压 zip 不接受非 ASCII 密码（7-Zip 自己也不行），这时也用内置的编码器。
+#[cfg(windows)]
+fn sevenzip_format(req: &CompressRequest) -> Option<&'static str> {
+    let name = match req.format {
+        Format::SevenZ => "7z",
+        Format::Zip if req.password.as_deref().is_none_or(|p| p.is_ascii()) => "zip",
+        _ => return None,
+    };
+    (std::env::var_os("ONEZIP_NO_7Z_COMPRESS").is_none() && crate::sevenzip::available()).then_some(name)
+}
+
+#[cfg(windows)]
+fn sevenzip_items(items: &[Item]) -> Vec<crate::sevenzip::UpdateItem> {
+    items
+        .iter()
+        .map(|i| crate::sevenzip::UpdateItem {
+            name: i.name.replace('/', "\\"),
+            path: i.path.clone(),
+            dir: i.dir,
+            size: i.size,
+            mtime: i.modified.and_then(filetime),
+            attrib: i.attrib,
+        })
+        .collect()
+}
+
+#[cfg(windows)]
+fn sevenzip_options(req: &CompressRequest) -> crate::sevenzip::UpdateOptions {
+    crate::sevenzip::UpdateOptions {
+        level: req.level,
+        threads: req.threads,
+        solid: req.solid,
+        password: req.password.clone(),
+        encrypt_names: req.encrypt_names,
+    }
+}
+
+/// UTC 时间换成 FILETIME（从 1601 年起的 100 纳秒数）。
+#[cfg(windows)]
+fn filetime(t: SystemTime) -> Option<u64> {
+    const EPOCH_DIFF: u64 = 116_444_736_000_000_000;
+    let d = t.duration_since(SystemTime::UNIX_EPOCH).ok()?;
+    Some(EPOCH_DIFF + d.as_secs() * 10_000_000 + u64::from(d.subsec_nanos() / 100))
 }
 
 /// 用户取消。
@@ -339,6 +398,7 @@ fn walk(path: &Path, name: String, meta: &fs::Metadata, output: &Path, items: &m
             dir: true,
             size: 0,
             modified: meta.modified().ok(),
+            attrib: attributes(meta),
         });
         let mut children: Vec<_> = fs::read_dir(path)?.collect::<io::Result<_>>()?;
         children.sort_by_key(|e| e.file_name());
@@ -361,9 +421,20 @@ fn walk(path: &Path, name: String, meta: &fs::Metadata, output: &Path, items: &m
             dir: false,
             size: meta.len(),
             modified: meta.modified().ok(),
+            attrib: attributes(meta),
         });
     }
     Ok(())
+}
+
+#[cfg(windows)]
+fn attributes(meta: &fs::Metadata) -> u32 {
+    std::os::windows::fs::MetadataExt::file_attributes(meta)
+}
+
+#[cfg(not(windows))]
+fn attributes(meta: &fs::Metadata) -> u32 {
+    if meta.is_dir() { 0x10 } else { 0x20 }
 }
 
 fn write_zip(file: File, items: &[Item], req: &CompressRequest, ctx: &Ctx) -> Result<()> {

@@ -1,0 +1,218 @@
+// 浏览压缩包（像 7-Zip 的文件管理器）：一层层打开文件夹，解压选中的项，
+// 双击文件用默认程序打开，选中的项可以直接拖到资源管理器里。
+import { Button, ListView, Palette } from "std-widgets.slint";
+import { ThemedWindow } from "theme.slint";
+
+export struct BrowseRow {
+    name: string,
+    size: string,
+    modified: string,
+    is-dir: bool,
+    selected: bool,
+}
+
+export component BrowserWindow inherits ThemedWindow {
+    title: root.archive-name + " - OneZip";
+    preferred-width: 860px;
+    preferred-height: 580px;
+    min-width: 560px;
+    min-height: 360px;
+
+    in property <string> archive-name;
+    // 当前位置，如"资料.zip › 资料 › 子"
+    in property <string> location;
+    in property <bool> can-up;
+    in property <[BrowseRow]> rows;
+    in property <int> selected-count;
+    in property <string> status;
+    // 列表的位置显示的一句话（正在打开、打不开、需要密码）；空时显示列表
+    in property <string> message;
+    in property <bool> needs-password;
+    in property <bool> busy;
+
+    callback up();
+    // 按下某一行（ctrl、shift 是否按着）
+    callback row-pressed(int, bool, bool);
+    // 在某一行上松开（没有拖动）
+    callback row-clicked(int);
+    callback row-opened(int);
+    // 从某一行开始拖动
+    callback drag-out(int);
+    callback extract-selected();
+    callback extract-all();
+    callback enter-password();
+    callback select-all();
+
+    forward-focus: keys;
+    keys := FocusScope {
+        key-pressed(e) => {
+            if (e.modifiers.control && (e.text == "a" || e.text == "A")) {
+                root.select-all();
+                return accept;
+            }
+            if (e.text == Key.Backspace && root.can-up) {
+                root.up();
+                return accept;
+            }
+            reject
+        }
+
+        VerticalLayout {
+            padding: 12px;
+            spacing: 10px;
+
+            // 位置栏
+            HorizontalLayout {
+                spacing: 8px;
+                Button {
+                    text: "上一级";
+                    enabled: root.can-up && !root.busy;
+                    clicked => { root.up(); }
+                }
+                Rectangle {
+                    horizontal-stretch: 1;
+                    background: Palette.alternate-background;
+                    border-radius: 4px;
+                    HorizontalLayout {
+                        padding-left: 10px;
+                        padding-right: 10px;
+                        Text {
+                            text: root.location;
+                            vertical-alignment: center;
+                            overflow: elide;
+                        }
+                    }
+                }
+            }
+
+            // 列表
+            Rectangle {
+                vertical-stretch: 1;
+                border-width: 1px;
+                border-color: Palette.border;
+                border-radius: 4px;
+                clip: true;
+
+                if root.message != "": VerticalLayout {
+                    alignment: center;
+                    spacing: 12px;
+                    Text {
+                        text: root.message;
+                        horizontal-alignment: center;
+                        wrap: word-wrap;
+                    }
+                    if root.needs-password: HorizontalLayout {
+                        alignment: center;
+                        Button {
+                            text: "输入密码";
+                            primary: true;
+                            clicked => { root.enter-password(); }
+                        }
+                    }
+                }
+
+                if root.message == "": VerticalLayout {
+                    // 表头
+                    Rectangle {
+                        height: 30px;
+                        background: Palette.alternate-background;
+                        HorizontalLayout {
+                            padding-left: 12px;
+                            padding-right: 12px;
+                            spacing: 12px;
+                            Text { text: "名称"; horizontal-stretch: 1; vertical-alignment: center; font-weight: 600; }
+                            Text { text: "大小"; width: 90px; horizontal-alignment: right; vertical-alignment: center; font-weight: 600; }
+                            Text { text: "修改时间"; width: 140px; vertical-alignment: center; font-weight: 600; }
+                        }
+                    }
+                    ListView {
+                        for row[i] in root.rows: Rectangle {
+                            height: 28px;
+                            background: row.selected ? Palette.selection-background
+                                : ta.has-hover ? Palette.alternate-background : transparent;
+                            ta := TouchArea {
+                                property <bool> dragged;
+                                pointer-event(e) => {
+                                    if (e.kind == PointerEventKind.down && e.button == PointerEventButton.left) {
+                                        self.dragged = false;
+                                        keys.focus();
+                                        root.row-pressed(i, e.modifiers.control, e.modifiers.shift);
+                                    }
+                                }
+                                moved => {
+                                    if (self.pressed && !self.dragged && !root.busy
+                                        && (abs(self.mouse-x - self.pressed-x) > 6px || abs(self.mouse-y - self.pressed-y) > 6px)) {
+                                        self.dragged = true;
+                                        root.drag-out(i);
+                                    }
+                                }
+                                clicked => {
+                                    if (!self.dragged) {
+                                        root.row-clicked(i);
+                                    }
+                                }
+                                double-clicked => { root.row-opened(i); }
+                            }
+                            HorizontalLayout {
+                                padding-left: 12px;
+                                padding-right: 12px;
+                                spacing: 12px;
+                                Text {
+                                    text: row.is-dir ? "\u{E8B7}" : "\u{E8A5}";
+                                    font-family: "Segoe Fluent Icons";
+                                    font-size: 16px;
+                                    width: 18px;
+                                    vertical-alignment: center;
+                                    color: row.is-dir ? #e8a33d : row.selected ? Palette.selection-foreground : Palette.foreground;
+                                }
+                                Text {
+                                    text: row.name;
+                                    horizontal-stretch: 1;
+                                    vertical-alignment: center;
+                                    overflow: elide;
+                                    color: row.selected ? Palette.selection-foreground : Palette.foreground;
+                                }
+                                Text {
+                                    text: row.size;
+                                    width: 90px;
+                                    horizontal-alignment: right;
+                                    vertical-alignment: center;
+                                    color: row.selected ? Palette.selection-foreground : Palette.foreground;
+                                }
+                                Text {
+                                    text: row.modified;
+                                    width: 140px;
+                                    vertical-alignment: center;
+                                    color: row.selected ? Palette.selection-foreground : Palette.foreground;
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+
+            // 状态和按钮
+            HorizontalLayout {
+                spacing: 8px;
+                Text {
+                    text: root.status;
+                    horizontal-stretch: 1;
+                    vertical-alignment: center;
+                    overflow: elide;
+                    opacity: 0.75;
+                }
+                Button {
+                    text: "解压选中的项…";
+                    enabled: root.selected-count > 0 && !root.busy;
+                    clicked => { root.extract-selected(); }
+                }
+                Button {
+                    text: "全部解压…";
+                    primary: true;
+                    enabled: !root.busy && root.message == "";
+                    clicked => { root.extract-all(); }
+                }
+            }
+        }
+    }
+}

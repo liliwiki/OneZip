@@ -33,6 +33,8 @@ pub enum Action {
         delete: Delete,
     },
     Test,
+    /// 打开浏览窗口，看压缩包里有什么。
+    Open,
     /// `None`：弹出压缩对话框；`Some`：直接压成该格式。
     Compress(Option<Format>),
     Url(String),
@@ -64,6 +66,7 @@ impl Request {
                 "--reclaim" => delete = Delete::InPlace,
                 "--delete-after" => delete = Delete::After,
                 "--test" => action = Some(Action::Test),
+                "--open" => action = Some(Action::Open),
                 "--compress" => action = Some(Action::Compress(None)),
                 "--compress-7z" => action = Some(Action::Compress(Some(Format::SevenZ))),
                 "--compress-zip" => action = Some(Action::Compress(Some(Format::Zip))),
@@ -93,7 +96,8 @@ impl Request {
                 delete,
             },
             Some(a) => a,
-            // 直接把压缩包拖到 OneZip.exe 上 / 双击关联文件：智能解压并保留原包。
+            // 直接把压缩包拖到 OneZip.exe 上：智能解压并保留原包。
+            // （双击关联的压缩包走 --open，打开浏览窗口。）
             None if !paths.is_empty() => extract(Placement::Smart, false),
             None => Action::Show,
         };
@@ -122,6 +126,7 @@ impl Request {
                 }
             ),
             Action::Test => "test".into(),
+            Action::Open => "open".into(),
             Action::Compress(f) => format!("compress {}", f.map_or("ask", |f| f.extension())),
             Action::Url(u) => format!("url {u}"),
             Action::Hash(kinds) => format!(
@@ -163,6 +168,7 @@ impl Request {
                 }
             }
             ("test", _) => Action::Test,
+            ("open", _) => Action::Open,
             ("compress", Some("ask")) => Action::Compress(None),
             ("compress", Some(f)) => Action::Compress(Some(Format::parse(f)?)),
             ("url", Some(u)) => Action::Url(u.to_string()),

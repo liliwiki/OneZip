@@ -75,3 +75,38 @@ pub(super) fn reveal(path: &Path) {
 pub(super) fn open_url(target: &str) {
     crate::win::shell_open(target);
 }
+
+/// 在后台线程里做 `work`（打开、解出压缩包这类可能很慢的事），做完后在界面线程调用 `done`。
+/// `done` 可以用 `Rc`，界面不会卡住。
+pub(super) fn background<T: Send + 'static>(work: impl FnOnce() -> T + Send + 'static, done: impl FnOnce(T) + 'static) {
+    use std::sync::{Arc, Mutex};
+    use std::task::{Poll, Waker};
+    struct Slot<T> {
+        value: Option<T>,
+        waker: Option<Waker>,
+    }
+    let slot = Arc::new(Mutex::new(Slot { value: None, waker: None }));
+    let sender = slot.clone();
+    std::thread::spawn(move || {
+        let v = work();
+        let mut s = sender.lock().unwrap();
+        s.value = Some(v);
+        if let Some(w) = s.waker.take() {
+            w.wake();
+        }
+    });
+    let _ = slint::spawn_local(async move {
+        let v = std::future::poll_fn(|cx| {
+            let mut s = slot.lock().unwrap();
+            match s.value.take() {
+                Some(v) => Poll::Ready(v),
+                None => {
+                    s.waker = Some(cx.waker().clone());
+                    Poll::Pending
+                }
+            }
+        })
+        .await;
+        done(v);
+    });
+}

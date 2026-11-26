@@ -1,5 +1,6 @@
 // 设置窗口：主窗口点"设置"弹出。改动立即保存、立即生效。
-// 排版按定稿的 Demo；文件关联、密码、语言三项在后面的版本里再显示。
+// 排版按定稿的 Demo；语言一项在后面的版本里再显示。
+// 页码：0 常规、1 解压、2 压缩、3 右键菜单、4 更新、5 关于、6 密码、7 文件关联（后加的页接着编号，免得改动别处的页码）。
 import { Button, CheckBox, ComboBox, LineEdit, Switch, SpinBox, ScrollView, Palette } from "std-widgets.slint";
 import { ThemedWindow } from "theme.slint";
 
@@ -140,6 +141,25 @@ export struct MenuRow {
     has-b: bool,
 }
 
+/// 文件关联页的一行：几个扩展名的勾选项。
+export struct AssocRow {
+    items: [MenuToggle],
+}
+
+component AssocGrid inherits Panel {
+    in property <[AssocRow]> rows;
+    callback toggled(string, bool);
+    for row in rows: HorizontalLayout {
+        for t in row.items: CheckBox {
+            width: 25%;
+            text: t.label;
+            checked: t.checked;
+            toggled => { root.toggled(t.id, self.checked); }
+        }
+        Rectangle {}
+    }
+}
+
 component MenuGrid inherits Panel {
     in property <[MenuRow]> rows;
     in property <bool> enabled;
@@ -161,6 +181,12 @@ component MenuGrid inherits Panel {
             toggled => { root.toggled(row.b.id, self.checked); }
         }
     }
+}
+
+/// 密码页的一行。没验证身份前 `text` 是空的，界面显示圆点。
+export struct SavedPassword {
+    text: string,
+    note: string,
 }
 
 // ---- 窗口 ----
@@ -203,6 +229,16 @@ export component SettingsWindow inherits ThemedWindow {
     in property <bool> checking;
     in-out property <bool> auto-update;
     in property <string> skipped;
+    // 密码
+    in property <[SavedPassword]> saved-passwords;
+    in property <bool> passwords-shown;
+    in property <bool> verifying;
+    in-out property <string> new-password;
+    // 文件关联
+    in property <[AssocRow]> assoc-archives;
+    in property <[AssocRow]> assoc-images;
+    // 关联了、但双击时 Windows 还不直接用 OneZip 打开的扩展名（要用户在 Windows 里确认），如".zip、.rar"
+    in property <string> assoc-overridden;
 
     // 任何一项改了：Rust 读出全部属性并保存。
     callback changed();
@@ -216,6 +252,18 @@ export component SettingsWindow inherits ThemedWindow {
     callback open-github();
     callback open-licenses();
     callback report-issue();
+    callback add-password();
+    callback remove-password(int);
+    callback remove-all-passwords();
+    // 显示 / 隐藏密码（显示前 Rust 先验证 Windows 身份）
+    callback toggle-passwords();
+    callback assoc-toggled(string, bool);
+    callback assoc-common();
+    callback assoc-none();
+    callback assoc-refresh();
+    callback open-default-apps();
+    // 身份验证通过（Rust 内部用）
+    callback passwords-verified();
 
 
     HorizontalLayout {
@@ -244,6 +292,8 @@ export component SettingsWindow inherits ThemedWindow {
             NavItem { icon: "\u{E713}"; label: "常规"; selected: page == 0; clicked => { page = 0; } }
             NavItem { icon: "\u{E8B7}"; label: "解压"; selected: page == 1; clicked => { page = 1; } }
             NavItem { icon: "\u{E7B8}"; label: "压缩"; selected: page == 2; clicked => { page = 2; } }
+            NavItem { icon: "\u{E72E}"; label: "密码"; selected: page == 6; clicked => { page = 6; } }
+            NavItem { icon: "\u{E8A5}"; label: "文件关联"; selected: page == 7; clicked => { page = 7; root.assoc-refresh(); } }
             NavItem { icon: "\u{E700}"; label: "右键菜单"; selected: page == 3; clicked => { page = 3; } }
             NavItem { icon: "\u{E895}"; label: "更新"; selected: page == 4; clicked => { page = 4; } }
             NavItem { icon: "\u{E946}"; label: "关于"; selected: page == 5; clicked => { page = 5; } }
@@ -304,7 +354,7 @@ export component SettingsWindow inherits ThemedWindow {
                     desc: "目标位置已经有同名文件时怎么办";
                     ComboBox {
                         width: 190px;
-                        model: ["替换", "跳过", "自动改名（如 a (2).txt）"];
+                        model: ["每次询问", "替换", "跳过", "自动改名（如 a (2).txt）"];
                         current-index <=> root.conflict;
                         selected => { root.changed(); }
                     }
@@ -415,6 +465,122 @@ export component SettingsWindow inherits ThemedWindow {
                         checked <=> root.encrypt-names;
                         toggled => { root.changed(); }
                     }
+                }
+            }
+
+            // ---- 密码 ----
+            if page == 6: Page {
+                title: "密码";
+                Note { text: "解压加密的压缩包时，先自动试这里的密码（最近用过的先试），都不对才弹出密码框。在密码框里勾选“记住这个密码”，解压成功后就会保存到这里。"; }
+                Section { text: "添加"; }
+                Card {
+                    title: "保存一个密码";
+                    desc: "保存前不检查它对不对";
+                    LineEdit {
+                        width: 230px;
+                        input-type: InputType.password;
+                        placeholder-text: "输入密码";
+                        text <=> root.new-password;
+                        accepted => { root.add-password(); }
+                    }
+                    Button {
+                        text: "保存";
+                        enabled: root.new-password != "";
+                        clicked => { root.add-password(); }
+                    }
+                }
+                HorizontalLayout {
+                    spacing: 8px;
+                    Section {
+                        text: "已保存的密码（" + root.saved-passwords.length + "）";
+                        horizontal-stretch: 1;
+                    }
+                    VerticalLayout {
+                        alignment: end;
+                        Button {
+                            text: root.verifying ? "正在验证…" : root.passwords-shown ? "隐藏密码" : "显示密码";
+                            enabled: !root.verifying && root.saved-passwords.length > 0;
+                            clicked => { root.toggle-passwords(); }
+                        }
+                    }
+                    VerticalLayout {
+                        alignment: end;
+                        Button {
+                            text: "全部删除";
+                            enabled: root.saved-passwords.length > 0;
+                            clicked => { root.remove-all-passwords(); }
+                        }
+                    }
+                }
+                Panel {
+                    if root.saved-passwords.length == 0: Note { text: "还没有保存的密码"; }
+                    for p[i] in root.saved-passwords: HorizontalLayout {
+                        spacing: 12px;
+                        Text {
+                            text: root.passwords-shown ? p.text : "••••••••";
+                            vertical-alignment: center;
+                            width: 38%;
+                            overflow: elide;
+                        }
+                        Note {
+                            text: p.note;
+                            vertical-alignment: center;
+                            horizontal-stretch: 1;
+                            wrap: no-wrap;
+                            overflow: elide;
+                        }
+                        Button {
+                            text: "删除";
+                            clicked => { root.remove-password(i); }
+                        }
+                    }
+                }
+                Note { text: "密码用 Windows 加密后保存在本机，只有当前 Windows 用户能解开。显示密码前要先验证 Windows 身份（PIN、指纹、人脸或登录密码）。卸载 OneZip 时可以选择一并删除。"; }
+            }
+
+            // ---- 文件关联 ----
+            if page == 7: Page {
+                title: "文件关联";
+                Note { text: "勾选的格式双击时用 OneZip 打开：先看到里面有哪些文件，再选择解压、打开或拖出来。只影响当前 Windows 用户，取消勾选会还原成原来的打开方式。"; }
+                if root.assoc-overridden != "": Card {
+                    icon: "\u{E7BA}";
+                    title: "这些格式双击时还不会直接用 OneZip 打开：" + root.assoc-overridden;
+                    desc: "Windows 要你自己确认：第一次双击时它会问用什么打开，选 OneZip 再点“始终”；也可以现在到 Windows 设置里改成 OneZip。";
+                    Button {
+                        text: "打开 Windows 设置";
+                        clicked => { root.open-default-apps(); }
+                    }
+                }
+                HorizontalLayout {
+                    spacing: 8px;
+                    Section {
+                        text: "压缩包";
+                        horizontal-stretch: 1;
+                    }
+                    VerticalLayout {
+                        alignment: end;
+                        Button {
+                            text: "选择常用的";
+                            clicked => { root.assoc-common(); }
+                        }
+                    }
+                    VerticalLayout {
+                        alignment: end;
+                        Button {
+                            text: "全部取消";
+                            clicked => { root.assoc-none(); }
+                        }
+                    }
+                }
+                AssocGrid {
+                    rows: root.assoc-archives;
+                    toggled(id, on) => { root.assoc-toggled(id, on); }
+                }
+                Section { text: "磁盘镜像等"; }
+                Note { text: "Windows 自己能打开或挂载这些文件；关联后双击改成用 OneZip 看里面的文件。"; }
+                AssocGrid {
+                    rows: root.assoc-images;
+                    toggled(id, on) => { root.assoc-toggled(id, on); }
                 }
             }
 

@@ -8,7 +8,7 @@ use onezip_settings::Settings;
 use slint::ComponentHandle;
 
 use super::common::{file_dialog, stem, unique};
-use super::{App, compress, confirm, progress, settings};
+use super::{App, browser, compress, confirm, progress, settings};
 use crate::request::{Action, Delete, Request};
 use crate::tasks::{Kind, file_name};
 use crate::win;
@@ -22,7 +22,8 @@ pub(super) fn handle_from_window(app: &Rc<App>, req: Request) {
 /// 每个任务弹一个自己的进度窗口；来自主窗口的按钮时任务只显示在主窗口的列表里。
 pub(super) fn handle(app: &Rc<App>, req: Request, external: bool) {
     let w = &app.window;
-    if !external || matches!(req.action, Action::Show | Action::RegisterMenu | Action::UnregisterMenu) {
+    let own_window = matches!(req.action, Action::Open);
+    if (!external && !own_window) || matches!(req.action, Action::Show | Action::RegisterMenu | Action::UnregisterMenu) {
         win::present(w);
     }
     let mut ids = Vec::new();
@@ -50,6 +51,11 @@ pub(super) fn handle(app: &Rc<App>, req: Request, external: bool) {
                         password: None,
                     },
                 ));
+            }
+        }
+        Action::Open => {
+            for path in req.paths {
+                browser::open(app, path);
             }
         }
         Action::Url(url) => {
@@ -176,6 +182,8 @@ fn extract(app: &Rc<App>, paths: Vec<PathBuf>, placement: Placement, ask_folder:
 /// 设置里的"遇到同名文件"。
 pub(super) fn conflict(s: &Settings) -> Conflict {
     match s.conflict {
+        // 先不动，有同名文件时任务停下来，弹窗问（见 ui::same_names）。
+        onezip_settings::Conflict::Ask => Conflict::Refuse,
         onezip_settings::Conflict::Replace => Conflict::Replace,
         onezip_settings::Conflict::Skip => Conflict::Skip,
         onezip_settings::Conflict::Rename => Conflict::Rename,

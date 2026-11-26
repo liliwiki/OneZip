@@ -8,11 +8,12 @@
 //! 记进进度文件 → 把这批的区间在 NTFS 上打洞释放。打过洞的地方读出来是零，
 //! 7z.dll 重新打开时只读文件头，不碰这些区间，所以中断后可以接着来。
 
-mod archive;
+pub(crate) mod archive;
 mod fetch;
 mod ffi;
 mod iso;
 mod layout;
+mod update;
 
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::fs::{self, File, OpenOptions};
@@ -25,6 +26,12 @@ use anyhow::{Context, Result, anyhow, bail};
 
 pub(crate) use archive::{BadPassword, NeedPassword};
 pub(crate) use fetch::extract_url;
+pub(crate) use update::{Item as UpdateItem, Options as UpdateOptions, compress};
+
+/// 7z.dll 能不能用（压缩时用不了就退回内置的编码器）。
+pub(crate) fn available() -> bool {
+    ffi::library().is_ok()
+}
 use archive::{Sink, Stopped, Target};
 
 use crate::{Confirm, Conflict, Entry, Event, ExtractRequest, Observer, Outcome, Placement};
@@ -234,14 +241,14 @@ fn plan_clashes(output: &Path, files: &[(u32, &str)], conflict: Conflict) -> Res
     }
     let clash: Vec<(u32, &str)> =
         files.iter().copied().filter(|(_, rel)| fs::symlink_metadata(target_of(output, rel)).is_ok()).collect();
-    let Some(first) = clash.first() else { return Ok(plan) };
+    if clash.is_empty() {
+        return Ok(plan);
+    }
     match conflict {
-        Conflict::Refuse => bail!(
-            "{} 里已有 {} 个同名文件（例如 {}）。什么都没改动；如要替换请选择替换",
-            output.display(),
-            clash.len(),
-            target_of(output, first.1).display()
-        ),
+        Conflict::Refuse => bail!(crate::SameNames {
+            output: output.to_path_buf(),
+            files: clash.iter().map(|(_, rel)| PathBuf::from(rel.replace('/', "\\"))).collect(),
+        }),
         Conflict::Replace => {}
         Conflict::Skip => plan.skip = clash.iter().map(|c| c.0).collect(),
         Conflict::Rename => {

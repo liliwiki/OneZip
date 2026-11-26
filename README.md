@@ -29,14 +29,14 @@ Requires Windows 10 or 11 (x64).
 ### Upgrading and uninstalling
 
 - To upgrade, run the new installer; it installs to the same folder and removes files the old version left behind. OneZip can also do this itself with "Update now" (see [Updates](#updates)).
-- To uninstall, use "Installed apps" in Windows Settings, or run `uninstall.exe` in the install folder. It asks for confirmation and whether to delete OneZip's settings and error log too.
+- To uninstall, use "Installed apps" in Windows Settings, or run `uninstall.exe` in the install folder. It asks for confirmation and whether to delete OneZip's settings, saved passwords, and error log too. File associations are always removed, and each type's previous handler is restored.
 - Uninstalling removes only the files the installer put there. Files you extracted or compressed are left alone.
 
 ## Features
 
 | Feature | Details | Engine |
 |---|---|---|
-| Compress | 7z (LZMA2, multi-threaded, optional solid mode, AES-256 with encrypted file names), zip (Deflate, AES-256), tar.zst, tar.xz, tar.gz; written to a temporary file and renamed when done. Zip passwords use the system code page, as 7-Zip does | sevenz-rust2, zip, zstd, lzma-rust2, flate2 |
+| Compress | 7z (LZMA2, multi-threaded, optional solid mode, AES-256 with encrypted file names), zip (Deflate, AES-256), tar.zst, tar.xz, tar.gz; written to a temporary file and renamed when done. Zip passwords use the system code page, as 7-Zip does | 7-Zip (7z.dll) for 7z and zip; zstd, lzma-rust2, flate2 |
 | Extract (keeping the archive) | zip, 7z, rar | 7-Zip (7z.dll) |
 | Extract | tar, tar.gz, tar.bz2, tar.xz, split 7z (.7z.001) | HatchZip |
 | Extract | tar.zst, tar.lz4, .zst, .lz4 | Peel |
@@ -45,6 +45,8 @@ Requires Windows 10 or 11 (x64).
 | Extract while deleting the archive | Frees the archive's space batch by batch during extraction, so it needs far less free space than the archive itself; resumes after a power cut or crash. Works for every format above except disk images and installers (dmg, vhd, vhdx, vmdk, vdi, qcow2, msi, chm, and similar), whose layout doesn't allow it | HatchZip (also for zip, 7z, rar), Peel, OneZip |
 | Extract while downloading | Parallel ranged downloads, extracts data as it arrives, releases used data right away, resumes after interruption. Works for every format above, including password-protected zip, 7z, and rar; disk images and installers release the downloaded data only when extraction finishes | Peel, OneZip |
 | Smart extraction | Puts a single top-level item next to the archive, otherwise extracts into a folder named after it; can unpack nested archives too | OneZip |
+| Browse | A window in the style of 7-Zip's file manager: go through folders, open a file with its default program, extract the selected items, drag items into Explorer. Opens from "Open archive…" in the main window or by double-clicking an associated archive | 7-Zip (7z.dll) |
+| Saved passwords | "Remember this password" in the password prompt; saved passwords are encrypted with DPAPI for the current Windows user and tried before OneZip asks | OneZip |
 | List, test, checksums | CRC-32, CRC-64, MD5, SHA-1, SHA-256, SHA-512 for files and folders | OneZip, HatchZip |
 
 ## Context menu
@@ -64,13 +66,17 @@ Notes:
 
 ## Settings
 
-Open them with "Settings" in the main window; changes apply immediately. They are stored in the registry under `HKCU\Software\OneZip`.
+Open them with "Settings" in the main window; changes apply immediately. They are stored in the registry under `HKCU\Software\OneZip`; saved passwords are kept there encrypted with DPAPI.
+
+Windows doesn't let a program make itself the default app, so after you tick a file association Windows may ask which app to use the first time you double-click that type.
 
 | Page | Contents |
 |---|---|
 | General | Theme (follow Windows / light / dark), restore all defaults |
-| Extract | Default extraction; replace, skip, or rename files that already exist; unpack nested archives; whether "extract, then delete" uses the Recycle Bin; confirm before extracting while deleting; default folder and connection count for extracting while downloading |
+| Extract | Default extraction; ask every time, replace, skip, or rename files that already exist; unpack nested archives; whether "extract, then delete" uses the Recycle Bin; confirm before extracting while deleting; default folder and connection count for extracting while downloading |
 | Compress | Default format, level, threads, 7z solid mode, encrypted file names |
+| Passwords | Add and delete saved passwords; showing them requires Windows Hello or the Windows sign-in password |
+| File associations | Which archive and disk image types open in OneZip when double-clicked; lists the types Windows hasn't confirmed yet and opens Windows' Default apps page |
 | Context menu | Master switch and per-item visibility |
 | Updates | Automatic update check, check now, skipped versions, open the releases page |
 | About | Version, open-source projects used, GitHub page, licenses, report a problem |
@@ -86,6 +92,7 @@ Open them with "Settings" in the main window; changes apply immediately. They ar
 - "Extract while deleting the archive" deletes the archive as it extracts and cannot be undone. Progress is saved on disk so an interrupted extraction can continue, but back up anything you cannot get again. It explains this and asks before it starts (you can turn the prompt off).
 - "Extract, then delete the archive" deletes only after everything extracted successfully, to the Recycle Bin by default.
 - Extracting while downloading releases downloaded data as it is used, so extracting again means downloading again.
+- Saved passwords can be decrypted only by your Windows user, but anyone signed in to your account can use them to extract.
 
 Report security issues privately as described in [SECURITY.md](SECURITY.md).
 
@@ -98,10 +105,10 @@ Failed tasks and crashes are logged to `%LOCALAPPDATA%\OneZip\onezip.log`, which
 ```text
 crates/onezip-core/      Engine: extract(), compress(), list(), test(), hash()
 crates/onezip-formats/   Format table: which engine handles a format, whether it can extract in place
-crates/onezip-settings/  Settings storage (registry)
+crates/onezip-settings/  Settings, saved passwords, and file associations (registry)
 crates/onezip-menu/      Context menu items
 crates/onezip-cli/       onezipc.exe command line
-crates/onezip-app/       OneZip.exe window (Slint): task queue, progress windows, settings, updates
+crates/onezip-app/       OneZip.exe window (Slint): task queue, progress windows, archive browser, settings, updates
 crates/onezip-shell/     onezip_shell.dll, the Windows 11 context menu (IExplorerCommand)
 crates/onezip-setup/     OneZip-<version>-Setup.exe installer, which is also the uninstaller
 packaging/               Sparse package manifest, packaging and signing script, release script
@@ -133,7 +140,7 @@ onezipc h D:\file.iso -a sha256
 
 Ctrl+C during extraction pauses at a safe point; run the same command again to continue.
 
-With OneZip installed, `tools\uitest\regress.ps1` tests every context menu item and the progress windows. It moves the mouse and types, so leave the computer alone while it runs.
+With OneZip installed, `tools\uitest\regress.ps1` tests every context menu item, the progress windows, the archive browser, saved passwords, and file associations; it restores the settings and associations it changes. It moves the mouse and types, so leave the computer alone while it runs.
 
 ### Releasing
 

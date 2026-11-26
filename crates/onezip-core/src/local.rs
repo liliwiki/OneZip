@@ -219,12 +219,10 @@ fn extract_one(
             };
             let found = session::existing(&job, &out)?;
             if !found.is_empty() && req.conflict == Conflict::Refuse {
-                bail!(
-                    "{} 里已有 {} 个同名文件（例如 {}）。什么都没改动；如要替换请选择替换",
-                    out.display(),
-                    found.len(),
-                    found[0].display()
-                );
+                bail!(crate::SameNames {
+                    output: out.clone(),
+                    files: found,
+                });
             }
             check_space(&job, &out, false, req.keep_free, req.keep_source)?;
             if req.verify_first {

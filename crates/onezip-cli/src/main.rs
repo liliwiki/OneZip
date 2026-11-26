@@ -169,12 +169,14 @@ fn run(command: Command) -> Result<u8> {
             nested,
             keep_free_mb,
         } => {
+            let named = output.is_some();
             let req = ExtractRequest {
                 source: Source::parse(&source),
                 output,
                 placement: if here {
                     Placement::Here
-                } else if folder {
+                } else if folder || named {
+                    // 指定了输出文件夹就原样放进去（链接解压不再把唯一的一项挪出来）。
                     Placement::NewFolder
                 } else {
                     Placement::Smart

@@ -8,6 +8,7 @@
 //!
 //! 前端只和这里的类型打交道，不直接接触上游类型，以后换引擎或加格式不影响前端。
 
+pub mod browse;
 pub mod compress;
 pub mod hash;
 pub mod http;
@@ -16,6 +17,7 @@ mod local;
 mod sevenzip;
 mod remote;
 mod route;
+mod smart;
 mod source;
 
 use std::path::{Path, PathBuf};
@@ -71,6 +73,34 @@ pub fn needs_password(e: &anyhow::Error) -> bool {
             }
         }
     })
+}
+
+/// 解压目标里已经有同名的文件，而请求是 [`Conflict::Refuse`]：什么都没改动，
+/// 前端可以问用户怎么办，再按选择重新解压。
+#[derive(Debug, Clone)]
+pub struct SameNames {
+    pub output: PathBuf,
+    /// 已存在的那些文件，相对 `output`。
+    pub files: Vec<PathBuf>,
+}
+
+impl std::fmt::Display for SameNames {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "{} 里已有 {} 个同名文件（例如 {}）。什么都没改动；如要替换请选择替换",
+            self.output.display(),
+            self.files.len(),
+            self.files.first().map(|p| self.output.join(p)).unwrap_or_default().display()
+        )
+    }
+}
+
+impl std::error::Error for SameNames {}
+
+/// 失败是因为目标里已有同名文件（见 [`SameNames`]）时返回详情。
+pub fn same_names(e: &anyhow::Error) -> Option<&SameNames> {
+    e.chain().find_map(|c| c.downcast_ref::<SameNames>())
 }
 
 /// 字节数的可读形式，如 `1.5 GB`。
@@ -139,6 +169,8 @@ pub fn free_name(path: &Path) -> PathBuf {
 pub struct ExtractRequest {
     pub source: Source,
     /// 输出目录；`None` 时按 [`placement`](Self::placement) 决定。
+    /// 链接解压时这里是要新建的文件夹，`placement` 为 [`Placement::Smart`] 时，
+    /// 解完里面只有一项就把它挪到外面一层。
     pub output: Option<PathBuf>,
     pub placement: Placement,
     /// 保留原压缩包（不边解边删）。只对本地文件有意义。

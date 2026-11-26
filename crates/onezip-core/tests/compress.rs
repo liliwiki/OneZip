@@ -77,6 +77,11 @@ fn zip_encrypted_round_trip() {
 }
 
 #[test]
+fn zip_ascii_password_round_trip() {
+    round_trip(Format::Zip, Some("pass word!123"));
+}
+
+#[test]
 fn sevenz_round_trip() {
     round_trip(Format::SevenZ, None);
 }
@@ -247,6 +252,29 @@ fn list_and_test() {
     }
     fs::write(&archive, bytes).unwrap();
     assert!(onezip_core::test(&archive, None, quiet()).is_err());
+}
+
+/// 边解边删 tar.zst（Peel）也是智能解压：只有一个顶层文件夹时直接放在压缩包旁边。
+#[test]
+fn tar_zst_in_place_single_root_goes_beside_archive() {
+    let dir = tempfile::tempdir().unwrap();
+    let src = source_tree(&dir.path().join("src"), "资料");
+    let archive = dir.path().join("pack.tar.zst");
+    onezip_core::compress(&CompressRequest::new(vec![src], archive.clone(), Format::TarZst), quiet(), &stop()).unwrap();
+    fs::remove_dir_all(dir.path().join("src")).unwrap();
+    let req = ExtractRequest {
+        source: Source::Local(archive.clone()),
+        keep_free: 0,
+        ..Default::default()
+    };
+    let r = onezip_core::extract(&req, quiet(), &stop(), &mut |_| true).unwrap();
+    let Outcome::Finished { output, .. } = r else { panic!("应该完成") };
+    assert_eq!(output, dir.path().join("资料"));
+    assert!(!dir.path().join("pack").exists(), "多套了一层文件夹");
+    let mut got = common::read_tree(&output);
+    got.retain(|k, _| !k.contains(".peel."));
+    assert_eq!(got, common::sample_files());
+    assert!(!archive.exists());
 }
 
 #[test]

@@ -41,6 +41,9 @@ fn write_7z(dir: &Path, files: &BTreeMap<String, Vec<u8>>) -> PathBuf {
     let inputs: Vec<PathBuf> = fs::read_dir(&src).unwrap().map(|e| e.unwrap().path()).collect();
     let mut req = CompressRequest::new(inputs, out.clone(), Format::SevenZ);
     req.level = 1;
+    // 单线程压：多线程压出的 7z 解压时也多线程，解码跑在写文件前面，
+    // 刚过 1 MB 就暂停时可能一个文件都还没写完，测不到"续传"。
+    req.threads = 1;
     onezip_core::compress(&req, quiet(), &Arc::new(AtomicBool::new(false))).unwrap();
     fs::remove_dir_all(src).unwrap();
     out
@@ -102,7 +105,13 @@ fn check(make: impl Fn(&Path) -> PathBuf, keep: bool, label: &str) {
         prepared(&out);
         let r = run(&archive, &out, keep, conflict);
         if conflict == Conflict::Refuse {
-            assert!(r.is_err(), "{label}: 有同名文件时应拒绝");
+            let e = r.expect_err(&format!("{label}: 有同名文件时应拒绝"));
+            // 前端靠这个弹窗问用户：要带上输出位置和全部同名文件（相对路径）。
+            let same = onezip_core::same_names(&e).unwrap_or_else(|| panic!("{label}: 应报告同名文件：{e:#}"));
+            let mut names: Vec<String> = same.files.iter().map(|p| p.to_string_lossy().replace('\\', "/")).collect();
+            names.sort();
+            assert_eq!(names, ["a.txt", "sub/b.txt"], "{label}");
+            assert_eq!(same.output, out, "{label}");
             assert_eq!(fs::read(out.join("a.txt")).unwrap(), b"mine a", "{label}: 拒绝时不应改动");
             assert!(!out.join("c.txt").exists(), "{label}: 拒绝时不应解出任何文件");
             assert!(archive.exists());

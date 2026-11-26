@@ -1,4 +1,4 @@
-﻿# 右键菜单回归测试：在 D:\OZT 造测试文件，逐项点 OneZip 子菜单，检查结果。
+﻿# 回归测试：在 D:\OZT 造测试文件，逐项点 OneZip 子菜单，再试每次询问、记住密码、浏览窗口、文件关联。
 # 需要已安装的 OneZip（位置从"应用和功能"的卸载项里读），会操作鼠标键盘，运行时别动电脑。
 # 用法：powershell -ExecutionPolicy Bypass -File regress.ps1
 param([string]$Dir = 'D:\OZT')
@@ -83,12 +83,15 @@ Check '添加到 "照片.7z"' (WaitFor { (Test-Path "$Dir\照片.7z") -and ((& $
 MN -Folder $Dir -Items '笔记.txt' -Command '添加到*笔记.zip*'
 Check '添加到 "笔记.zip"' (WaitFor { (Test-Path "$Dir\笔记.zip") -and ((& $cli t "$Dir\笔记.zip") -match '通过') })
 
+# 格式跟着设置里的默认格式走（7z 或 zip 都支持密码），看新出现的那个包。
+$had = @(Get-ChildItem "$Dir\笔记*" -Include *.7z, *.zip).Name
 MN -Folder $Dir -Items '笔记.txt' -Command '添加到压缩包…'
 $fg = WaitFor { (UI -Do windows | Select-String 'foreground: 添加到压缩包') } 10
 UI -Do clicktype -Window '添加到压缩包' -Type Edit -Name 1 | Out-Null; Start-Sleep 1
 UI -Do type -Text '246810' | Out-Null; Start-Sleep 1
 UI -Do click -Window '添加到压缩包' -Name '开始压缩' | Out-Null
-Check '添加到压缩包…（对话框在最前，加密 7z）' ($fg -and (WaitFor { (Test-Path "$Dir\笔记.7z") -and ((& $cli t "$Dir\笔记.7z" -p 246810) -match '通过') }))
+$new = { Get-ChildItem "$Dir\笔记*" -Include *.7z, *.zip | ? { $had -notcontains $_.Name } | Select -First 1 }
+Check '添加到压缩包…（对话框在最前，加密）' ($fg -and (WaitFor { ($f = & $new) -and ((& $cli t $f.FullName -p 246810) -match '通过') })) ((& $new).Name)
 
 # ---- 校验值（平铺在 OneZip 子菜单里）----
 # 结果窗口里的文字通过“复制”按钮取出来核对。
@@ -210,6 +213,76 @@ Set-Clipboard 'secret'; UI -Do type -Text '^v' | Out-Null; Start-Sleep 1
 UI -Do click -Window '需要密码' -Name '确定' | Out-Null
 Check 'RAR5 加密文件名：弹密码框，输对后解出' ($pw -and (WaitFor { (Get-Content "$Dir\game\config\settings.ini" -Raw -EA SilentlyContinue) -eq ("volume=7`n" * 2000) }))
 WaitFor { -not (Get-Process OneZip -EA SilentlyContinue) } 20 | Out-Null
+
+# ---- 第二批（0.2.0）：每次询问、记住密码、浏览窗口、文件关联 ----
+# 会动到用户自己的设置、保存的密码、文件关联：先记下，测完原样放回。
+$keyPath = 'HKCU:\Software\OneZip'
+$oldConflict = (Get-ItemProperty $keyPath -EA SilentlyContinue).Conflict
+$oldPasswords = (Get-ItemProperty $keyPath -EA SilentlyContinue).Passwords
+function DotDefault($e) { (Get-ItemProperty "HKCU:\Software\Classes\.$e" -EA SilentlyContinue).'(default)' }
+
+# 每次询问：解压前弹窗列出同名文件，选“都保留”
+Set-ItemProperty $keyPath Conflict 'ask'
+New-Item -ItemType Directory "$Dir\问\资料" -Force | Out-Null
+Copy-Item "$Dir\资料.zip" "$Dir\问\资料.zip"
+Set-Content "$Dir\问\资料\f1.txt" 'MINE'
+MN -Folder "$Dir\问" -Items '资料.zip' -Command '解压到当前位置'
+$asked = WaitFor { (UI -Do windows | Select-String '^目标位置有同名文件 \|') } 15
+$list = (UI -Do dump -Window '目标位置有同名文件') -match '资料\\f1\.txt'
+UI -Do invoke -Window '目标位置有同名文件' -Name '都保留（新的改名）' | Out-Null
+$kept = WaitFor { (Test-Path "$Dir\问\资料\f1 (2).txt") -and (Test-Path "$Dir\问\资料\f4.txt") }
+Check '每次询问：弹窗列出同名文件，选“都保留”后改名解出' ($asked -and $list -and $kept -and (Get-Content "$Dir\问\资料\f1.txt" -Raw).Trim() -eq 'MINE')
+WaitFor { -not (Get-Process OneZip -EA SilentlyContinue) } 20 | Out-Null
+if ($null -eq $oldConflict) { Remove-ItemProperty $keyPath Conflict } else { Set-ItemProperty $keyPath Conflict $oldConflict }
+
+# 记住密码：第一次勾“记住这个密码”，第二次不再问
+Remove-ItemProperty $keyPath Passwords -EA SilentlyContinue
+New-Item -ItemType Directory "$Dir\记" -Force | Out-Null
+Copy-Item "$Dir\加密.7z" "$Dir\记\加密.7z"
+MN -Folder "$Dir\记" -Items '加密.7z' -Command '智能解压'
+$pw = WaitFor { (UI -Do windows | Select-String 'foreground: 需要密码') } 15
+UI -Do setvalue -Window '需要密码' -Name 0 -Text '1234' | Out-Null
+UI -Do toggle -Window '需要密码' -Name '记住这个密码' | Out-Null
+UI -Do invoke -Window '需要密码' -Name '确定' | Out-Null
+$first = WaitFor { (T "$Dir\记\资料") -eq $ref }
+WaitFor { -not (Get-Process OneZip -EA SilentlyContinue) } 20 | Out-Null
+Remove-Item "$Dir\记\资料" -Recurse -Force -EA SilentlyContinue
+MN -Folder "$Dir\记" -Items '加密.7z' -Command '智能解压'
+$second = WaitFor { (T "$Dir\记\资料") -eq $ref }
+$askedAgain = [bool](UI -Do windows | Select-String '需要密码')
+Check '记住密码：勾选后保存，第二次自动用上' ($pw -and $first -and $second -and -not $askedAgain)
+WaitFor { -not (Get-Process OneZip -EA SilentlyContinue) } 20 | Out-Null
+if ($null -eq $oldPasswords) { Remove-ItemProperty $keyPath Passwords -EA SilentlyContinue }
+else { Set-ItemProperty $keyPath Passwords ([byte[]]$oldPasswords) -Type Binary }
+
+# 浏览窗口：--open 列出内容
+Start-Process "$installed\OneZip.exe" -ArgumentList '--open', "$Dir\多根.7z"
+$open = WaitFor { (UI -Do windows | Select-String '^多根\.7z - OneZip \|') } 15
+$rows = UI -Do dump -Window '多根.7z - OneZip'
+Check '浏览窗口：打开压缩包，列出里面的文件夹' ($open -and ($rows -match '^Text: 甲$') -and ($rows -match '^Text: 乙$') -and ($rows -match '2 个文件夹'))
+UI -Do close -Window '多根.7z - OneZip' | Out-Null
+WaitFor { -not (Get-Process OneZip -EA SilentlyContinue) } 20 | Out-Null
+
+# 文件关联：设置里勾 .lzma（少见，不会碰到用户常用的格式），再取消，还原原样
+$before = DotDefault 'lzma'
+if ($before -ne 'OneZip.lzma') {
+  Start-Process "$installed\OneZip.exe"
+  WaitFor { (UI -Do windows | Select-String '^OneZip \|') } 10 | Out-Null
+  UI -Do click -Window OneZip -Name '设置' | Out-Null
+  WaitFor { (UI -Do windows | Select-String 'OneZip 设置') } 10 | Out-Null
+  UI -Do click -Window 'OneZip 设置' -Name '文件关联' | Out-Null; Start-Sleep 1
+  UI -Do toggle -Window 'OneZip 设置' -Name '.lzma' | Out-Null; Start-Sleep 1
+  $cmd = (Get-ItemProperty 'HKCU:\Software\Classes\OneZip.lzma\shell\open\command' -EA SilentlyContinue).'(default)'
+  $on = (DotDefault 'lzma') -eq 'OneZip.lzma' -and $cmd -match '--open "%1"'
+  UI -Do toggle -Window 'OneZip 设置' -Name '.lzma' | Out-Null; Start-Sleep 1
+  $off = (DotDefault 'lzma') -eq $before -and -not (Test-Path 'HKCU:\Software\Classes\OneZip.lzma')
+  Check '文件关联：勾选后双击走 --open，取消后还原' ($on -and $off) $cmd
+  UI -Do close -Window 'OneZip 设置' | Out-Null
+  (Get-Process OneZip -EA SilentlyContinue).CloseMainWindow() | Out-Null
+  WaitFor { -not (Get-Process OneZip -EA SilentlyContinue) } 10 | Out-Null
+} else {
+  Check '文件关联（.lzma 已被用户关联，跳过）' $true
+}
 
 $results | Format-Table -AutoSize | Out-String -Width 200
 "通过 {0} / {1}" -f @($results | ? 结果 -eq '通过').Count, $results.Count

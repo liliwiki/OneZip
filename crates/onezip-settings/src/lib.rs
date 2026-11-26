@@ -5,6 +5,9 @@
 
 use std::path::PathBuf;
 
+pub mod assoc;
+pub mod passwords;
+
 /// 注册表位置（HKCU 下）。
 pub const KEY: &str = r"Software\OneZip";
 
@@ -28,6 +31,8 @@ pub enum ExtractMode {
 /// 目标位置已有同名文件时怎么办。
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
 pub enum Conflict {
+    /// 解压前先查出同名文件，弹窗问一次怎么办。
+    Ask,
     Replace,
     Skip,
     /// 都保留，解出的改名为 `名字 (2).扩展名`。不会丢任何东西，所以是默认。
@@ -131,7 +136,7 @@ impl Word for ExtractMode {
 }
 impl Word for Conflict {
     const ALL: &'static [(Self, &'static str)] =
-        &[(Conflict::Replace, "replace"), (Conflict::Skip, "skip"), (Conflict::Rename, "rename")];
+        &[(Conflict::Ask, "ask"), (Conflict::Replace, "replace"), (Conflict::Skip, "skip"), (Conflict::Rename, "rename")];
 }
 impl Word for DeleteMode {
     const ALL: &'static [(Self, &'static str)] =
@@ -222,7 +227,7 @@ pub fn menu_filter() -> (bool, Vec<String>) {
     (s.menu_enabled, s.menu_hidden)
 }
 
-/// 删除全部设置（卸载时用户选择删除，或"恢复全部默认"）。
+/// 删除全部设置和保存的密码（卸载时用户勾选删除）。
 pub fn delete_all() -> std::io::Result<()> {
     store::delete_all()
 }

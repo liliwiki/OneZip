@@ -11,6 +11,7 @@ mod request;
 mod tasks;
 mod ui;
 mod update;
+mod verify;
 mod win;
 
 use std::sync::mpsc;

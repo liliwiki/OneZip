@@ -1,16 +1,19 @@
 //! 设置窗口：主窗口点"设置"弹出。每改一项就整体保存并立即生效（主题、右键菜单）。
 
+use std::cell::RefCell;
 use std::path::PathBuf;
 use std::rc::Rc;
 
 use onezip_core::Format;
 use onezip_menu::{Command, Show};
+use onezip_settings::assoc;
+use onezip_settings::passwords::{self, Saved};
 use onezip_settings::{Conflict, DeleteMode, ExtractMode, Settings, Theme};
 use slint::{ComponentHandle, ModelRc, SharedString, VecModel};
 
 use super::common::{error, file_dialog, open_url};
 use super::{App, show_dialog};
-use crate::{MenuRow, MenuToggle, SettingsWindow, menu};
+use crate::{AssocRow, MenuRow, MenuToggle, SavedPassword, SettingsWindow, menu};
 
 pub(super) const GITHUB: &str = "https://github.com/liliwiki/OneZip";
 
@@ -69,6 +72,173 @@ fn download_placeholder() -> String {
         .unwrap_or_default()
 }
 
+/// 密码页：重新读出保存的密码放进列表。`shown` 为假时不把密码本身交给界面。
+fn fill_passwords(d: &SettingsWindow, list: &RefCell<Vec<Saved>>, shown: bool) {
+    let saved = passwords::load();
+    let rows: Vec<SavedPassword> = saved
+        .iter()
+        .map(|s| SavedPassword {
+            text: if shown { s.password.as_str().into() } else { SharedString::new() },
+            note: if s.note.is_empty() { "手动添加".into() } else { format!("上次用于 {}", s.note).into() },
+        })
+        .collect();
+    d.set_saved_passwords(ModelRc::new(VecModel::from(rows)));
+    d.set_passwords_shown(shown && !saved.is_empty());
+    *list.borrow_mut() = saved;
+}
+
+/// 密码页的按钮。`list` 是界面上显示的那份（按序号删除时用它，免得期间有新保存的密码时删错）。
+fn wire_passwords(d: &SettingsWindow) {
+    let list = Rc::new(RefCell::new(Vec::new()));
+    fill_passwords(d, &list, false);
+    let failed = |d: &SettingsWindow, e: std::io::Error| error(d.window(), &format!("保存密码失败：{e}"));
+    d.on_add_password({
+        let (w, list) = (d.as_weak(), list.clone());
+        move || {
+            let Some(d) = w.upgrade() else { return };
+            let pw = d.get_new_password().to_string();
+            if pw.is_empty() {
+                return;
+            }
+            if let Err(e) = passwords::remember(&pw, "") {
+                failed(&d, e);
+            }
+            d.set_new_password(SharedString::new());
+            fill_passwords(&d, &list, d.get_passwords_shown());
+        }
+    });
+    d.on_remove_password({
+        let (w, list) = (d.as_weak(), list.clone());
+        move |i| {
+            let Some(d) = w.upgrade() else { return };
+            let pw = list.borrow().get(i as usize).map(|s| s.password.clone());
+            if let Some(pw) = pw
+                && let Err(e) = passwords::forget(&pw)
+            {
+                failed(&d, e);
+            }
+            fill_passwords(&d, &list, d.get_passwords_shown());
+        }
+    });
+    d.on_remove_all_passwords({
+        let (w, list) = (d.as_weak(), list.clone());
+        move || {
+            let Some(d) = w.upgrade() else { return };
+            let r = super::common::message(d.window())
+                .set_description("删除全部保存的密码？删除后不能恢复。")
+                .set_buttons(rfd::MessageButtons::OkCancel)
+                .show();
+            if r != rfd::MessageDialogResult::Ok {
+                return;
+            }
+            if let Err(e) = passwords::save(&[]) {
+                failed(&d, e);
+            }
+            fill_passwords(&d, &list, false);
+        }
+    });
+    d.on_toggle_passwords({
+        let (w, list) = (d.as_weak(), list.clone());
+        move || {
+            let Some(d) = w.upgrade() else { return };
+            if d.get_passwords_shown() {
+                fill_passwords(&d, &list, false);
+                return;
+            }
+            d.set_verifying(true);
+            let w = w.clone();
+            crate::verify::verify_user(d.window(), "验证你的身份以显示 OneZip 保存的密码", move |ok| {
+                let Some(d) = w.upgrade() else { return };
+                d.set_verifying(false);
+                if ok {
+                    d.invoke_passwords_verified();
+                }
+            });
+        }
+    });
+    d.on_passwords_verified({
+        let (w, list) = (d.as_weak(), list.clone());
+        move || {
+            if let Some(d) = w.upgrade() {
+                fill_passwords(&d, &list, true);
+            }
+        }
+    });
+}
+
+/// 文件关联页：按注册表里的实际情况勾选。
+fn fill_assoc(d: &SettingsWindow) {
+    let rows = |exts: &[&str]| -> ModelRc<AssocRow> {
+        let rows: Vec<AssocRow> = exts
+            .chunks(4)
+            .map(|chunk| {
+                let items: Vec<MenuToggle> = chunk
+                    .iter()
+                    .map(|e| MenuToggle { id: (*e).into(), label: format!(".{e}").into(), checked: assoc::associated(e) })
+                    .collect();
+                AssocRow { items: ModelRc::new(VecModel::from(items)) }
+            })
+            .collect();
+        ModelRc::new(VecModel::from(rows))
+    };
+    d.set_assoc_archives(rows(assoc::ARCHIVES));
+    d.set_assoc_images(rows(assoc::IMAGES));
+    let overridden: Vec<String> = assoc::ARCHIVES
+        .iter()
+        .chain(assoc::IMAGES)
+        .filter(|e| assoc::overridden(e))
+        .map(|e| format!(".{e}"))
+        .collect();
+    d.set_assoc_overridden(overridden.join("、").into());
+}
+
+/// 关联或取消一批扩展名，然后刷新页面。
+fn set_assoc(d: &SettingsWindow, exts: &[&str], on: bool) {
+    let exe = match std::env::current_exe() {
+        Ok(e) => e,
+        Err(e) => return error(d.window(), &format!("找不到 OneZip.exe：{e}")),
+    };
+    let failed: Vec<String> = exts
+        .iter()
+        .filter_map(|e| assoc::set(&exe, e, on).err().map(|err| format!(".{e}：{err}")))
+        .collect();
+    assoc::notify();
+    if !failed.is_empty() {
+        error(d.window(), &format!("设置文件关联失败：\n{}", failed.join("\n")));
+    }
+    fill_assoc(d);
+}
+
+fn wire_assoc(d: &SettingsWindow) {
+    fill_assoc(d);
+    let w = d.as_weak();
+    d.on_assoc_toggled(move |id, on| {
+        if let Some(d) = w.upgrade() {
+            set_assoc(&d, &[id.as_str()], on);
+        }
+    });
+    let w = d.as_weak();
+    d.on_assoc_common(move || {
+        if let Some(d) = w.upgrade() {
+            set_assoc(&d, assoc::COMMON, true);
+        }
+    });
+    let w = d.as_weak();
+    d.on_assoc_none(move || {
+        if let Some(d) = w.upgrade() {
+            let all: Vec<&str> = assoc::ARCHIVES.iter().chain(assoc::IMAGES).copied().collect();
+            set_assoc(&d, &all, false);
+        }
+    });
+    let w = d.as_weak();
+    d.on_assoc_refresh(move || {
+        if let Some(d) = w.upgrade() {
+            fill_assoc(&d);
+        }
+    });
+    d.on_open_default_apps(|| open_url(&format!("ms-settings:defaultapps?registeredAppUser={}", assoc::APP)));
+}
+
 /// 设置 → 窗口。
 fn fill(d: &SettingsWindow, s: &Settings) {
     d.set_theme_index(theme_index(s.theme));
@@ -80,9 +250,10 @@ fn fill(d: &SettingsWindow, s: &Settings) {
         ExtractMode::Here => 2,
     });
     d.set_conflict(match s.conflict {
-        Conflict::Replace => 0,
-        Conflict::Skip => 1,
-        Conflict::Rename => 2,
+        Conflict::Ask => 0,
+        Conflict::Replace => 1,
+        Conflict::Skip => 2,
+        Conflict::Rename => 3,
     });
     d.set_nested(s.nested);
     d.set_delete_mode(match s.delete_mode {
@@ -128,8 +299,9 @@ fn read(d: &SettingsWindow, s: &mut Settings) {
         _ => ExtractMode::Smart,
     };
     s.conflict = match d.get_conflict() {
-        0 => Conflict::Replace,
-        1 => Conflict::Skip,
+        0 => Conflict::Ask,
+        1 => Conflict::Replace,
+        2 => Conflict::Skip,
         _ => Conflict::Rename,
     };
     s.nested = d.get_nested();
@@ -181,6 +353,8 @@ pub(super) fn open(app: &Rc<App>, page: Option<i32>) {
         d.set_page(p);
     }
     fill(&d, &app.settings.borrow());
+    wire_passwords(&d);
+    wire_assoc(&d);
 
     d.on_changed({
         let app = Rc::downgrade(app);

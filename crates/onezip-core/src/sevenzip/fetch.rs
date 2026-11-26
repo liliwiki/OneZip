@@ -409,6 +409,8 @@ pub(crate) fn extract_url(url: &str, req: &ExtractRequest, observer: Observer, s
 
     // 进度：下载量 / 总大小，另报解出的字节数。每秒把下好的块刷盘记进检查点。
     observer(Event::Started { total: len, resuming });
+    // 智能解压：解完后文件夹里只有一项就挪出来（只动这次新建的文件夹）。
+    let smart = req.placement == crate::Placement::Smart && (resuming || crate::smart::is_empty_dir(&output));
     let extracted = Arc::new(AtomicU64::new(0));
     let done = Arc::new(AtomicBool::new(false));
     let ticker = {
@@ -475,6 +477,7 @@ pub(crate) fn extract_url(url: &str, req: &ExtractRequest, observer: Observer, s
     match result {
         Ok(Outcome::Finished { warning, .. }) => {
             let _ = fs::remove_dir_all(&work);
+            let output = if smart { crate::smart::flatten(&output) } else { output };
             Ok(Outcome::Finished { output, warning })
         }
         Ok(o) => Ok(o),

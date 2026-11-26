@@ -126,6 +126,15 @@ switch ($Do) {
     $e.GetCurrentPattern([System.Windows.Automation.InvokePattern]::Pattern).Invoke()
     "invoked '$Name'"
   }
+  'toggle' {
+    # 切换复选框（不动鼠标、不按键）
+    $c1 = New-Object System.Windows.Automation.PropertyCondition ($A::NameProperty), $Name
+    $c2 = New-Object System.Windows.Automation.PropertyCondition ($A::ControlTypeProperty), ([System.Windows.Automation.ControlType]::CheckBox)
+    $e = $scope.FindFirst([System.Windows.Automation.TreeScope]::Descendants, (New-Object System.Windows.Automation.AndCondition $c1, $c2))
+    if (-not $e) { "checkbox '$Name' not found"; exit 3 }
+    $t = $e.GetCurrentPattern([System.Windows.Automation.TogglePattern]::Pattern); $t.Toggle()
+    "toggled '$Name' -> $($t.Current.ToggleState)"
+  }
   'wheel' {
     # 在窗口中部向下滚动
     $r = $scope.Current.BoundingRectangle

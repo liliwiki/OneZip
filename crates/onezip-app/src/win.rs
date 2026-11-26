@@ -182,6 +182,91 @@ mod imp {
     }
 }
 
+#[cfg(windows)]
+mod drag {
+    //! 把文件拖到资源管理器（或任何接受文件拖放的程序）。
+
+    use std::path::PathBuf;
+
+    use windows::Win32::Foundation::{DRAGDROP_S_CANCEL, DRAGDROP_S_DROP, DRAGDROP_S_USEDEFAULTCURSORS, S_OK};
+    use windows::Win32::System::Com::IDataObject;
+    use windows::Win32::System::Ole::{DROPEFFECT, DROPEFFECT_COPY, DoDragDrop, IDropSource, IDropSource_Impl, OleInitialize};
+    use windows::Win32::System::SystemServices::{MK_LBUTTON, MODIFIERKEYS_FLAGS};
+    use windows::Win32::UI::Shell::Common::ITEMIDLIST;
+    use windows::Win32::UI::Shell::{BHID_DataObject, ILCreateFromPathW, ILFree, IShellItemArray, SHCreateShellItemArrayFromIDLists};
+    use windows::core::{BOOL, HRESULT, HSTRING};
+    use windows_core::implement;
+
+    #[implement(IDropSource)]
+    struct Source;
+
+    impl IDropSource_Impl for Source_Impl {
+        fn QueryContinueDrag(&self, escape: BOOL, keys: MODIFIERKEYS_FLAGS) -> HRESULT {
+            if escape.as_bool() {
+                DRAGDROP_S_CANCEL
+            } else if keys.0 & MK_LBUTTON.0 == 0 {
+                DRAGDROP_S_DROP
+            } else {
+                S_OK
+            }
+        }
+        fn GiveFeedback(&self, _effect: DROPEFFECT) -> HRESULT {
+            DRAGDROP_S_USEDEFAULTCURSORS
+        }
+    }
+
+    /// 开始拖放这些文件（都在同一个文件夹里），直到松开鼠标才返回。
+    pub fn drag_files(paths: &[PathBuf]) -> windows::core::Result<()> {
+        unsafe {
+            let _ = OleInitialize(None);
+            let pidls: Vec<*mut ITEMIDLIST> =
+                paths.iter().map(|p| ILCreateFromPathW(&HSTRING::from(p.as_path()))).filter(|p| !p.is_null()).collect();
+            let r = (|| {
+                let list: Vec<*const ITEMIDLIST> = pidls.iter().map(|p| *p as *const _).collect();
+                let items: IShellItemArray = SHCreateShellItemArrayFromIDLists(&list)?;
+                let data: IDataObject = items.BindToHandler(None, &BHID_DataObject)?;
+                let source: IDropSource = Source.into();
+                let mut effect = DROPEFFECT(0);
+                DoDragDrop(&data, &source, DROPEFFECT_COPY, &mut effect).ok()
+            })();
+            for p in pidls {
+                ILFree(Some(p));
+            }
+            r
+        }
+    }
+}
+
+#[cfg(windows)]
+pub use drag::drag_files;
+
+/// 本地时间，如 `2026-11-26 21:10`。
+#[cfg(windows)]
+pub fn local_time(t: std::time::SystemTime) -> String {
+    use windows::Win32::Foundation::{FILETIME, SYSTEMTIME};
+    use windows::Win32::System::Time::{FileTimeToSystemTime, SystemTimeToTzSpecificLocalTime};
+    let Ok(d) = t.duration_since(std::time::UNIX_EPOCH) else { return String::new() };
+    let ft = d.as_nanos() as u64 / 100 + 116_444_736_000_000_000;
+    let ft = FILETIME { dwLowDateTime: ft as u32, dwHighDateTime: (ft >> 32) as u32 };
+    let (mut utc, mut local) = (SYSTEMTIME::default(), SYSTEMTIME::default());
+    unsafe {
+        if FileTimeToSystemTime(&ft, &mut utc).is_err() || SystemTimeToTzSpecificLocalTime(None, &utc, &mut local).is_err() {
+            return String::new();
+        }
+    }
+    format!("{}-{:02}-{:02} {:02}:{:02}", local.wYear, local.wMonth, local.wDay, local.wHour, local.wMinute)
+}
+
+#[cfg(not(windows))]
+pub fn local_time(_t: std::time::SystemTime) -> String {
+    String::new()
+}
+
+#[cfg(not(windows))]
+pub fn drag_files(_paths: &[std::path::PathBuf]) -> anyhow::Result<()> {
+    anyhow::bail!("只支持 Windows")
+}
+
 #[cfg(not(windows))]
 mod imp {
     pub fn bring_to_front(_window: &slint::Window) {}
@@ -200,6 +285,8 @@ mod imp {
     }
 }
 
+#[cfg(windows)]
+pub use imp::hwnd;
 pub use imp::{
     allow_any_foreground, bring_to_front, center_on, recycle, set_clipboard, set_owner, shell_open, windows_version,
 };

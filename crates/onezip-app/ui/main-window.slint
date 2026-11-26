@@ -114,6 +114,7 @@ export component MainWindow inherits ThemedWindow {
     callback compress-files();
     callback compress-folder();
     callback extract-files();
+    callback open-archive();
     callback extract-url(string);
     callback pause(int);
     callback resume(int);
@@ -131,6 +132,10 @@ export component MainWindow inherits ThemedWindow {
                 text: "解压…";
                 primary: true;
                 clicked => { root.extract-files(); }
+            }
+            Button {
+                text: "打开压缩包…";
+                clicked => { root.open-archive(); }
             }
             Button {
                 text: "压缩文件…";

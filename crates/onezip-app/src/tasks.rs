@@ -21,6 +21,8 @@ pub enum Kind {
     /// 第二项：全部解压成功后要删除压缩包时，怎么删。
     Extract(ExtractRequest, Option<DeleteMode>),
     Compress(CompressRequest),
+    /// 浏览窗口里选中的几项（保留原压缩包）。
+    Pick(onezip_core::browse::PickRequest),
     Test {
         path: PathBuf,
         password: Option<String>,
@@ -40,6 +42,8 @@ pub enum Status {
     Done,
     Cancelled,
     NeedsPassword { retry: bool },
+    /// 目标位置已有同名文件（设置为"每次询问"）：什么都没动，等用户选怎么办。
+    SameNames { output: PathBuf, files: Vec<PathBuf> },
     Failed(String),
 }
 
@@ -63,6 +67,8 @@ pub struct Task {
     pub started: Option<Instant>,
     /// 这一轮结束的时间；结束后已用时间不再增加。
     pub ended: Option<Instant>,
+    /// 用户在密码框里勾了"记住这个密码"：确认密码对了（解压完成或暂停）就保存。
+    remember: bool,
     stop: Arc<AtomicBool>,
 }
 
@@ -89,6 +95,7 @@ impl Task {
             Status::Done => "完成".into(),
             Status::Cancelled => "已取消".into(),
             Status::NeedsPassword { .. } => "需要密码".into(),
+            Status::SameNames { .. } => "有同名文件".into(),
             Status::Failed(_) => "失败".into(),
         }
     }
@@ -102,6 +109,9 @@ impl Task {
                 None => "完成".into(),
             },
             Status::Paused => "进度已保存，可以随时继续（关掉 OneZip 也不会丢）".into(),
+            Status::SameNames { output, files } => {
+                format!("{} 里已有 {} 个同名文件，请选择怎么办", output.display(), files.len())
+            }
             _ if !self.note.is_empty() && self.total == 0 => self.note.clone(),
             _ => {
                 let mut s = match self.remote {
@@ -179,12 +189,32 @@ impl Task {
         !matches!(self.status, Status::Running | Status::Queued)
     }
 
+    /// 任务带着的密码（解压、测试）。
+    fn password(&self) -> Option<&str> {
+        match &self.kind {
+            Kind::Extract(r, _) => r.password.as_deref(),
+            Kind::Pick(r) => r.password.as_deref(),
+            Kind::Test { password, .. } => password.as_deref(),
+            Kind::Compress(_) | Kind::Hash { .. } => None,
+        }
+    }
+
+    fn set_password(&mut self, password: String) {
+        match &mut self.kind {
+            Kind::Extract(r, _) => r.password = Some(password),
+            Kind::Pick(r) => r.password = Some(password),
+            Kind::Test { password: p, .. } => *p = Some(password),
+            Kind::Compress(_) | Kind::Hash { .. } => {}
+        }
+    }
+
     pub fn archive_name(&self) -> String {
         match &self.kind {
             Kind::Extract(r, _) => match &r.source {
                 Source::Local(p) => file_name(p),
                 Source::Url(u) => u.clone(),
             },
+            Kind::Pick(r) => file_name(&r.archive),
             Kind::Test { path, .. } => file_name(path),
             Kind::Compress(r) => file_name(&r.output),
             Kind::Hash { paths, .. } => match paths.as_slice() {
@@ -242,6 +272,7 @@ impl Manager {
             report: None,
             started: None,
             ended: None,
+            remember: false,
             stop: Arc::new(AtomicBool::new(false)),
         });
         id
@@ -282,7 +313,7 @@ impl Manager {
 
     pub fn cancel(&self, id: u64) {
         self.with(id, |t| match t.status {
-            Status::Queued => t.status = Status::Cancelled,
+            Status::Queued | Status::SameNames { .. } => t.status = Status::Cancelled,
             Status::Running if t.can_cancel() => t.stop.store(true, Ordering::SeqCst),
             _ => {}
         });
@@ -302,13 +333,26 @@ impl Manager {
             .retain(|t| !matches!(t.status, Status::Done | Status::Cancelled));
     }
 
-    /// 带上密码重新排队。
-    pub fn set_password(&self, id: u64, password: String) {
+    /// 带上密码重新排队。`remember`：密码对了就保存起来。
+    pub fn set_password(&self, id: u64, password: String, remember: bool) {
+        self.with(id, |t| {
+            if matches!(t.kind, Kind::Compress(_) | Kind::Hash { .. }) {
+                return;
+            }
+            t.set_password(password);
+            t.remember = remember;
+            t.stop = Arc::new(AtomicBool::new(false));
+            t.status = Status::Queued;
+        });
+    }
+
+    /// 有同名文件时用户选了怎么办：按这个重新排队。
+    pub fn set_conflict(&self, id: u64, conflict: onezip_core::Conflict) {
         self.with(id, |t| {
             match &mut t.kind {
-                Kind::Extract(r, _) => r.password = Some(password),
-                Kind::Test { password: p, .. } => *p = Some(password),
-                Kind::Compress(_) | Kind::Hash { .. } => return,
+                Kind::Extract(r, _) => r.conflict = conflict,
+                Kind::Pick(r) => r.conflict = conflict,
+                _ => return,
             }
             t.stop = Arc::new(AtomicBool::new(false));
             t.status = Status::Queued;
@@ -383,12 +427,53 @@ impl Manager {
         })
     }
 
+    /// 加密的压缩包、而任务没带密码：先用保存的密码挨个试（最近用过的先试），
+    /// 试对了就记到任务里（暂停后继续还要用）。都不对时返回第一次的错误，前端再弹密码框。
+    fn with_saved_passwords<T>(
+        &self,
+        id: u64,
+        has_password: bool,
+        mut run: impl FnMut(Option<String>) -> anyhow::Result<T>,
+    ) -> anyhow::Result<T> {
+        let first = run(None);
+        match &first {
+            Err(e) if !has_password && onezip_core::needs_password(e) => {}
+            _ => return first,
+        }
+        let saved = onezip_settings::passwords::load();
+        for (i, s) in saved.iter().enumerate() {
+            self.with(id, |t| t.note = format!("正在试保存的密码（{}/{}）…", i + 1, saved.len()));
+            match run(Some(s.password.clone())) {
+                Err(e) if onezip_core::needs_password(&e) => continue,
+                r => {
+                    let mut name = String::new();
+                    self.with(id, |t| {
+                        t.note.clear();
+                        t.set_password(s.password.clone());
+                        name = t.archive_name();
+                    });
+                    let _ = onezip_settings::passwords::remember(&s.password, &name);
+                    return r;
+                }
+            }
+        }
+        self.with(id, |t| t.note.clear());
+        first
+    }
+
     fn work(self: Arc<Self>, id: u64, kind: Kind, stop: Arc<AtomicBool>) {
         let observer = self.observer(id);
         let result: anyhow::Result<(Status, Option<PathBuf>)> = match &kind {
             // 右键菜单里选"释放空间"、或窗口里勾选后确认过，到这里已经是确认过的。
             Kind::Extract(req, after) => {
-                onezip_core::extract(req, observer, &stop, &mut |_| true).map(|o| match o {
+                self.with_saved_passwords(id, req.password.is_some(), |pw| {
+                    let mut r = req.clone();
+                    if pw.is_some() {
+                        r.password = pw;
+                    }
+                    onezip_core::extract(&r, observer.clone(), &stop, &mut |_| true)
+                })
+                .map(|o| match o {
                     Outcome::Finished { output, warning } => {
                         let note = match (warning, after, &req.source) {
                             // 有需要转告的问题时不删，让用户先看看。
@@ -405,13 +490,22 @@ impl Manager {
                     Outcome::Paused => (Status::Paused, None),
                 })
             }
+            Kind::Pick(req) => self
+                .with_saved_passwords(id, req.password.is_some(), |pw| {
+                    let mut r = req.clone();
+                    if pw.is_some() {
+                        r.password = pw;
+                    }
+                    onezip_core::browse::extract(&r, observer.clone(), &stop)
+                })
+                .map(|out| (Status::Done, Some(out))),
             Kind::Compress(req) => onezip_core::compress(req, observer, &stop)
                 .map(|()| (Status::Done, Some(req.output.clone()))),
-            Kind::Test { path, password } => {
-                onezip_core::test(path, password.clone(), observer).map(|()| {
-                    (Status::Done, None)
+            Kind::Test { path, password } => self
+                .with_saved_passwords(id, password.is_some(), |pw| {
+                    onezip_core::test(path, pw.or_else(|| password.clone()), observer.clone())
                 })
-            }
+                .map(|()| (Status::Done, None)),
             Kind::Hash { paths, kinds } => {
                 onezip_core::hash(paths, kinds, observer, &stop).map(|report| {
                     let text = report.to_text();
@@ -426,6 +520,12 @@ impl Manager {
         self.with(id, |t| t.ended = Some(Instant::now()));
         self.with(id, |t| match result {
             Ok((status, output)) => {
+                if t.remember {
+                    t.remember = false;
+                    if let Some(pw) = t.password() {
+                        let _ = onezip_settings::passwords::remember(pw, &t.archive_name());
+                    }
+                }
                 if status == Status::Done && matches!(kind, Kind::Test { .. }) {
                     t.note = "测试通过，没有发现错误".into();
                     t.output = None;
@@ -438,17 +538,20 @@ impl Manager {
                 t.status = Status::Cancelled;
             }
             Err(e) if onezip_core::needs_password(&e) => {
-                let had = match &t.kind {
-                    Kind::Extract(r, _) => r.password.is_some(),
-                    Kind::Test { password, .. } => password.is_some(),
-                    Kind::Compress(_) | Kind::Hash { .. } => false,
-                };
-                t.status = Status::NeedsPassword { retry: had };
+                t.status = Status::NeedsPassword { retry: t.password().is_some() };
             }
-            Err(e) => {
-                crate::log::error(&format!("{}：{e:#}", t.title));
-                t.status = Status::Failed(format!("{e:#}"));
-            }
+            Err(e) => match onezip_core::same_names(&e) {
+                Some(s) => {
+                    t.status = Status::SameNames {
+                        output: s.output.clone(),
+                        files: s.files.clone(),
+                    };
+                }
+                None => {
+                    crate::log::error(&format!("{}：{e:#}", t.title));
+                    t.status = Status::Failed(format!("{e:#}"));
+                }
+            },
         });
     }
 }

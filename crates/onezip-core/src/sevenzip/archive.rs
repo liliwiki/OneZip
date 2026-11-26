@@ -531,7 +531,7 @@ impl ICryptoGetTextPassword_Impl for ExtractCallback_Impl {
     }
 }
 
-fn filetime_to_system(ft: u64) -> std::time::SystemTime {
+pub(crate) fn filetime_to_system(ft: u64) -> std::time::SystemTime {
     // FILETIME：自 1601-01-01 起的 100 纳秒数。
     const EPOCH_DIFF: u64 = 116_444_736_000_000_000;
     if ft >= EPOCH_DIFF {

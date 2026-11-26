@@ -1,4 +1,5 @@
-//! 需要密码时弹出的密码框。
+//! 需要密码时弹出的密码框（保存的密码都试过、都不对之后）。勾选"记住这个密码"的，
+//! 解压成功后保存到设置的"密码"页。
 
 use std::rc::Rc;
 
@@ -31,9 +32,10 @@ pub(super) fn ask_password(app: &Rc<App>, id: u64) {
                 return;
             };
             let pw = d.get_password().to_string();
+            let remember = d.get_remember();
             let _ = d.hide();
             if !pw.is_empty() {
-                app.tasks.set_password(id, pw);
+                app.tasks.set_password(id, pw, remember);
             }
         }
     });

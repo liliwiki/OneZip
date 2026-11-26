@@ -141,6 +141,7 @@ pub(super) fn update_progress(app: &App, snapshot: &[crate::tasks::Task]) {
             ),
             // 密码框会自动弹出；这里给个能关掉的出口。
             Status::NeedsPassword { .. } => ("需要密码：请在弹出的密码框里输入。".into(), false, true),
+            Status::SameNames { .. } => ("目标位置有同名文件：请在弹出的窗口里选择怎么办。".into(), false, true),
             _ => (String::new(), false, false),
         };
         d.set_message(message.into());

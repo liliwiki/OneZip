@@ -83,6 +83,38 @@ pub unsafe trait IArchiveGetRawProps: IUnknown {
     pub unsafe fn GetRawPropInfo(&self, index: u32, name: *mut *mut u16, prop: *mut u32) -> HRESULT;
 }
 
+// ---- 压缩用的接口 ----
+
+#[interface("23170F69-40C1-278A-0000-000300040000")]
+pub unsafe trait IOutStream: ISequentialOutStream {
+    pub unsafe fn Seek(&self, offset: i64, origin: u32, new_position: *mut u64) -> HRESULT;
+    pub unsafe fn SetSize(&self, size: u64) -> HRESULT;
+}
+
+#[interface("23170F69-40C1-278A-0000-000500110000")]
+pub unsafe trait ICryptoGetTextPassword2: IUnknown {
+    pub unsafe fn CryptoGetTextPassword2(&self, defined: *mut i32, password: *mut *mut u16) -> HRESULT;
+}
+
+#[interface("23170F69-40C1-278A-0000-000600030000")]
+pub unsafe trait ISetProperties: IUnknown {
+    pub unsafe fn SetProperties(&self, names: *const *const u16, values: *const PropVariant, n: u32) -> HRESULT;
+}
+
+#[interface("23170F69-40C1-278A-0000-000600800000")]
+pub unsafe trait IArchiveUpdateCallback: IProgress {
+    pub unsafe fn GetUpdateItemInfo(&self, index: u32, new_data: *mut i32, new_props: *mut i32, index_in_archive: *mut u32) -> HRESULT;
+    pub unsafe fn GetProperty(&self, index: u32, prop: u32, value: *mut PropVariant) -> HRESULT;
+    pub unsafe fn GetStream(&self, index: u32, stream: *mut *mut c_void) -> HRESULT;
+    pub unsafe fn SetOperationResult(&self, result: i32) -> HRESULT;
+}
+
+#[interface("23170F69-40C1-278A-0000-000600A00000")]
+pub unsafe trait IOutArchive: IUnknown {
+    pub unsafe fn UpdateItems(&self, out: *mut c_void, n: u32, callback: *mut c_void) -> HRESULT;
+    pub unsafe fn GetFileTimeType(&self, kind: *mut u32) -> HRESULT;
+}
+
 // ---- 常量 ----
 
 pub mod kpid {
@@ -97,6 +129,7 @@ pub mod kpid {
     pub const ENCRYPTED: u32 = 15;
     pub const BLOCK: u32 = 27;
     pub const POSITION: u32 = 29;
+    pub const IS_ANTI: u32 = 21;
     pub const SYM_LINK: u32 = 54;
     pub const IS_ALT_STREAM: u32 = 63;
     pub const IS_AUX: u32 = 64;
@@ -218,6 +251,27 @@ impl PropVariant {
         let p = self.data[0] as *const u8;
         let len = unsafe { SysStringByteLen(self.data[0] as *const u16) } as usize;
         Some(unsafe { std::slice::from_raw_parts(p, len) }.to_vec())
+    }
+
+    pub fn from_bool(b: bool) -> Self {
+        Self { vt: VT_BOOL, reserved: [0; 3], data: [if b { 0xFFFF } else { 0 }, 0] }
+    }
+
+    pub fn from_u32(v: u32) -> Self {
+        Self { vt: VT_UI4, reserved: [0; 3], data: [u64::from(v), 0] }
+    }
+
+    pub fn from_u64(v: u64) -> Self {
+        Self { vt: VT_UI8, reserved: [0; 3], data: [v, 0] }
+    }
+
+    pub fn from_filetime(ft: u64) -> Self {
+        Self { vt: VT_FILETIME, reserved: [0; 3], data: [ft, 0] }
+    }
+
+    /// 自己持有的 BSTR，drop 时释放。
+    pub fn from_str(s: &str) -> Self {
+        Self { vt: VT_BSTR, reserved: [0; 3], data: [alloc_bstr(s) as u64, 0] }
     }
 
     /// 写入一个字符串（给 7-Zip 的回调返回值用，所有权交给对方）。
@@ -386,6 +440,16 @@ fn load() -> Result<Library> {
 impl Library {
     pub fn handler(&self, name: &str) -> Option<&Handler> {
         self.handlers.iter().find(|h| h.name.eq_ignore_ascii_case(name))
+    }
+
+    /// 创建一个能写压缩包的格式处理器对象（7z、zip 等）。
+    pub fn create_out(&self, handler: &Handler) -> Result<IOutArchive> {
+        let mut obj: *mut c_void = std::ptr::null_mut();
+        unsafe { (self.create_object)(&handler.class_id, &<IOutArchive as windows_core::Interface>::IID, &mut obj) }.ok()?;
+        if obj.is_null() {
+            bail!("7z.dll 不能写 {} 格式", handler.name);
+        }
+        Ok(unsafe { <IOutArchive as windows_core::Interface>::from_raw(obj) })
     }
 
     /// 创建一个格式处理器对象。

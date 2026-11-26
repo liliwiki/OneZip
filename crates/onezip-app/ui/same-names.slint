@@ -1,0 +1,65 @@
+// 解压前发现目标位置已有同名文件（设置为"每次询问"）：列出这些文件，问一次怎么办。
+import { Button, ListView, Palette } from "std-widgets.slint";
+import { ThemedWindow } from "theme.slint";
+import { Note } from "settings.slint";
+
+export component SameNamesDialog inherits ThemedWindow {
+    title: "目标位置有同名文件";
+    width: 600px;
+
+    in property <string> heading;
+    in property <string> detail;
+    in property <[string]> files;
+    callback replace();
+    callback skip();
+    callback rename();
+    callback cancel();
+
+    VerticalLayout {
+        padding: 24px;
+        spacing: 14px;
+        HorizontalLayout {
+            spacing: 14px;
+            Text {
+                text: "\u{E7BA}";
+                font-family: "Segoe Fluent Icons";
+                font-size: 28px;
+                color: #e8a33d;
+                vertical-alignment: top;
+            }
+            VerticalLayout {
+                spacing: 4px;
+                Text {
+                    text: root.heading;
+                    font-size: 16px;
+                    font-weight: 600;
+                    wrap: word-wrap;
+                }
+                Note { text: root.detail; }
+            }
+        }
+        Rectangle {
+            height: 200px;
+            border-width: 1px;
+            border-color: Palette.border;
+            border-radius: 4px;
+            ListView {
+                for f in root.files: Text {
+                    text: f;
+                    height: 24px;
+                    x: 10px;
+                    vertical-alignment: center;
+                    overflow: elide;
+                }
+            }
+        }
+        HorizontalLayout {
+            spacing: 8px;
+            alignment: end;
+            Button { text: "全部替换"; clicked => { root.replace(); } }
+            Button { text: "全部跳过"; clicked => { root.skip(); } }
+            Button { text: "都保留（新的改名）"; primary: true; clicked => { root.rename(); } }
+            Button { text: "取消"; width: 80px; clicked => { root.cancel(); } }
+        }
+    }
+}

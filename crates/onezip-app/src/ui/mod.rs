@@ -5,12 +5,14 @@
 //! - [`compress`]、[`password`]、[`hash`]、[`progress`]、[`settings`]、[`update`]：各自的窗口；
 //! - [`common`]：提示框、文件对话框等小工具。
 
+mod browser;
 mod common;
 mod compress;
 mod confirm;
 mod hash;
 mod main_window;
 mod password;
+mod same_names;
 mod progress;
 mod requests;
 mod settings;
@@ -30,7 +32,7 @@ use crate::tasks::{Manager, Status};
 use onezip_settings::Settings;
 
 use crate::{
-    CompressDialog, ConfirmDialog, HashDialog, MainWindow, PasswordDialog, ProgressDialog, SettingsWindow, TaskRow, UpdateDialog, win,
+    BrowserWindow, CompressDialog, ConfirmDialog, HashDialog, MainWindow, PasswordDialog, ProgressDialog, SameNamesDialog, SettingsWindow, TaskRow, UpdateDialog, win,
 };
 
 /// 跟着设置里的主题切换浅色 / 深色的窗口（都继承 theme.slint 的 ThemedWindow）。
@@ -52,7 +54,7 @@ macro_rules! themed {
         })*
     };
 }
-themed!(MainWindow, CompressDialog, ConfirmDialog, PasswordDialog, HashDialog, ProgressDialog, SettingsWindow, UpdateDialog);
+themed!(BrowserWindow, MainWindow, CompressDialog, ConfirmDialog, PasswordDialog, HashDialog, ProgressDialog, SameNamesDialog, SettingsWindow, UpdateDialog);
 
 pub(super) struct App {
     pub(super) window: MainWindow,
@@ -76,6 +78,10 @@ pub(super) struct App {
     pub(super) update: RefCell<update::State>,
     /// 开着的"边解压边删除"说明对话框。
     pub(super) confirms: RefCell<Vec<ConfirmDialog>>,
+    /// 开着的"有同名文件"询问窗口和它对应的任务。
+    pub(super) same_names: RefCell<Option<(u64, SameNamesDialog)>>,
+    /// 开着的压缩包浏览窗口。
+    pub(super) browsers: RefCell<Vec<Rc<browser::Browser>>>,
 }
 
 impl App {
@@ -108,6 +114,12 @@ impl App {
         for d in self.confirms.borrow().iter() {
             d.apply(t);
         }
+        if let Some((_, d)) = self.same_names.borrow().as_ref() {
+            d.apply(t);
+        }
+        for b in self.browsers.borrow().iter() {
+            b.window.apply(t);
+        }
     }
 }
 
@@ -127,6 +139,8 @@ pub fn run(first: Request, incoming: Receiver<Request>) -> anyhow::Result<()> {
         settings_window: RefCell::new(None),
         update: RefCell::new(update::State::new()),
         confirms: RefCell::new(Vec::new()),
+        same_names: RefCell::new(None),
+        browsers: RefCell::new(Vec::new()),
     });
     main_window::wire(&app);
     app.window.apply(app.theme());
@@ -174,7 +188,9 @@ pub(super) fn quit_if_idle(app: &App) {
         || app.hashes.borrow().iter().any(|h| h.window().is_visible())
         || app.settings_window.borrow().is_some()
         || update::has_window(app)
-        || !app.confirms.borrow().is_empty();
+        || !app.confirms.borrow().is_empty()
+        || app.same_names.borrow().is_some()
+        || !app.browsers.borrow().is_empty();
     let busy = app
         .tasks
         .snapshot()
@@ -213,6 +229,8 @@ pub(super) fn refresh(app: &Rc<App>) {
         app.prompted.borrow_mut().insert(id);
         password::ask_password(app, id);
     }
+    // 设置为"每次询问"时遇到同名文件：弹窗问怎么办。
+    same_names::prompt_next(app);
     // 校验值算完就弹出结果窗口（像 7-Zip 一样）。
     let finished: Vec<u64> = snapshot
         .iter()

@@ -57,6 +57,11 @@ pub(crate) fn extract_file(
         OutputTarget::File(p) | OutputTarget::Dir(p) => p.clone(),
     };
     let resuming = peel_checkpoint_exists(&archive);
+    // 智能解压：事先看不到里面有什么，先解到新文件夹，完成后只有一项就挪出来。
+    let smart = req.output.is_none()
+        && req.placement == Placement::Smart
+        && matches!(output, OutputTarget::Dir(_))
+        && (resuming || crate::smart::is_empty_dir(&out_path));
     if !req.keep_source
         && !resuming
         && !confirm(&Confirm {
@@ -86,7 +91,7 @@ pub(crate) fn extract_file(
 
     match result {
         Ok(_) => Ok(Outcome::Finished {
-            output: out_path,
+            output: if smart { crate::smart::flatten(&out_path) } else { out_path },
             warning: None,
         }),
         Err(CoordinatorError::Aborted { .. }) if stop.load(Ordering::Relaxed) => Ok(Outcome::Paused),
@@ -155,6 +160,10 @@ pub(crate) fn extract(
     let out_path = match &output {
         OutputTarget::File(p) | OutputTarget::Dir(p) => p.clone(),
     };
+    // 智能解压：解完后文件夹里只有一项就挪出来（只动这次新建的文件夹）。
+    let smart = req.placement == Placement::Smart
+        && matches!(output, OutputTarget::Dir(_))
+        && (peel_checkpoint_exists(&out_path) || crate::smart::is_empty_dir(&out_path));
 
     let client = Client::new().map_err(|e| anyhow!(e)).context("创建 HTTP 客户端失败")?;
     let state = ProgressState::new();
@@ -207,7 +216,7 @@ pub(crate) fn extract(
                 total: stats.total_size,
             });
             Ok(Outcome::Finished {
-                output: out_path,
+                output: if smart { crate::smart::flatten(&out_path) } else { out_path },
                 warning: None,
             })
         }

@@ -146,7 +146,7 @@ export component SetupWindow inherits Window {
     }
 }
 
-// 卸载：先确认，可选同时删除设置。
+// 卸载：先确认，可选同时删除设置和保存的密码。
 export component UninstallWindow inherits Window {
     in property <string> version;
     in property <string> location;
@@ -195,7 +195,7 @@ export component UninstallWindow inherits Window {
                 wrap: word-wrap;
             }
             CheckBox {
-                text: "同时删除 OneZip 的设置和出错记录";
+                text: "同时删除 OneZip 的设置、保存的密码和出错记录";
                 checked <=> root.delete-settings;
             }
         }

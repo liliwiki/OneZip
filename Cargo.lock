@@ -3839,7 +3839,7 @@ checksum = "384b8ab6d37215f3c5301a95a4accb5d64aa607f1fcb26a11b5303878451b4fe"
 
 [[package]]
 name = "onezip-app"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "interprocess",
@@ -3854,13 +3854,15 @@ dependencies = [
  "slint",
  "slint-build",
  "windows",
+ "windows-core",
+ "windows-future",
  "winreg",
  "winresource",
 ]
 
 [[package]]
 name = "onezip-cli"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "clap",
@@ -3871,7 +3873,7 @@ dependencies = [
 
 [[package]]
 name = "onezip-core"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "crc",
@@ -3895,25 +3897,26 @@ dependencies = [
 
 [[package]]
 name = "onezip-formats"
-version = "0.1.0"
+version = "0.2.0"
 
 [[package]]
 name = "onezip-menu"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "onezip-formats",
 ]
 
 [[package]]
 name = "onezip-settings"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
+ "windows",
  "winreg",
 ]
 
 [[package]]
 name = "onezip-setup"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "onezip-settings",
@@ -3928,7 +3931,7 @@ dependencies = [
 
 [[package]]
 name = "onezip-shell"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "onezip-menu",
  "onezip-settings",
