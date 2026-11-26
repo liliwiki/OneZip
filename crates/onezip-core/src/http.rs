@@ -32,7 +32,9 @@ pub fn final_url(url: &str) -> Result<String> {
 /// 下载 `url` 的全部内容到内存（小文件用，最多 4 MB）。
 pub fn get(url: &str) -> Result<Vec<u8>> {
     let url = Url::parse(url).map_err(|e| anyhow!(e))?;
-    let resp = client()?.get_full(&url).map_err(|e| anyhow!(e)).with_context(|| t!("连接 {} 失败", url.host()))?;
+    // 客户端要活到读完响应体：它一释放，后台读数据的线程就停了，读到的是空内容。
+    let client = client()?;
+    let resp = client.get_full(&url).map_err(|e| anyhow!(e)).with_context(|| t!("连接 {} 失败", url.host()))?;
     if !resp.status.is_success() {
         bail!(t!("服务器返回 {} {}", resp.status.code, resp.status.reason));
     }
@@ -44,7 +46,9 @@ pub fn get(url: &str) -> Result<Vec<u8>> {
 /// 下载 `url` 到文件 `to`。`progress(已下载, 总大小)`；`stop` 置位时停下并报错。
 pub fn download(url: &str, to: &Path, progress: &dyn Fn(u64, Option<u64>), stop: &AtomicBool) -> Result<()> {
     let url = Url::parse(url).map_err(|e| anyhow!(e))?;
-    let resp = client()?.get_full(&url).map_err(|e| anyhow!(e)).with_context(|| t!("连接 {} 失败", url.host()))?;
+    // 客户端要活到读完响应体：它一释放，后台读数据的线程就停了，读到的是空内容。
+    let client = client()?;
+    let resp = client.get_full(&url).map_err(|e| anyhow!(e)).with_context(|| t!("连接 {} 失败", url.host()))?;
     if !resp.status.is_success() {
         bail!(t!("服务器返回 {} {}", resp.status.code, resp.status.reason));
     }
