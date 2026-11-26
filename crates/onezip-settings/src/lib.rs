@@ -19,6 +19,27 @@ pub enum Theme {
     Dark,
 }
 
+/// 界面语言。
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub enum Language {
+    /// 跟着 Windows 的显示语言：中文用中文，其他都用英文。
+    #[default]
+    System,
+    Chinese,
+    English,
+}
+
+impl Language {
+    /// 实际用的语言。
+    pub fn resolve(self) -> onezip_i18n::Lang {
+        match self {
+            Language::System => onezip_i18n::system(),
+            Language::Chinese => onezip_i18n::Lang::Zh,
+            Language::English => onezip_i18n::Lang::En,
+        }
+    }
+}
+
 /// 主窗口"解压…"按钮和双击压缩包时的默认解压方式。
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
 pub enum ExtractMode {
@@ -52,6 +73,7 @@ pub enum DeleteMode {
 pub struct Settings {
     // ---- 常规 ----
     pub theme: Theme,
+    pub language: Language,
 
     // ---- 解压 ----
     pub extract_mode: ExtractMode,
@@ -94,6 +116,7 @@ impl Default for Settings {
     fn default() -> Self {
         Settings {
             theme: Theme::System,
+            language: Language::System,
             extract_mode: ExtractMode::Smart,
             conflict: Conflict::Rename,
             nested: true,
@@ -130,6 +153,10 @@ trait Word: Sized + Copy + PartialEq + 'static {
 impl Word for Theme {
     const ALL: &'static [(Self, &'static str)] = &[(Theme::System, "system"), (Theme::Light, "light"), (Theme::Dark, "dark")];
 }
+impl Word for Language {
+    const ALL: &'static [(Self, &'static str)] =
+        &[(Language::System, "system"), (Language::Chinese, "zh"), (Language::English, "en")];
+}
 impl Word for ExtractMode {
     const ALL: &'static [(Self, &'static str)] =
         &[(ExtractMode::Smart, "smart"), (ExtractMode::NewFolder, "folder"), (ExtractMode::Here, "here")];
@@ -148,6 +175,7 @@ fn to_pairs(s: &Settings) -> Vec<(&'static str, String)> {
     let b = |v: bool| u8::from(v).to_string();
     vec![
         ("Theme", s.theme.word().into()),
+        ("Language", s.language.word().into()),
         ("ExtractMode", s.extract_mode.word().into()),
         ("Conflict", s.conflict.word().into()),
         ("Nested", b(s.nested)),
@@ -184,6 +212,7 @@ fn from_pairs(get: impl Fn(&str) -> Option<String>) -> Settings {
     }
     Settings {
         theme: word(get("Theme"), d.theme),
+        language: word(get("Language"), d.language),
         extract_mode: word(get("ExtractMode"), d.extract_mode),
         conflict: word(get("Conflict"), d.conflict),
         nested: flag("Nested", d.nested),
@@ -225,6 +254,14 @@ impl Settings {
 pub fn menu_filter() -> (bool, Vec<String>) {
     let s = from_pairs(|k| if matches!(k, "MenuEnabled" | "MenuHidden") { store::get(k) } else { None });
     (s.menu_enabled, s.menu_hidden)
+}
+
+/// 按设置切换界面语言（之后的 `t!` 用它），返回实际用的语言。
+/// 只读这一项，右键菜单 DLL、安装程序、命令行也用它。
+pub fn apply_language() -> onezip_i18n::Lang {
+    let lang = from_pairs(|k| if k == "Language" { store::get(k) } else { None }).language.resolve();
+    onezip_i18n::set(lang);
+    lang
 }
 
 /// 删除全部设置和保存的密码（卸载时用户勾选删除）。
@@ -283,6 +320,7 @@ mod tests {
     fn round_trip_and_bad_values() {
         let s = Settings {
             theme: Theme::Dark,
+            language: Language::English,
             conflict: Conflict::Skip,
             download_dir: Some(PathBuf::from(r"D:\下载")),
             menu_hidden: vec!["md5".into(), "test".into()],

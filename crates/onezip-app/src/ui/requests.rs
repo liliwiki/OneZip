@@ -1,5 +1,6 @@
 //! 把一个请求（右键菜单、命令行、另一个实例、主窗口按钮）变成任务。
 
+use onezip_i18n::t;
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
 
@@ -45,7 +46,7 @@ pub(super) fn handle(app: &Rc<App>, req: Request, external: bool) {
         Action::Test => {
             for path in req.paths {
                 ids.push(app.tasks.add(
-                    format!("测试 {}", file_name(&path)),
+                    t!("测试 {}", file_name(&path)),
                     Kind::Test {
                         path,
                         password: None,
@@ -81,7 +82,7 @@ pub(super) fn handle(app: &Rc<App>, req: Request, external: bool) {
                 connections: s.connections,
                 ..Default::default()
             };
-            ids.push(app.tasks.add(format!("下载并解压 {name}"), Kind::Extract(r, None)));
+            ids.push(app.tasks.add(t!("下载并解压 {}", name), Kind::Extract(r, None)));
         }
         Action::Compress(Some(format)) => {
             if req.paths.is_empty() {
@@ -95,7 +96,7 @@ pub(super) fn handle(app: &Rc<App>, req: Request, external: bool) {
             compress_defaults(&mut r, &app.settings.borrow());
             ids.push(
                 app.tasks
-                    .add(format!("压缩为 {}", file_name(&out)), Kind::Compress(r)),
+                    .add(t!("压缩为 {}", file_name(&out)), Kind::Compress(r)),
             );
         }
         Action::Compress(None) => {
@@ -107,12 +108,12 @@ pub(super) fn handle(app: &Rc<App>, req: Request, external: bool) {
             if !req.paths.is_empty() {
                 let name = match req.paths.as_slice() {
                     [one] => file_name(one),
-                    [first, ..] => format!("{} 等 {} 项", file_name(first), req.paths.len()),
+                    [first, ..] => t!("{} 等 {} 项", file_name(first), req.paths.len()),
                     [] => String::new(),
                 };
                 let algos = kinds.iter().map(|k| k.name()).collect::<Vec<_>>().join(" ");
                 ids.push(app.tasks.add(
-                    format!("校验 {name}（{algos}）"),
+                    t!("校验 {}（{}）", name, algos),
                     Kind::Hash {
                         paths: req.paths,
                         kinds,
@@ -135,7 +136,7 @@ fn extract(app: &Rc<App>, paths: Vec<PathBuf>, placement: Placement, ask_folder:
     let w = &app.window;
     let output_root = if ask_folder {
         let start = paths.first().and_then(|p| p.parent()).map(Path::to_path_buf);
-        let mut d = file_dialog(w.window()).set_title("解压到哪个文件夹");
+        let mut d = file_dialog(w.window()).set_title(t!("解压到哪个文件夹"));
         if let Some(s) = start {
             d = d.set_directory(s);
         }
@@ -166,9 +167,9 @@ fn extract(app: &Rc<App>, paths: Vec<PathBuf>, placement: Placement, ask_folder:
             ..Default::default()
         };
         let (title, after) = match delete {
-            Delete::Keep => (format!("解压 {}", file_name(&path)), None),
-            Delete::InPlace => (format!("解压并释放空间 {}", file_name(&path)), None),
-            Delete::After => (format!("解压后删除 {}", file_name(&path)), Some(s.delete_mode)),
+            Delete::Keep => (t!("解压 {}", file_name(&path)), None),
+            Delete::InPlace => (t!("解压并释放空间 {}", file_name(&path)), None),
+            Delete::After => (t!("解压后删除 {}", file_name(&path)), Some(s.delete_mode)),
         };
         ids.push(app.tasks.add(title, Kind::Extract(r, after)));
     }

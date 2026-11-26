@@ -4,7 +4,7 @@ import { ThemedWindow } from "theme.slint";
 import { Panel, Note } from "settings.slint";
 
 export component ConfirmDialog inherits ThemedWindow {
-    title: "边解压边删除压缩包";
+    title: @tr("边解压边删除压缩包");
     width: 560px;
 
     in property <string> heading;
@@ -37,20 +37,20 @@ export component ConfirmDialog inherits ThemedWindow {
             }
         }
         Panel {
-            Text { text: "•  已经解出的部分会立刻从压缩包里删掉，用来腾出空间。"; wrap: word-wrap; }
-            Text { text: "•  中途暂停、断电或关机后可以接着解，但压缩包回不到原来的样子。"; wrap: word-wrap; }
-            Text { text: "•  开始前会先完整检查一遍压缩包，有损坏就停下，不会删除任何东西。"; wrap: word-wrap; }
-            Text { text: "•  想先解完、确认没问题再删？请改用“解压后删除压缩包”。"; wrap: word-wrap; }
+            Text { text: @tr("•  已经解出的部分会立刻从压缩包里删掉，用来腾出空间。"); wrap: word-wrap; }
+            Text { text: @tr("•  中途暂停、断电或关机后可以接着解，但压缩包回不到原来的样子。"); wrap: word-wrap; }
+            Text { text: @tr("•  开始前会先完整检查一遍压缩包，有损坏就停下，不会删除任何东西。"); wrap: word-wrap; }
+            Text { text: @tr("•  想先解完、确认没问题再删？请改用“解压后删除压缩包”。"); wrap: word-wrap; }
         }
         HorizontalLayout {
             spacing: 8px;
             CheckBox {
-                text: "我已了解，以后不再提醒";
+                text: @tr("我已了解，以后不再提醒");
                 checked <=> root.never-again;
                 horizontal-stretch: 1;
             }
-            Button { text: "开始"; primary: true; width: 96px; clicked => { root.start(); } }
-            Button { text: "取消"; width: 96px; clicked => { root.cancel(); } }
+            Button { text: @tr("开始"); primary: true; width: 96px; clicked => { root.start(); } }
+            Button { text: @tr("取消"); width: 96px; clicked => { root.cancel(); } }
         }
     }
 }

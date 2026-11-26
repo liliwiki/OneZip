@@ -3,6 +3,7 @@
 //! 引擎在工作线程里运行，进度通过 [`onezip_core::Observer`] 写回这里；
 //! 界面定时取快照显示。
 
+use onezip_i18n::t;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
@@ -86,17 +87,17 @@ impl Task {
 
     pub fn state_text(&self) -> String {
         match &self.status {
-            Status::Queued => "排队中".into(),
+            Status::Queued => t!("排队中").into(),
             Status::Running => match self.progress() {
                 p if p >= 0.0 => format!("{:.0}%", p * 100.0),
-                _ => "进行中".into(),
+                _ => t!("进行中").into(),
             },
-            Status::Paused => "已暂停".into(),
-            Status::Done => "完成".into(),
-            Status::Cancelled => "已取消".into(),
-            Status::NeedsPassword { .. } => "需要密码".into(),
-            Status::SameNames { .. } => "有同名文件".into(),
-            Status::Failed(_) => "失败".into(),
+            Status::Paused => t!("已暂停").into(),
+            Status::Done => t!("完成").into(),
+            Status::Cancelled => t!("已取消").into(),
+            Status::NeedsPassword { .. } => t!("需要密码").into(),
+            Status::SameNames { .. } => t!("有同名文件").into(),
+            Status::Failed(_) => t!("失败").into(),
         }
     }
 
@@ -104,30 +105,25 @@ impl Task {
         match &self.status {
             Status::Failed(e) => e.clone(),
             Status::Done => match &self.output {
-                Some(p) => format!("完成：{}", p.display()),
+                Some(p) => t!("完成：{}", p.display()),
                 None if !self.note.is_empty() => self.note.clone(),
-                None => "完成".into(),
+                None => t!("完成").into(),
             },
-            Status::Paused => "进度已保存，可以随时继续（关掉 OneZip 也不会丢）".into(),
+            Status::Paused => t!("进度已保存，可以随时继续（关掉 OneZip 也不会丢）").into(),
             Status::SameNames { output, files } => {
-                format!("{} 里已有 {} 个同名文件，请选择怎么办", output.display(), files.len())
+                t!("{} 里已有 {} 个同名文件，请选择怎么办", output.display(), files.len())
             }
             _ if !self.note.is_empty() && self.total == 0 => self.note.clone(),
             _ => {
                 let mut s = match self.remote {
-                    Some((down, out)) => format!(
-                        "已下载 {} / {} · 已解出 {}",
-                        human(down),
-                        human(self.total),
-                        human(out)
-                    ),
+                    Some((down, out)) => t!("已下载 {} / {} · 已解出 {}", human(down), human(self.total), human(out)),
                     None if self.total > 0 => {
                         format!("{} / {}", human(self.done), human(self.total))
                     }
                     None => String::new(),
                 };
                 if let Some(left) = self.left {
-                    s.push_str(&format!(" · 原压缩包剩余 {}", human(left)));
+                    s.push_str(&t!(" · 原压缩包剩余 {}", human(left)));
                 }
                 if !self.note.is_empty() {
                     s.push_str(" · ");
@@ -219,7 +215,7 @@ impl Task {
             Kind::Compress(r) => file_name(&r.output),
             Kind::Hash { paths, .. } => match paths.as_slice() {
                 [one] => file_name(one),
-                [first, ..] => format!("{} 等 {} 项", file_name(first), paths.len()),
+                [first, ..] => t!("{} 等 {} 项", file_name(first), paths.len()),
                 [] => String::new(),
             },
         }
@@ -296,7 +292,7 @@ impl Manager {
         self.with(id, |t| {
             if t.can_pause() {
                 t.stop.store(true, Ordering::SeqCst);
-                t.note = "正在暂停，到下一个安全点就停…".into();
+                t.note = t!("正在暂停，到下一个安全点就停…").into();
             }
         });
     }
@@ -442,7 +438,7 @@ impl Manager {
         }
         let saved = onezip_settings::passwords::load();
         for (i, s) in saved.iter().enumerate() {
-            self.with(id, |t| t.note = format!("正在试保存的密码（{}/{}）…", i + 1, saved.len()));
+            self.with(id, |t| t.note = t!("正在试保存的密码（{}/{}）…", i + 1, saved.len()));
             match run(Some(s.password.clone())) {
                 Err(e) if onezip_core::needs_password(&e) => continue,
                 r => {
@@ -477,7 +473,7 @@ impl Manager {
                     Outcome::Finished { output, warning } => {
                         let note = match (warning, after, &req.source) {
                             // 有需要转告的问题时不删，让用户先看看。
-                            (Some(w), Some(_), _) => Some(format!("{w}；压缩包没有删除")),
+                            (Some(w), Some(_), _) => Some(t!("{}；压缩包没有删除", w)),
                             (Some(w), None, _) => Some(w),
                             (None, Some(mode), Source::Local(path)) => delete_archive(path, *mode).err(),
                             (None, _, _) => None,
@@ -510,7 +506,7 @@ impl Manager {
                 onezip_core::hash(paths, kinds, observer, &stop).map(|report| {
                     let text = report.to_text();
                     self.with(id, |t| {
-                        t.note = format!("{} 个文件，点“查看”看结果", report.files.len());
+                        t.note = t!("{} 个文件，点“查看”看结果", report.files.len());
                         t.report = Some(text);
                     });
                     (Status::Done, None)
@@ -527,7 +523,7 @@ impl Manager {
                     }
                 }
                 if status == Status::Done && matches!(kind, Kind::Test { .. }) {
-                    t.note = "测试通过，没有发现错误".into();
+                    t.note = t!("测试通过，没有发现错误").into();
                     t.output = None;
                 } else {
                     t.output = output;
@@ -548,7 +544,7 @@ impl Manager {
                     };
                 }
                 None => {
-                    crate::log::error(&format!("{}：{e:#}", t.title));
+                    crate::log::error(&t!("{}：{}", t.title, format!("{:#}", e)));
                     t.status = Status::Failed(format!("{e:#}"));
                 }
             },
@@ -564,7 +560,7 @@ fn delete_archive(path: &std::path::Path, mode: DeleteMode) -> Result<(), String
         DeleteMode::Permanent => volumes.iter().try_for_each(std::fs::remove_file),
     };
     r.map_err(|e| {
-        crate::log::error(&format!("删除 {} 失败：{e}", path.display()));
-        format!("解压完成，但删除压缩包失败：{e}")
+        crate::log::error(&t!("删除 {} 失败：{}", path.display(), e));
+        t!("解压完成，但删除压缩包失败：{}", e)
     })
 }

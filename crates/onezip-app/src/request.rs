@@ -3,6 +3,7 @@
 //! 右键菜单、拖到 exe 上、第二次启动，都会变成一个 [`Request`]：
 //! 已有 OneZip 窗口在运行时，通过命名管道交给它排进同一个任务队列，自己立即退出。
 
+use onezip_i18n::t;
 use std::io::{BufRead, BufReader, Write};
 use std::path::PathBuf;
 use std::time::Duration;
@@ -72,16 +73,16 @@ impl Request {
                 "--compress-zip" => action = Some(Action::Compress(Some(Format::Zip))),
                 "--url" => match args.next() {
                     Some(u) => action = Some(Action::Url(u)),
-                    None => bail!("--url 后面要跟一个链接"),
+                    None => bail!(t!("--url 后面要跟一个链接")),
                 },
                 "--hash" => match args.next().and_then(|a| HashKind::parse_list(&a)) {
                     Some(kinds) => action = Some(Action::Hash(kinds)),
-                    None => bail!("--hash 后面要跟算法，如 crc32,sha256 或 *"),
+                    None => bail!(t!("--hash 后面要跟算法，如 crc32,sha256 或 *")),
                 },
                 "--register-menu" => action = Some(Action::RegisterMenu),
                 "--unregister-menu" => action = Some(Action::UnregisterMenu),
                 "/quiet" => paths.push(PathBuf::from(a)),
-                s if s.starts_with("--") => bail!("不认识的参数 {s}"),
+                s if s.starts_with("--") => bail!(t!("不认识的参数 {}", s)),
                 _ => paths.push(PathBuf::from(a)),
             }
         }

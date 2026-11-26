@@ -8,6 +8,7 @@
 //! 或者 Windows 发现这种文件有了新的打开方式，双击时会先弹窗问。程序不能也不该绕过这一步：
 //! [`overridden`] 查出双击时还不会直接用 OneZip 的扩展名，界面引导用户去确认。
 
+
 /// 压缩包。
 pub const ARCHIVES: &[&str] = &[
     "7z", "zip", "rar", "tar", "gz", "tgz", "bz2", "tbz2", "xz", "txz", "zst", "tzst", "lz4", "001", "cab", "arj",
@@ -27,6 +28,7 @@ fn progid(ext: &str) -> String {
 
 #[cfg(windows)]
 mod imp {
+    use onezip_i18n::t;
     use std::io;
     use std::path::Path;
 
@@ -92,12 +94,12 @@ mod imp {
         let exe = exe.display();
         let classes = hkcu().create_subkey(CLASSES)?.0;
         let (prog, _) = classes.create_subkey(&id)?;
-        let name = format!("{} 压缩包", ext.to_uppercase());
+        let name = t!("{} 压缩包", ext.to_uppercase());
         prog.set_value("", &name)?;
         prog.set_value("FriendlyTypeName", &name)?;
         prog.create_subkey("DefaultIcon")?.0.set_value("", &format!("\"{exe}\",0"))?;
         let (open, _) = prog.create_subkey(r"shell\open")?;
-        open.set_value("", &"用 OneZip 打开")?;
+        open.set_value("", &t!("用 OneZip 打开"))?;
         open.create_subkey("command")?.0.set_value("", &format!("\"{exe}\" --open \"%1\""))?;
 
         let (dot, _) = classes.create_subkey(format!(".{ext}"))?;
@@ -112,7 +114,7 @@ mod imp {
 
         let (cap, _) = hkcu().create_subkey(CAPABILITIES)?;
         cap.set_value("ApplicationName", &APP)?;
-        cap.set_value("ApplicationDescription", &"压缩、解压、浏览压缩包")?;
+        cap.set_value("ApplicationDescription", &t!("压缩、解压、浏览压缩包"))?;
         cap.create_subkey("FileAssociations")?.0.set_value(format!(".{ext}"), &id)?;
         hkcu().create_subkey(REGISTERED)?.0.set_value(APP, &CAPABILITIES)?;
         Ok(())

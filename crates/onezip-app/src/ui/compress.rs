@@ -1,5 +1,6 @@
 //! "添加到压缩包"对话框。
 
+use onezip_i18n::t;
 use std::path::PathBuf;
 use std::rc::Rc;
 
@@ -20,8 +21,8 @@ pub(super) fn open_compress_dialog(app: &Rc<App>, inputs: Vec<PathBuf>, external
         .collect();
     d.set_formats(ModelRc::new(VecModel::from(formats)));
     let label = match inputs.len() {
-        1 => format!("压缩：{}", inputs[0].display()),
-        n => format!("压缩 {n} 项：{} 等", file_name(&inputs[0])),
+        1 => t!("压缩：{}", inputs[0].display()),
+        n => t!("压缩 {} 项：{} 等", n, file_name(&inputs[0])),
     };
     d.set_inputs_label(label.into());
     // 设置里的默认格式、级别、固实
@@ -59,7 +60,7 @@ pub(super) fn open_compress_dialog(app: &Rc<App>, inputs: Vec<PathBuf>, external
         move || {
             let Some(d) = d.upgrade() else { return };
             let current = PathBuf::from(d.get_output().to_string());
-            let mut fd = file_dialog(d.window()).set_title("保存压缩包");
+            let mut fd = file_dialog(d.window()).set_title(t!("保存压缩包"));
             if let Some(dir) = current.parent() {
                 fd = fd.set_directory(dir);
             }
@@ -101,7 +102,7 @@ pub(super) fn open_compress_dialog(app: &Rc<App>, inputs: Vec<PathBuf>, external
             r.solid = d.get_solid();
             if output.exists() {
                 let ok = message(d.window())
-                    .set_description(format!("{} 已存在，要替换它吗？", output.display()))
+                    .set_description(t!("{} 已存在，要替换它吗？", output.display()))
                     .set_buttons(MessageButtons::OkCancel)
                     .show()
                     == MessageDialogResult::Ok;
@@ -114,7 +115,7 @@ pub(super) fn open_compress_dialog(app: &Rc<App>, inputs: Vec<PathBuf>, external
             let _ = d.hide();
             let id = app
                 .tasks
-                .add(format!("压缩为 {}", file_name(&output)), Kind::Compress(r));
+                .add(t!("压缩为 {}", file_name(&output)), Kind::Compress(r));
             if external {
                 progress::open_progress(&app, id);
             }

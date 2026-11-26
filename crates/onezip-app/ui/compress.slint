@@ -3,7 +3,7 @@ import { Button, CheckBox, ComboBox, LineEdit, Slider, VerticalBox, GroupBox } f
 import { ThemedWindow } from "theme.slint";
 
 export component CompressDialog inherits ThemedWindow {
-    title: "添加到压缩包";
+    title: @tr("添加到压缩包");
     preferred-width: 520px;
 
     in property <string> inputs-label;
@@ -27,14 +27,14 @@ export component CompressDialog inherits ThemedWindow {
             opacity: 0.8;
         }
         GroupBox {
-            title: "压缩包";
+            title: @tr("压缩包");
             HorizontalLayout {
                 spacing: 8px;
                 LineEdit {
                     text <=> root.output;
                 }
                 Button {
-                    text: "浏览…";
+                    text: @tr("浏览…");
                     clicked => { root.browse(); }
                 }
             }
@@ -43,7 +43,7 @@ export component CompressDialog inherits ThemedWindow {
             spacing: 12px;
             VerticalLayout {
                 spacing: 4px;
-                Text { text: "格式"; }
+                Text { text: @tr("格式"); }
                 ComboBox {
                     model: root.formats;
                     current-index <=> root.format-index;
@@ -54,7 +54,7 @@ export component CompressDialog inherits ThemedWindow {
                 spacing: 4px;
                 horizontal-stretch: 1;
                 Text {
-                    text: "压缩级别：" + (root.level < 0.5 ? "仅存储" : root.level < 3.5 ? "快速" : root.level < 6.5 ? "标准" : "最强") + "（" + round(root.level) + "）";
+                    text: @tr("压缩级别：{}（{}）", root.level < 0.5 ? @tr("仅存储") : root.level < 3.5 ? @tr("快速") : root.level < 6.5 ? @tr("标准") : @tr("最强"), round(root.level));
                 }
                 Slider {
                     minimum: 0;
@@ -66,7 +66,7 @@ export component CompressDialog inherits ThemedWindow {
         VerticalLayout {
             spacing: 4px;
             Text {
-                text: root.password-allowed ? "密码（留空不加密）" : "这种格式不支持密码";
+                text: root.password-allowed ? @tr("密码（留空不加密）") : @tr("这种格式不支持密码");
             }
             LineEdit {
                 input-type: InputType.password;
@@ -75,18 +75,18 @@ export component CompressDialog inherits ThemedWindow {
             }
         }
         if root.format-index == 0: CheckBox {
-            text: "固实压缩（压缩率更高）";
+            text: @tr("固实压缩（压缩率更高）");
             checked <=> root.solid;
         }
         HorizontalLayout {
             alignment: end;
             spacing: 8px;
             Button {
-                text: "取消";
+                text: @tr("取消");
                 clicked => { root.reject(); }
             }
             Button {
-                text: "开始压缩";
+                text: @tr("开始压缩");
                 primary: true;
                 enabled: root.output != "";
                 clicked => { root.accept(); }

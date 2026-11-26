@@ -1,5 +1,6 @@
 //! 右键菜单发起的任务各自的进度窗口（像 7-Zip 那样），做完自动关闭。
 
+use onezip_i18n::t;
 use std::rc::Rc;
 use std::time::Duration;
 
@@ -119,8 +120,8 @@ pub(super) fn update_progress(app: &App, snapshot: &[crate::tasks::Task]) {
             SharedString::new()
         });
         d.set_extra(match (t.left, &t.remote) {
-            (Some(left), _) => format!("原压缩包剩余 {}", onezip_core::human(left)).into(),
-            (None, Some((_, out))) => format!("已解出 {}", onezip_core::human(*out)).into(),
+            (Some(left), _) => t!("原压缩包剩余 {}", onezip_core::human(left)).into(),
+            (None, Some((_, out))) => t!("已解出 {}", onezip_core::human(*out)).into(),
             _ => SharedString::new(),
         });
         d.set_can_pause(t.can_pause());
@@ -135,13 +136,13 @@ pub(super) fn update_progress(app: &App, snapshot: &[crate::tasks::Task]) {
             }
             Status::Failed(e) => (e.clone(), true, true),
             Status::Paused => (
-                "已暂停，进度已保存。可以继续，或以后再从右键菜单解压同一个压缩包接着来。".into(),
+                t!("已暂停，进度已保存。可以继续，或以后再从右键菜单解压同一个压缩包接着来。").into(),
                 false,
                 false,
             ),
             // 密码框会自动弹出；这里给个能关掉的出口。
-            Status::NeedsPassword { .. } => ("需要密码：请在弹出的密码框里输入。".into(), false, true),
-            Status::SameNames { .. } => ("目标位置有同名文件：请在弹出的窗口里选择怎么办。".into(), false, true),
+            Status::NeedsPassword { .. } => (t!("需要密码：请在弹出的密码框里输入。").into(), false, true),
+            Status::SameNames { .. } => (t!("目标位置有同名文件：请在弹出的窗口里选择怎么办。").into(), false, true),
             _ => (String::new(), false, false),
         };
         d.set_message(message.into());

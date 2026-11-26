@@ -2,6 +2,7 @@
 
 #![allow(non_snake_case)]
 
+use onezip_i18n::t;
 use std::ffi::c_void;
 use std::fs::File;
 use std::io::{Read, Seek, SeekFrom, Write};
@@ -50,11 +51,11 @@ pub fn compress(
     stop: &Arc<AtomicBool>,
 ) -> Result<()> {
     let lib = library()?;
-    let handler = lib.handler(format).with_context(|| format!("7z.dll 不支持 {format} 格式"))?;
+    let handler = lib.handler(format).with_context(|| t!("7z.dll 不支持 {} 格式", format))?;
     let arc = lib.create_out(handler)?;
     set_properties(&arc, format, opts)?;
 
-    let file = Arc::new(Mutex::new(File::create(out).with_context(|| format!("创建 {}", out.display()))?));
+    let file = Arc::new(Mutex::new(File::create(out).with_context(|| t!("创建 {}", out.display()))?));
     let stream: IOutStream = OutFile { file: file.clone() }.into();
     let total: u64 = items.iter().filter(|i| !i.dir).map(|i| i.size).sum();
     let n = items.len() as u32;
@@ -76,7 +77,7 @@ pub fn compress(
     if stop.load(Ordering::Relaxed) || hr == E_ABORT {
         bail!(crate::compress::Cancelled);
     }
-    hr.ok().map_err(|e| anyhow!("7z.dll 压缩失败：{e}"))?;
+    hr.ok().map_err(|e| anyhow!(t!("7z.dll 压缩失败：{}", e)))?;
     file.lock().unwrap().sync_all()?;
     Ok(())
 }
@@ -102,10 +103,10 @@ fn set_properties(arc: &IOutArchive, format: &str, opts: &Options) -> Result<()>
     let names: Vec<Vec<u16>> = props.iter().map(|(n, _)| n.encode_utf16().chain(Some(0)).collect()).collect();
     let name_ptrs: Vec<*const u16> = names.iter().map(|n| n.as_ptr()).collect();
     let values: Vec<PropVariant> = props.into_iter().map(|(_, v)| v).collect();
-    let setter: ISetProperties = arc.cast().context("7z.dll 不接受压缩参数")?;
+    let setter: ISetProperties = arc.cast().context(t!("7z.dll 不接受压缩参数"))?;
     unsafe { setter.SetProperties(name_ptrs.as_ptr(), values.as_ptr(), values.len() as u32) }
         .ok()
-        .map_err(|e| anyhow!("7z.dll 不接受压缩参数：{e}"))
+        .map_err(|e| anyhow!(t!("7z.dll 不接受压缩参数：{}", e)))
 }
 
 // ---- 输出文件 ----
@@ -273,7 +274,7 @@ impl IArchiveUpdateCallback_Impl for UpdateCallback_Impl {
                 S_OK
             }
             Err(e) => {
-                self.state.lock().unwrap().error = Some(anyhow!("压缩 {}：{e}", item.path.display()));
+                self.state.lock().unwrap().error = Some(anyhow!(t!("压缩 {}：{}", item.path.display(), e)));
                 E_FAIL
             }
         }

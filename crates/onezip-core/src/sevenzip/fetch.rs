@@ -9,6 +9,7 @@
 //! 断点续传：已经落盘的块记在镜像旁边的 `.onezip-chunks` 里（先刷盘再记），解压进度
 //! 记在本地流程自己的进度文件里。用同一个 URL、同一个输出位置再调一次就接着来。
 
+use onezip_i18n::t;
 use std::collections::VecDeque;
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Read, Seek, SeekFrom, Write};
@@ -164,7 +165,7 @@ impl Mirror {
             }
             if self.stop.load(Ordering::Relaxed) || st.quit {
                 // 不能用 ErrorKind::Interrupted：read_exact 遇到它会自动重试，永远停不下来。
-                return Err(io::Error::other("已暂停"));
+                return Err(io::Error::other(t!("已暂停")));
             }
             st = self.cv.wait_timeout(st, Duration::from_millis(200)).unwrap().0;
         }
@@ -185,7 +186,7 @@ impl Mirror {
     fn worker(self: Arc<Self>) {
         let mut out = match OpenOptions::new().write(true).open(&self.path) {
             Ok(f) => f,
-            Err(e) => return self.fail(format!("打开 {} 失败：{e}", self.path.display())),
+            Err(e) => return self.fail(t!("打开 {} 失败：{}", self.path.display(), e)),
         };
         loop {
             let c = {
@@ -210,7 +211,7 @@ impl Mirror {
                     Err(e) => {
                         tries += 1;
                         if tries >= 5 {
-                            self.fail(format!("下载失败：{e:#}"));
+                            self.fail(t!("下载失败：{}", format!("{:#}", e)));
                             break false;
                         }
                         thread::sleep(Duration::from_secs(1 << tries.min(4)));
@@ -225,7 +226,7 @@ impl Mirror {
 
     fn download(&self, c: usize, out: &mut File) -> Result<bool> {
         let (s, e) = self.range(c);
-        let range = ByteRange::new(ByteOffset::new(s), ByteOffset::new(e)).ok_or_else(|| anyhow!("区间无效"))?;
+        let range = ByteRange::new(ByteOffset::new(s), ByteOffset::new(e)).ok_or_else(|| anyhow!(t!("区间无效")))?;
         let mut resp = self.client.get_range(&self.url, range).map_err(|e| anyhow!(e))?;
         out.seek(SeekFrom::Start(s))?;
         let mut buf = vec![0u8; 256 << 10];
@@ -237,7 +238,7 @@ impl Mirror {
             let want = ((e - s - got) as usize).min(buf.len());
             let n = resp.body.read(&mut buf[..want])?;
             if n == 0 {
-                bail!("连接提前断开（{got} / {} 字节）", e - s);
+                bail!(t!("连接提前断开（{} / {} 字节）", got, e - s));
             }
             out.write_all(&buf[..n])?;
             got += n as u64;
@@ -295,14 +296,14 @@ fn header(url: &str, len: u64, chunk: u64, tag: &str) -> String {
 fn probe(client: &Client, url: &Url) -> Result<(u64, String)> {
     let range = ByteRange::new(ByteOffset::new(0), ByteOffset::new(1)).unwrap();
     let resp = client.get_range(url, range).map_err(|e| anyhow!(e)).context(
-        "服务器不支持分段下载（Range），这种格式没法边下载边解压；请先下载下来再解压",
+        t!("服务器不支持分段下载（Range），这种格式没法边下载边解压；请先下载下来再解压"),
     )?;
     let total = resp
         .headers
         .get("content-range")
         .and_then(|v| peel::http::range::parse_content_range(v).ok())
         .and_then(|r| r.total())
-        .ok_or_else(|| anyhow!("服务器没有告诉文件大小，没法边下载边解压"))?;
+        .ok_or_else(|| anyhow!(t!("服务器没有告诉文件大小，没法边下载边解压")))?;
     let tag = resp
         .headers
         .get("etag")
@@ -320,7 +321,7 @@ fn url_file_name(url: &str) -> Option<String> {
 
 /// 边下载边解压。输出目录是 `req.output`（没给就用当前目录下以文件名命名的文件夹）。
 pub(crate) fn extract_url(url: &str, req: &ExtractRequest, observer: Observer, stop: &Arc<AtomicBool>) -> Result<Outcome> {
-    let name = url_file_name(url).ok_or_else(|| anyhow!("无法从 URL 得到文件名"))?;
+    let name = url_file_name(url).ok_or_else(|| anyhow!(t!("无法从 URL 得到文件名")))?;
     let output = match &req.output {
         Some(p) => std::path::absolute(p)?,
         None => std::path::absolute(super::stem(Path::new(&name)))?,
@@ -332,11 +333,11 @@ pub(crate) fn extract_url(url: &str, req: &ExtractRequest, observer: Observer, s
     let mirror_path = work.join(&name);
     let ckpt = work.join(format!("{name}.onezip-chunks"));
 
-    let parsed = Url::parse(url).map_err(|e| anyhow!(e)).context("URL 无效")?;
-    let client = Client::new().map_err(|e| anyhow!(e)).context("创建 HTTP 客户端失败")?;
+    let parsed = Url::parse(url).map_err(|e| anyhow!(e)).context(t!("URL 无效"))?;
+    let client = Client::new().map_err(|e| anyhow!(e)).context(t!("创建 HTTP 客户端失败"))?;
     let (len, tag) = probe(&client, &parsed)?;
     if len == 0 {
-        bail!("远程文件是空的");
+        bail!(t!("远程文件是空的"));
     }
     let chunk = chunk_size(len);
     let head = header(url, len, chunk, &tag);
@@ -359,15 +360,12 @@ pub(crate) fn extract_url(url: &str, req: &ExtractRequest, observer: Observer, s
     } else if work.exists() {
         if output.exists() && fs::read_dir(&output).is_ok_and(|mut d| d.next().is_some()) {
             bail!(
-                "远程文件和上次没下完时不一样了。请删除 {} 和 {} 后重新开始",
-                output.display(),
-                work.display()
-            );
+                t!("远程文件和上次没下完时不一样了。请删除 {} 和 {} 后重新开始", output.display(), work.display()));
         }
-        fs::remove_dir_all(&work).with_context(|| format!("清理 {}", work.display()))?;
+        fs::remove_dir_all(&work).with_context(|| t!("清理 {}", work.display()))?;
     }
     if !resuming {
-        fs::create_dir_all(&work).with_context(|| format!("创建 {}", work.display()))?;
+        fs::create_dir_all(&work).with_context(|| t!("创建 {}", work.display()))?;
         hide(&work);
         let f = File::create(&mirror_path)?;
         #[cfg(windows)]
@@ -423,7 +421,7 @@ pub(crate) fn extract_url(url: &str, req: &ExtractRequest, observer: Observer, s
                 if n.is_multiple_of(5)
                     && let Err(e) = m.commit()
                 {
-                    m.fail(format!("保存下载进度失败：{e:#}"));
+                    m.fail(t!("保存下载进度失败：{}", format!("{:#}", e)));
                 }
                 obs(Event::Remote {
                     downloaded: m.downloaded.load(Ordering::Relaxed),

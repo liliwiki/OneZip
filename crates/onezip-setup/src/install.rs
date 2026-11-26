@@ -4,6 +4,7 @@
 //! 和 licenses 文件夹。装了哪些文件记在卸载项的 `InstalledFiles` 里；升级时上一版有、
 //! 这一版没有的文件会删掉，卸载也只删这些文件。
 
+use onezip_i18n::t;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
@@ -113,8 +114,8 @@ fn copy_file(from: &Path, to: &Path) -> Result<()> {
     // 被占着的文件（多半是资源管理器还加载着菜单 DLL）不能覆盖，但可以改名。
     let aside = to.with_file_name(format!("{}{OLD_SUFFIX}", to.file_name().unwrap_or_default().to_string_lossy()));
     let _ = std::fs::remove_file(&aside);
-    std::fs::rename(to, &aside).with_context(|| format!("{} 正在被使用，无法替换", to.display()))?;
-    std::fs::copy(from, to).with_context(|| format!("复制 {}", to.display()))?;
+    std::fs::rename(to, &aside).with_context(|| t!("{} 正在被使用，无法替换", to.display()))?;
+    std::fs::copy(from, to).with_context(|| t!("复制 {}", to.display()))?;
     Ok(())
 }
 
@@ -136,9 +137,9 @@ fn ensure_writable(dir: &Path) -> Result<()> {
     }
     let sid = sys::user_sid()?;
     sys::run_elevated(&["--grant".into(), dir.display().to_string(), sid])
-        .with_context(|| format!("无法安装到 {}，请换一个位置", dir.display()))?;
+        .with_context(|| t!("无法安装到 {}，请换一个位置", dir.display()))?;
     if !writable(dir) {
-        bail!("无法写入 {}，请换一个位置", dir.display());
+        bail!(t!("无法写入 {}，请换一个位置", dir.display()));
     }
     Ok(())
 }
@@ -156,7 +157,7 @@ pub fn install(plan: &Plan, say: &dyn Fn(&str)) -> Result<()> {
 fn steps(plan: &Plan, tmp: &Path, say: &dyn Fn(&str)) -> Result<()> {
     let dest = &plan.dest;
     let exe = std::env::current_exe()?;
-    say("正在解出安装文件…");
+    say(t!("正在解出安装文件…"));
     payload::unpack(&exe, tmp)?;
     let mut files = payload::program_files(tmp)?;
     files.push("uninstall.exe".into());
@@ -164,7 +165,7 @@ fn steps(plan: &Plan, tmp: &Path, say: &dyn Fn(&str)) -> Result<()> {
 
     ensure_writable(dest)?;
 
-    say("正在关闭 OneZip…");
+    say(t!("正在关闭 OneZip…"));
     let mut dirs = vec![dest.clone()];
     dirs.extend(plan.old.clone());
     sys::close_onezip(&dirs, Duration::from_secs(if plan.update { 30 } else { 0 }));
@@ -179,7 +180,7 @@ fn steps(plan: &Plan, tmp: &Path, say: &dyn Fn(&str)) -> Result<()> {
         let _ = std::fs::remove_dir(old);
     }
 
-    say("正在复制文件…");
+    say(t!("正在复制文件…"));
     for f in files.iter().filter(|f| f.as_str() != "uninstall.exe") {
         copy_file(&tmp.join(f), &dest.join(f))?;
     }
@@ -196,13 +197,13 @@ fn steps(plan: &Plan, tmp: &Path, say: &dyn Fn(&str)) -> Result<()> {
     if sys::is_win11()
         && let Some(msix) = payload::setup_file(tmp, "OneZip-Shell.msix")
     {
-        say("正在注册右键菜单…");
+        say(t!("正在注册右键菜单…"));
         // 自签名的包要先让本机信任签名证书（一次管理员确认，以后升级不再需要）。
         if let Some(cer) = payload::setup_file(tmp, "OneZip-Dev.cer") {
             let der = std::fs::read(&cer)?;
             if !sys::trusted(&der)? {
                 sys::run_elevated(&["--trust".into(), cer.display().to_string()])
-                    .context("右键菜单需要信任 OneZip 的签名证书")?;
+                    .context(t!("右键菜单需要信任 OneZip 的签名证书"))?;
             }
         }
         sys::add_shell_package(&msix, dest)?;
@@ -210,7 +211,7 @@ fn steps(plan: &Plan, tmp: &Path, say: &dyn Fn(&str)) -> Result<()> {
     // 传统右键菜单按设置写（装了第一层菜单时会删掉传统菜单，免得重复）。
     sys::run_hidden(&onezip, &["--register-menu", "/quiet"])?;
 
-    say("正在创建开始菜单快捷方式…");
+    say(t!("正在创建开始菜单快捷方式…"));
     sys::create_shortcut(&onezip)?;
     let size: u64 = files.iter().filter_map(|f| std::fs::metadata(dest.join(f)).ok()).map(|m| m.len()).sum();
     sys::write_uninstall_key(dest, env!("CARGO_PKG_VERSION"), &files, (size / 1024) as u32)?;

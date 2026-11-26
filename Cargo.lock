@@ -3845,6 +3845,7 @@ dependencies = [
  "interprocess",
  "onezip-core",
  "onezip-formats",
+ "onezip-i18n",
  "onezip-menu",
  "onezip-settings",
  "raw-window-handle",
@@ -3869,6 +3870,8 @@ dependencies = [
  "ctrlc",
  "indicatif",
  "onezip-core",
+ "onezip-i18n",
+ "onezip-settings",
 ]
 
 [[package]]
@@ -3883,6 +3886,7 @@ dependencies = [
  "lzma-rust2 0.23.0",
  "md-5",
  "onezip-formats",
+ "onezip-i18n",
  "peel-rs",
  "sevenz-rust2",
  "sha1",
@@ -3898,18 +3902,30 @@ dependencies = [
 [[package]]
 name = "onezip-formats"
 version = "0.2.0"
+dependencies = [
+ "onezip-i18n",
+]
+
+[[package]]
+name = "onezip-i18n"
+version = "0.2.0"
+dependencies = [
+ "windows",
+]
 
 [[package]]
 name = "onezip-menu"
 version = "0.2.0"
 dependencies = [
  "onezip-formats",
+ "onezip-i18n",
 ]
 
 [[package]]
 name = "onezip-settings"
 version = "0.2.0"
 dependencies = [
+ "onezip-i18n",
  "windows",
  "winreg",
 ]
@@ -3919,6 +3935,7 @@ name = "onezip-setup"
 version = "0.2.0"
 dependencies = [
  "anyhow",
+ "onezip-i18n",
  "onezip-settings",
  "rfd",
  "slint",

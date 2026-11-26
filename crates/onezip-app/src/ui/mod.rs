@@ -18,6 +18,7 @@ mod requests;
 mod settings;
 mod update;
 
+use onezip_i18n::t;
 use std::cell::{Cell, RefCell};
 use std::collections::{HashMap, HashSet};
 use std::rc::Rc;
@@ -89,6 +90,19 @@ impl App {
         settings::theme_index(self.settings.borrow().theme)
     }
 
+    /// 语言改了：界面文字马上换；代码里生成的文字（状态、菜单项名字等）重新生成，
+    /// 右键菜单和文件关联里的文字也重新写一遍。已经显示的任务名、提示保持原样。
+    pub(super) fn apply_language(&self) {
+        let lang = self.settings.borrow().language.resolve();
+        onezip_i18n::set(lang);
+        let _ = slint::select_bundled_translation(lang.slint_name());
+        self.window.set_status(main_window::status_text(&self.settings.borrow()).into());
+        if let Err(e) = crate::menu::apply(&self.settings.borrow()) {
+            crate::log::error(&format!("{e:#}"));
+        }
+        settings::refresh_assoc_labels();
+    }
+
     /// 主题改了：所有开着的窗口一起换。
     pub(super) fn apply_theme(&self) {
         let t = self.theme();
@@ -125,6 +139,8 @@ impl App {
 
 pub fn run(first: Request, incoming: Receiver<Request>) -> anyhow::Result<()> {
     let window = MainWindow::new()?;
+    // 界面上的 @tr 文字按设置的语言显示（窗口创建后 Slint 才有翻译表）。
+    let _ = slint::select_bundled_translation(onezip_i18n::lang().slint_name());
     let app = Rc::new(App {
         window,
         tasks: Manager::new(),
@@ -255,7 +271,7 @@ pub(super) fn refresh(app: &Rc<App>) {
             can_cancel: t.can_cancel(),
             can_remove: t.can_remove(),
             can_open: t.status == Status::Done && (t.output.is_some() || t.report.is_some()),
-            open_label: if t.report.is_some() { "查看" } else { "打开" }.into(),
+            open_label: if t.report.is_some() { t!("查看") } else { t!("打开") }.into(),
             needs_password: matches!(t.status, Status::NeedsPassword { .. }),
         })
         .collect();

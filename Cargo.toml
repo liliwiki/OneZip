@@ -1,6 +1,6 @@
 [workspace]
 resolver = "3"
-members = ["crates/onezip-formats", "crates/onezip-menu", "crates/onezip-settings", "crates/onezip-core", "crates/onezip-cli", "crates/onezip-app", "crates/onezip-shell", "crates/onezip-setup"]
+members = ["crates/onezip-i18n", "crates/onezip-formats", "crates/onezip-menu", "crates/onezip-settings", "crates/onezip-core", "crates/onezip-cli", "crates/onezip-app", "crates/onezip-shell", "crates/onezip-setup"]
 # 拷进来改过的上游代码，不当作工作区成员（不跑它们的测试、不套用本项目的 lint）。
 exclude = ["third_party"]
 
@@ -14,6 +14,7 @@ license = "MIT"
 [workspace.dependencies]
 onezip-core = { path = "crates/onezip-core" }
 onezip-formats = { path = "crates/onezip-formats" }
+onezip-i18n = { path = "crates/onezip-i18n" }
 onezip-menu = { path = "crates/onezip-menu" }
 onezip-settings = { path = "crates/onezip-settings" }
 anyhow = "1.0.100"

@@ -3,6 +3,7 @@
 //! 断点续传靠 Peel 放在输出旁边的 `.peel.part` / `.peel.ckpt`：用同一个 URL 和
 //! 同一个输出位置再调一次，就会从上次的检查点继续。
 
+use onezip_i18n::t;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -31,7 +32,7 @@ pub(crate) fn extract_file(
     confirm: &mut dyn FnMut(&Confirm) -> bool,
 ) -> Result<Outcome> {
     if req.password.is_some() {
-        bail!("这种格式的加密压缩包暂不支持");
+        bail!(t!("这种格式的加密压缩包暂不支持"));
     }
     let archive = std::path::absolute(archive)?;
     let registry = DecoderRegistry::with_defaults();
@@ -69,7 +70,7 @@ pub(crate) fn extract_file(
             output: &out_path,
         })
     {
-        bail!("已取消，压缩包没有任何改动");
+        bail!(t!("已取消，压缩包没有任何改动"));
     }
 
     let size = std::fs::metadata(&archive)?.len();
@@ -95,7 +96,7 @@ pub(crate) fn extract_file(
             warning: None,
         }),
         Err(CoordinatorError::Aborted { .. }) if stop.load(Ordering::Relaxed) => Ok(Outcome::Paused),
-        Err(e) => Err(anyhow!(e)).with_context(|| format!("解压 {name} 失败")),
+        Err(e) => Err(anyhow!(e)).with_context(|| t!("解压 {} 失败", name)),
     }
 }
 
@@ -165,7 +166,7 @@ pub(crate) fn extract(
         && matches!(output, OutputTarget::Dir(_))
         && (peel_checkpoint_exists(&out_path) || crate::smart::is_empty_dir(&out_path));
 
-    let client = Client::new().map_err(|e| anyhow!(e)).context("创建 HTTP 客户端失败")?;
+    let client = Client::new().map_err(|e| anyhow!(e)).context(t!("创建 HTTP 客户端失败"))?;
     let state = ProgressState::new();
     let password = Password::set(req.password.as_deref());
 
@@ -221,7 +222,7 @@ pub(crate) fn extract(
             })
         }
         Err(CoordinatorError::Aborted { .. }) if stop.load(Ordering::Relaxed) => Ok(Outcome::Paused),
-        Err(e) => Err(anyhow!(e)).with_context(|| format!("从 {url} 解压失败")),
+        Err(e) => Err(anyhow!(e)).with_context(|| t!("从 {} 解压失败", url)),
     }
 }
 
@@ -286,7 +287,7 @@ fn output_target(
             let stem = name
                 .as_deref()
                 .map(onezip_formats::archive_stem)
-                .ok_or_else(|| anyhow!("无法从 URL 推断输出名，请指定输出位置"))?;
+                .ok_or_else(|| anyhow!(t!("无法从 URL 推断输出名，请指定输出位置")))?;
             PathBuf::from(stem)
         }
     };

@@ -1,0 +1,2222 @@
+# OneZip 的英文译文。msgid 是代码里的中文原文，msgstr 是英文。
+# Rust 代码用 t!("…")，Slint 界面用 @tr("…")，都查这个文件；没有译文时显示中文。
+msgid ""
+msgstr ""
+"Content-Type: text/plain; charset=UTF-8\n"
+"Language: en\n"
+"Plural-Forms: nplurals=2; plural=(n != 1);\n"
+
+# crates/onezip-app/src/log.rs
+msgid "错误"
+msgstr "Error"
+
+msgid "信息"
+msgstr "Info"
+
+msgid "程序崩溃：{}"
+msgstr "OneZip crashed: {}"
+
+
+# crates/onezip-app/src/menu.rs
+msgid "右键菜单只支持 Windows"
+msgstr "The context menu is only available on Windows"
+
+
+# crates/onezip-app/src/request.rs
+msgid "--url 后面要跟一个链接"
+msgstr "--url must be followed by a link"
+
+msgid "--hash 后面要跟算法，如 crc32,sha256 或 *"
+msgstr "--hash must be followed by algorithms, such as crc32,sha256 or *"
+
+msgid "不认识的参数 {}"
+msgstr "Unknown argument {}"
+
+
+# crates/onezip-app/src/tasks.rs
+msgid "排队中"
+msgstr "Queued"
+
+msgid "进行中"
+msgstr "Running"
+
+msgid "已暂停"
+msgstr "Paused"
+
+msgid "完成"
+msgstr "Done"
+
+msgid "已取消"
+msgstr "Cancelled"
+
+msgid "需要密码"
+msgstr "Password required"
+
+msgid "有同名文件"
+msgstr "Files already exist"
+
+msgid "失败"
+msgstr "Failed"
+
+msgid "完成：{}"
+msgstr "Done: {}"
+
+msgid "进度已保存，可以随时继续（关掉 OneZip 也不会丢）"
+msgstr "Progress is saved; continue any time (closing OneZip won't lose it)"
+
+msgid "{} 里已有 {} 个同名文件，请选择怎么办"
+msgstr "{} already has {} files with the same names; choose what to do"
+
+msgid "已下载 {} / {} · 已解出 {}"
+msgstr "Downloaded {} / {} · extracted {}"
+
+msgid " · 原压缩包剩余 {}"
+msgstr " · {} of the archive left"
+
+msgid "{} 等 {} 项"
+msgstr "{} and others ({} items)"
+
+msgid "正在暂停，到下一个安全点就停…"
+msgstr "Pausing at the next safe point…"
+
+msgid "正在试保存的密码（{}/{}）…"
+msgstr "Trying saved passwords ({}/{})…"
+
+msgid "{}；压缩包没有删除"
+msgstr "{}; the archive was not deleted"
+
+msgid "{} 个文件，点“查看”看结果"
+msgstr "{} files; click \"View\" for the results"
+
+msgid "测试通过，没有发现错误"
+msgstr "Test passed, no errors found"
+
+msgid "{}：{}"
+msgstr "{}: {}"
+
+msgid "删除 {} 失败：{}"
+msgstr "Couldn't delete {}: {}"
+
+msgid "解压完成，但删除压缩包失败：{}"
+msgstr "Extracted, but couldn't delete the archive: {}"
+
+
+# crates/onezip-app/src/ui/browser.rs
+msgid "正在打开…"
+msgstr "Opening…"
+
+msgid "这个压缩包加密了，要输入密码才能看到里面的内容。"
+msgstr "This archive is encrypted. Enter the password to see what's inside."
+
+msgid "打开 {} 失败：{}"
+msgstr "Couldn't open {}: {}"
+
+msgid "打不开这个压缩包：{}"
+msgstr "Can't open this archive: {}"
+
+msgid "{} 个文件夹，{} 个文件（共 {}）"
+msgstr "{} folders, {} files ({} in total)"
+
+msgid "已选中 {} 项（{}）· 可以直接拖到资源管理器"
+msgstr "{} selected ({}) · drag them into File Explorer"
+
+msgid "解压到哪个文件夹"
+msgstr "Extract to which folder"
+
+msgid "解压 {} 里的 {} 项"
+msgstr "Extract {1} items from {0}"
+
+msgid "解压 {}"
+msgstr "Extract {}"
+
+msgid "正在打开 {}…"
+msgstr "Opening {}…"
+
+msgid "拖放失败：{}"
+msgstr "Drag and drop failed: {}"
+
+msgid "密码正确，请再拖一次"
+msgstr "Password accepted; drag again"
+
+msgid "解压失败：{}"
+msgstr "Extraction failed: {}"
+
+
+# crates/onezip-app/src/ui/compress.rs
+msgid "压缩：{}"
+msgstr "Compress: {}"
+
+msgid "压缩 {} 项：{} 等"
+msgstr "Compress {} items: {} and others"
+
+msgid "保存压缩包"
+msgstr "Save archive"
+
+msgid "{} 已存在，要替换它吗？"
+msgstr "{} already exists. Replace it?"
+
+msgid "压缩为 {}"
+msgstr "Compress to {}"
+
+
+# crates/onezip-app/src/ui/confirm.rs
+msgid "{} 会在解压过程中逐步删除"
+msgstr "{} will be deleted bit by bit while extracting"
+
+msgid "这 {} 个压缩包会在解压过程中逐步删除"
+msgstr "These {} archives will be deleted bit by bit while extracting"
+
+msgid "解压完成后压缩包不再存在，也不会进回收站。"
+msgstr "When extraction finishes the archive is gone; it doesn't go to the Recycle Bin."
+
+
+# crates/onezip-app/src/ui/hash.rs
+msgid "已复制到剪贴板"
+msgstr "Copied to the clipboard"
+
+msgid "复制失败，可以在上面选中文字后按 Ctrl+C"
+msgstr "Couldn't copy; select the text above and press Ctrl+C"
+
+
+# crates/onezip-app/src/ui/main_window.rs
+msgid "右键菜单已关闭：可以在“设置 → 右键菜单”里打开。"
+msgstr "The context menu is off; turn it on in Settings → Context menu."
+
+msgid "右键菜单已启用（Windows 11 第一层菜单）。"
+msgstr "The context menu is on (first level of the Windows 11 menu)."
+
+msgid "右键菜单已启用。"
+msgstr "The context menu is on."
+
+msgid "右键菜单尚未启用：在“设置 → 右键菜单”里打开。"
+msgstr "The context menu isn't on yet; turn it on in Settings → Context menu."
+
+msgid "选择要解压的压缩包"
+msgstr "Choose archives to extract"
+
+msgid "压缩包"
+msgstr "Archives"
+
+msgid "所有文件"
+msgstr "All files"
+
+msgid "边解压边删除压缩包"
+msgstr "Extract while deleting the archive"
+
+msgid "这些文件的格式（磁盘镜像、安装包等）不能边解压边删除，请取消勾选“解压时释放原压缩包空间”后再解压：\n\n{}"
+msgstr "These files' formats (disk images, installers, and the like) can't be extracted while deleting the archive. Untick \"Free the archive's space while extracting\" and extract again:\n\n{}"
+
+msgid "打开压缩包，看看里面有什么"
+msgstr "Open an archive to see what's inside"
+
+msgid "选择要压缩的文件"
+msgstr "Choose files to compress"
+
+msgid "选择要压缩的文件夹"
+msgstr "Choose a folder to compress"
+
+msgid "还有任务在进行。退出后，解压任务会在安全点暂停并保存进度，下次可以继续；压缩任务会被取消。确定退出吗？"
+msgstr "Tasks are still running. If you quit, extractions pause at a safe point and save their progress so they can continue later; compressions are cancelled. Quit anyway?"
+
+
+# crates/onezip-app/src/ui/mod.rs
+msgid "查看"
+msgstr "View"
+
+msgid "打开"
+msgstr "Open"
+
+
+# crates/onezip-app/src/ui/progress.rs
+msgid "原压缩包剩余 {}"
+msgstr "{} of the archive left"
+
+msgid "已解出 {}"
+msgstr "Extracted {}"
+
+msgid "已暂停，进度已保存。可以继续，或以后再从右键菜单解压同一个压缩包接着来。"
+msgstr "Paused, progress saved. Continue now, or extract the same archive from the context menu later to pick up where it stopped."
+
+msgid "需要密码：请在弹出的密码框里输入。"
+msgstr "Password required: enter it in the password window."
+
+msgid "目标位置有同名文件：请在弹出的窗口里选择怎么办。"
+msgstr "Files with the same names already exist: choose what to do in the window that opened."
+
+
+# crates/onezip-app/src/ui/requests.rs
+msgid "测试 {}"
+msgstr "Test {}"
+
+msgid "下载并解压 {}"
+msgstr "Download and extract {}"
+
+msgid "校验 {}（{}）"
+msgstr "Checksums of {} ({})"
+
+msgid "解压并释放空间 {}"
+msgstr "Extract and free space: {}"
+
+msgid "解压后删除 {}"
+msgstr "Extract, then delete {}"
+
+
+# crates/onezip-app/src/ui/same_names.rs
+msgid "{} 里已有 {} 个同名文件"
+msgstr "{} already has {} files with the same names"
+
+msgid "解压 {} 会用到下面这些名字。什么都还没改动，请选择怎么办："
+msgstr "Extracting {} would use the names below. Nothing has been changed yet; choose what to do:"
+
+msgid "……还有 {} 个"
+msgstr "…and {} more"
+
+
+# crates/onezip-app/src/ui/settings.rs
+msgid "自动（{}）"
+msgstr "Automatic ({})"
+
+msgid "手动添加"
+msgstr "Added by hand"
+
+msgid "上次用于 {}"
+msgstr "Last used for {}"
+
+msgid "保存密码失败：{}"
+msgstr "Couldn't save the password: {}"
+
+msgid "删除全部保存的密码？删除后不能恢复。"
+msgstr "Delete all saved passwords? This can't be undone."
+
+msgid "验证你的身份以显示 OneZip 保存的密码"
+msgstr "Verify your identity to show the passwords OneZip saved"
+
+msgid "、"
+msgstr ", "
+
+msgid "找不到 OneZip.exe：{}"
+msgstr "Can't find OneZip.exe: {}"
+
+msgid ".{}：{}"
+msgstr ".{}: {}"
+
+msgid "设置文件关联失败：\n{}"
+msgstr "Couldn't set the file associations:\n{}"
+
+msgid "保存设置失败：{}"
+msgstr "Couldn't save the settings: {}"
+
+msgid "设置右键菜单失败：{}"
+msgstr "Couldn't set up the context menu: {}"
+
+msgid "所有设置都恢复成刚安装时的样子？"
+msgstr "Restore every setting to how it was after installation?"
+
+msgid "边下载边解压：默认保存位置"
+msgstr "Extract while downloading: default location"
+
+
+# crates/onezip-app/src/ui/update.rs
+msgid "正在下载 {} / {}"
+msgstr "Downloading {} / {}"
+
+msgid "检查更新失败：{}"
+msgstr "Update check failed: {}"
+
+msgid "还没有检查过"
+msgstr "Not checked yet"
+
+msgid "上次检查：刚才"
+msgstr "Last checked: just now"
+
+msgid "上次检查：{} 分钟前"
+msgstr "Last checked: {} min ago"
+
+msgid "上次检查：{} 小时前"
+msgstr "Last checked: {} h ago"
+
+msgid "上次检查：{} 天前"
+msgstr "Last checked: {} days ago"
+
+msgid "正在检查…"
+msgstr "Checking…"
+
+msgid "已是最新版 · {}"
+msgstr "Up to date · {}"
+
+msgid "有新版本 {} · {}"
+msgstr "New version {} · {}"
+
+msgid "检查失败：{}"
+msgstr "Check failed: {}"
+
+msgid "OneZip {} 已发布（你现在用的是 {}）"
+msgstr "OneZip {} is out (you have {})"
+
+msgid "更新说明见发布页：\n{}"
+msgstr "See the release page for what's new:\n{}"
+
+msgid "还有任务在进行，等它们完成后自动开始更新…"
+msgstr "Tasks are still running; the update starts when they finish…"
+
+msgid "正在下载…"
+msgstr "Downloading…"
+
+msgid "下载更新失败：{}"
+msgstr "Couldn't download the update: {}"
+
+msgid "更新失败：{}"
+msgstr "Update failed: {}"
+
+msgid "开始安装更新 {}"
+msgstr "Installing update {}"
+
+msgid "（没有出错记录）"
+msgstr "(no errors logged)"
+
+msgid "**OneZip 版本**：{}\n**Windows**：{}\n\n**发生了什么、怎么操作的**：\n\n\n**最近的出错记录**（可删改）：\n```\n{}\n```\n"
+msgstr "**OneZip version**: {}\n**Windows**: {}\n\n**What happened, and what you did**:\n\n\n**Recent error log** (edit as you like):\n```\n{}\n```\n"
+
+
+# crates/onezip-app/src/update.rs
+msgid "GitHub 的回答看不懂"
+msgstr "Couldn't understand GitHub's response"
+
+msgid "没有版本号"
+msgstr "No version number"
+
+msgid "{} 里没有安装包"
+msgstr "{} has no installer"
+
+msgid "{} 里没有安装包的 SHA-256"
+msgstr "{} has no SHA-256 for the installer"
+
+msgid "还没有正式发布的版本"
+msgstr "No version has been released yet"
+
+msgid "SHA-256 文件格式不对"
+msgstr "The SHA-256 file is malformed"
+
+msgid "下载的安装包校验不对（SHA-256 不一致），已删除，没有安装"
+msgstr "The downloaded installer failed verification (SHA-256 mismatch); it was deleted and nothing was installed"
+
+msgid "启动 {} 失败"
+msgstr "Couldn't start {}"
+
+
+# crates/onezip-app/src/win.rs
+msgid "移到回收站失败（错误 {}）"
+msgstr "Couldn't move to the Recycle Bin (error {})"
+
+msgid "移到回收站被中止"
+msgstr "Moving to the Recycle Bin was aborted"
+
+msgid "未知"
+msgstr "Unknown"
+
+msgid "{} {}（{}）"
+msgstr "{} {} ({})"
+
+msgid "只支持 Windows"
+msgstr "Only available on Windows"
+
+
+# crates/onezip-app/ui/browser.slint
+msgid "上一级"
+msgstr "Up"
+
+msgid "输入密码"
+msgstr "Enter password"
+
+msgid "名称"
+msgstr "Name"
+
+msgid "大小"
+msgstr "Size"
+
+msgid "修改时间"
+msgstr "Modified"
+
+msgid "解压选中的项…"
+msgstr "Extract selected…"
+
+msgid "全部解压…"
+msgstr "Extract all…"
+
+
+# crates/onezip-app/ui/compress.slint
+msgid "添加到压缩包"
+msgstr "Add to archive"
+
+msgid "浏览…"
+msgstr "Browse…"
+
+msgid "格式"
+msgstr "Format"
+
+msgid "压缩级别：{}（{}）"
+msgstr "Level: {} ({})"
+
+msgid "仅存储"
+msgstr "Store only"
+
+msgid "快速"
+msgstr "Fast"
+
+msgid "标准"
+msgstr "Normal"
+
+msgid "最强"
+msgstr "Strongest"
+
+msgid "密码（留空不加密）"
+msgstr "Password (leave empty for none)"
+
+msgid "这种格式不支持密码"
+msgstr "This format doesn't support passwords"
+
+msgid "固实压缩（压缩率更高）"
+msgstr "Solid compression (smaller archive)"
+
+# crates/onezip-app/src/log.rs
+msgid "错误"
+msgstr "Error"
+
+msgid "信息"
+msgstr "Info"
+
+msgid "程序崩溃：{}"
+msgstr "OneZip crashed: {}"
+
+
+# crates/onezip-app/src/menu.rs
+msgid "右键菜单只支持 Windows"
+msgstr "The context menu is only available on Windows"
+
+
+# crates/onezip-app/src/request.rs
+msgid "--url 后面要跟一个链接"
+msgstr "--url must be followed by a link"
+
+msgid "--hash 后面要跟算法，如 crc32,sha256 或 *"
+msgstr "--hash must be followed by algorithms, such as crc32,sha256 or *"
+
+msgid "不认识的参数 {}"
+msgstr "Unknown argument {}"
+
+
+# crates/onezip-app/src/tasks.rs
+msgid "排队中"
+msgstr "Queued"
+
+msgid "进行中"
+msgstr "Running"
+
+msgid "已暂停"
+msgstr "Paused"
+
+msgid "完成"
+msgstr "Done"
+
+msgid "已取消"
+msgstr "Cancelled"
+
+msgid "需要密码"
+msgstr "Password required"
+
+msgid "有同名文件"
+msgstr "Files already exist"
+
+msgid "失败"
+msgstr "Failed"
+
+msgid "完成：{}"
+msgstr "Done: {}"
+
+msgid "进度已保存，可以随时继续（关掉 OneZip 也不会丢）"
+msgstr "Progress is saved; continue any time (closing OneZip won't lose it)"
+
+msgid "{} 里已有 {} 个同名文件，请选择怎么办"
+msgstr "{} already has {} files with the same names; choose what to do"
+
+msgid "已下载 {} / {} · 已解出 {}"
+msgstr "Downloaded {} / {} · extracted {}"
+
+msgid " · 原压缩包剩余 {}"
+msgstr " · {} of the archive left"
+
+msgid "{} 等 {} 项"
+msgstr "{} and others ({} items)"
+
+msgid "正在暂停，到下一个安全点就停…"
+msgstr "Pausing at the next safe point…"
+
+msgid "正在试保存的密码（{}/{}）…"
+msgstr "Trying saved passwords ({}/{})…"
+
+msgid "{}；压缩包没有删除"
+msgstr "{}; the archive was not deleted"
+
+msgid "{} 个文件，点“查看”看结果"
+msgstr "{} files; click \"View\" for the results"
+
+msgid "测试通过，没有发现错误"
+msgstr "Test passed, no errors found"
+
+msgid "{}：{}"
+msgstr "{}: {}"
+
+msgid "删除 {} 失败：{}"
+msgstr "Couldn't delete {}: {}"
+
+msgid "解压完成，但删除压缩包失败：{}"
+msgstr "Extracted, but couldn't delete the archive: {}"
+
+
+# crates/onezip-app/src/ui/browser.rs
+msgid "正在打开…"
+msgstr "Opening…"
+
+msgid "这个压缩包加密了，要输入密码才能看到里面的内容。"
+msgstr "This archive is encrypted. Enter the password to see what's inside."
+
+msgid "打开 {} 失败：{}"
+msgstr "Couldn't open {}: {}"
+
+msgid "打不开这个压缩包：{}"
+msgstr "Can't open this archive: {}"
+
+msgid "{} 个文件夹，{} 个文件（共 {}）"
+msgstr "{} folders, {} files ({} in total)"
+
+msgid "已选中 {} 项（{}）· 可以直接拖到资源管理器"
+msgstr "{} selected ({}) · drag them into File Explorer"
+
+msgid "解压到哪个文件夹"
+msgstr "Extract to which folder"
+
+msgid "解压 {} 里的 {} 项"
+msgstr "Extract {1} items from {0}"
+
+msgid "解压 {}"
+msgstr "Extract {}"
+
+msgid "正在打开 {}…"
+msgstr "Opening {}…"
+
+msgid "拖放失败：{}"
+msgstr "Drag and drop failed: {}"
+
+msgid "密码正确，请再拖一次"
+msgstr "Password accepted; drag again"
+
+msgid "解压失败：{}"
+msgstr "Extraction failed: {}"
+
+
+# crates/onezip-app/src/ui/compress.rs
+msgid "压缩：{}"
+msgstr "Compress: {}"
+
+msgid "压缩 {} 项：{} 等"
+msgstr "Compress {} items: {} and others"
+
+msgid "保存压缩包"
+msgstr "Save archive"
+
+msgid "{} 已存在，要替换它吗？"
+msgstr "{} already exists. Replace it?"
+
+msgid "压缩为 {}"
+msgstr "Compress to {}"
+
+
+# crates/onezip-app/src/ui/confirm.rs
+msgid "{} 会在解压过程中逐步删除"
+msgstr "{} will be deleted bit by bit while extracting"
+
+msgid "这 {} 个压缩包会在解压过程中逐步删除"
+msgstr "These {} archives will be deleted bit by bit while extracting"
+
+msgid "解压完成后压缩包不再存在，也不会进回收站。"
+msgstr "When extraction finishes the archive is gone; it doesn't go to the Recycle Bin."
+
+
+# crates/onezip-app/src/ui/hash.rs
+msgid "已复制到剪贴板"
+msgstr "Copied to the clipboard"
+
+msgid "复制失败，可以在上面选中文字后按 Ctrl+C"
+msgstr "Couldn't copy; select the text above and press Ctrl+C"
+
+
+# crates/onezip-app/src/ui/main_window.rs
+msgid "右键菜单已关闭：可以在“设置 → 右键菜单”里打开。"
+msgstr "The context menu is off; turn it on in Settings → Context menu."
+
+msgid "右键菜单已启用（Windows 11 第一层菜单）。"
+msgstr "The context menu is on (first level of the Windows 11 menu)."
+
+msgid "右键菜单已启用。"
+msgstr "The context menu is on."
+
+msgid "右键菜单尚未启用：在“设置 → 右键菜单”里打开。"
+msgstr "The context menu isn't on yet; turn it on in Settings → Context menu."
+
+msgid "选择要解压的压缩包"
+msgstr "Choose archives to extract"
+
+msgid "压缩包"
+msgstr "Archives"
+
+msgid "所有文件"
+msgstr "All files"
+
+msgid "边解压边删除压缩包"
+msgstr "Extract while deleting the archive"
+
+msgid "这些文件的格式（磁盘镜像、安装包等）不能边解压边删除，请取消勾选“解压时释放原压缩包空间”后再解压：\n\n{}"
+msgstr "These files' formats (disk images, installers, and the like) can't be extracted while deleting the archive. Untick \"Free the archive's space while extracting\" and extract again:\n\n{}"
+
+msgid "打开压缩包，看看里面有什么"
+msgstr "Open an archive to see what's inside"
+
+msgid "选择要压缩的文件"
+msgstr "Choose files to compress"
+
+msgid "选择要压缩的文件夹"
+msgstr "Choose a folder to compress"
+
+msgid "还有任务在进行。退出后，解压任务会在安全点暂停并保存进度，下次可以继续；压缩任务会被取消。确定退出吗？"
+msgstr "Tasks are still running. If you quit, extractions pause at a safe point and save their progress so they can continue later; compressions are cancelled. Quit anyway?"
+
+
+# crates/onezip-app/src/ui/mod.rs
+msgid "查看"
+msgstr "View"
+
+msgid "打开"
+msgstr "Open"
+
+
+# crates/onezip-app/src/ui/progress.rs
+msgid "原压缩包剩余 {}"
+msgstr "{} of the archive left"
+
+msgid "已解出 {}"
+msgstr "Extracted {}"
+
+msgid "已暂停，进度已保存。可以继续，或以后再从右键菜单解压同一个压缩包接着来。"
+msgstr "Paused, progress saved. Continue now, or extract the same archive from the context menu later to pick up where it stopped."
+
+msgid "需要密码：请在弹出的密码框里输入。"
+msgstr "Password required: enter it in the password window."
+
+msgid "目标位置有同名文件：请在弹出的窗口里选择怎么办。"
+msgstr "Files with the same names already exist: choose what to do in the window that opened."
+
+
+# crates/onezip-app/src/ui/requests.rs
+msgid "测试 {}"
+msgstr "Test {}"
+
+msgid "下载并解压 {}"
+msgstr "Download and extract {}"
+
+msgid "校验 {}（{}）"
+msgstr "Checksums of {} ({})"
+
+msgid "解压并释放空间 {}"
+msgstr "Extract and free space: {}"
+
+msgid "解压后删除 {}"
+msgstr "Extract, then delete {}"
+
+
+# crates/onezip-app/src/ui/same_names.rs
+msgid "{} 里已有 {} 个同名文件"
+msgstr "{} already has {} files with the same names"
+
+msgid "解压 {} 会用到下面这些名字。什么都还没改动，请选择怎么办："
+msgstr "Extracting {} would use the names below. Nothing has been changed yet; choose what to do:"
+
+msgid "……还有 {} 个"
+msgstr "…and {} more"
+
+
+# crates/onezip-app/src/ui/settings.rs
+msgid "自动（{}）"
+msgstr "Automatic ({})"
+
+msgid "手动添加"
+msgstr "Added by hand"
+
+msgid "上次用于 {}"
+msgstr "Last used for {}"
+
+msgid "保存密码失败：{}"
+msgstr "Couldn't save the password: {}"
+
+msgid "删除全部保存的密码？删除后不能恢复。"
+msgstr "Delete all saved passwords? This can't be undone."
+
+msgid "验证你的身份以显示 OneZip 保存的密码"
+msgstr "Verify your identity to show the passwords OneZip saved"
+
+msgid "、"
+msgstr ", "
+
+msgid "找不到 OneZip.exe：{}"
+msgstr "Can't find OneZip.exe: {}"
+
+msgid ".{}：{}"
+msgstr ".{}: {}"
+
+msgid "设置文件关联失败：\n{}"
+msgstr "Couldn't set the file associations:\n{}"
+
+msgid "保存设置失败：{}"
+msgstr "Couldn't save the settings: {}"
+
+msgid "设置右键菜单失败：{}"
+msgstr "Couldn't set up the context menu: {}"
+
+msgid "所有设置都恢复成刚安装时的样子？"
+msgstr "Restore every setting to how it was after installation?"
+
+msgid "边下载边解压：默认保存位置"
+msgstr "Extract while downloading: default location"
+
+
+# crates/onezip-app/src/ui/update.rs
+msgid "正在下载 {} / {}"
+msgstr "Downloading {} / {}"
+
+msgid "检查更新失败：{}"
+msgstr "Update check failed: {}"
+
+msgid "还没有检查过"
+msgstr "Not checked yet"
+
+msgid "上次检查：刚才"
+msgstr "Last checked: just now"
+
+msgid "上次检查：{} 分钟前"
+msgstr "Last checked: {} min ago"
+
+msgid "上次检查：{} 小时前"
+msgstr "Last checked: {} h ago"
+
+msgid "上次检查：{} 天前"
+msgstr "Last checked: {} days ago"
+
+msgid "正在检查…"
+msgstr "Checking…"
+
+msgid "已是最新版 · {}"
+msgstr "Up to date · {}"
+
+msgid "有新版本 {} · {}"
+msgstr "New version {} · {}"
+
+msgid "检查失败：{}"
+msgstr "Check failed: {}"
+
+msgid "OneZip {} 已发布（你现在用的是 {}）"
+msgstr "OneZip {} is out (you have {})"
+
+msgid "更新说明见发布页：\n{}"
+msgstr "See the release page for what's new:\n{}"
+
+msgid "还有任务在进行，等它们完成后自动开始更新…"
+msgstr "Tasks are still running; the update starts when they finish…"
+
+msgid "正在下载…"
+msgstr "Downloading…"
+
+msgid "下载更新失败：{}"
+msgstr "Couldn't download the update: {}"
+
+msgid "更新失败：{}"
+msgstr "Update failed: {}"
+
+msgid "开始安装更新 {}"
+msgstr "Installing update {}"
+
+msgid "（没有出错记录）"
+msgstr "(no errors logged)"
+
+msgid "**OneZip 版本**：{}\n**Windows**：{}\n\n**发生了什么、怎么操作的**：\n\n\n**最近的出错记录**（可删改）：\n```\n{}\n```\n"
+msgstr "**OneZip version**: {}\n**Windows**: {}\n\n**What happened, and what you did**:\n\n\n**Recent error log** (edit as you like):\n```\n{}\n```\n"
+
+
+# crates/onezip-app/src/update.rs
+msgid "GitHub 的回答看不懂"
+msgstr "Couldn't understand GitHub's response"
+
+msgid "没有版本号"
+msgstr "No version number"
+
+msgid "{} 里没有安装包"
+msgstr "{} has no installer"
+
+msgid "{} 里没有安装包的 SHA-256"
+msgstr "{} has no SHA-256 for the installer"
+
+msgid "还没有正式发布的版本"
+msgstr "No version has been released yet"
+
+msgid "SHA-256 文件格式不对"
+msgstr "The SHA-256 file is malformed"
+
+msgid "下载的安装包校验不对（SHA-256 不一致），已删除，没有安装"
+msgstr "The downloaded installer failed verification (SHA-256 mismatch); it was deleted and nothing was installed"
+
+msgid "启动 {} 失败"
+msgstr "Couldn't start {}"
+
+
+# crates/onezip-app/src/win.rs
+msgid "移到回收站失败（错误 {}）"
+msgstr "Couldn't move to the Recycle Bin (error {})"
+
+msgid "移到回收站被中止"
+msgstr "Moving to the Recycle Bin was aborted"
+
+msgid "未知"
+msgstr "Unknown"
+
+msgid "{} {}（{}）"
+msgstr "{} {} ({})"
+
+msgid "只支持 Windows"
+msgstr "Only available on Windows"
+
+
+# crates/onezip-app/ui/browser.slint
+msgid "上一级"
+msgstr "Up"
+
+msgid "输入密码"
+msgstr "Enter password"
+
+msgid "名称"
+msgstr "Name"
+
+msgid "大小"
+msgstr "Size"
+
+msgid "修改时间"
+msgstr "Modified"
+
+msgid "解压选中的项…"
+msgstr "Extract selected…"
+
+msgid "全部解压…"
+msgstr "Extract all…"
+
+
+# crates/onezip-app/ui/compress.slint
+msgid "添加到压缩包"
+msgstr "Add to archive"
+
+msgid "浏览…"
+msgstr "Browse…"
+
+msgid "格式"
+msgstr "Format"
+
+msgid "压缩级别：{}（{}）"
+msgstr "Level: {} ({})"
+
+msgid "仅存储"
+msgstr "Store only"
+
+msgid "快速"
+msgstr "Fast"
+
+msgid "标准"
+msgstr "Normal"
+
+msgid "最强"
+msgstr "Strongest"
+
+msgid "密码（留空不加密）"
+msgstr "Password (leave empty for none)"
+
+msgid "这种格式不支持密码"
+msgstr "This format doesn't support passwords"
+
+msgid "固实压缩（压缩率更高）"
+msgstr "Solid compression (smaller archive)"
+
+msgid "取消"
+msgstr "Cancel"
+
+msgid "开始压缩"
+msgstr "Compress"
+
+
+# crates/onezip-app/ui/confirm.slint
+msgid "•  已经解出的部分会立刻从压缩包里删掉，用来腾出空间。"
+msgstr "•  Whatever has been extracted is removed from the archive right away to free space."
+
+msgid "•  中途暂停、断电或关机后可以接着解，但压缩包回不到原来的样子。"
+msgstr "•  After a pause, power cut, or shutdown it can continue, but the archive can't be restored."
+
+msgid "•  开始前会先完整检查一遍压缩包，有损坏就停下，不会删除任何东西。"
+msgstr "•  The whole archive is checked first; if it's damaged, nothing is deleted."
+
+msgid "•  想先解完、确认没问题再删？请改用“解压后删除压缩包”。"
+msgstr "•  Want to extract everything first and delete only if all went well? Use \"Extract, then delete the archive\"."
+
+msgid "我已了解，以后不再提醒"
+msgstr "I understand, don't ask again"
+
+msgid "开始"
+msgstr "Start"
+
+
+# crates/onezip-app/ui/hash.slint
+msgid "校验值"
+msgstr "Checksums"
+
+msgid "复制"
+msgstr "Copy"
+
+msgid "关闭"
+msgstr "Close"
+
+
+# crates/onezip-app/ui/main-window.slint
+msgid "暂停"
+msgstr "Pause"
+
+msgid "继续"
+msgstr "Continue"
+
+msgid "移除"
+msgstr "Remove"
+
+msgid "解压…"
+msgstr "Extract…"
+
+msgid "打开压缩包…"
+msgstr "Open archive…"
+
+msgid "压缩文件…"
+msgstr "Compress files…"
+
+msgid "压缩文件夹…"
+msgstr "Compress folder…"
+
+msgid "设置"
+msgstr "Settings"
+
+msgid "解压时释放原压缩包空间（边解边删）"
+msgstr "Free the archive's space while extracting (deletes it as it goes)"
+
+msgid "粘贴 http(s) 链接：边下载边解压，用过的下载数据立即释放"
+msgstr "Paste an http(s) link to extract while downloading; downloaded data is released as it's used"
+
+msgid "下载并解压"
+msgstr "Download and extract"
+
+msgid "还没有任务。在资源管理器里右键压缩包或文件，或者使用上面的按钮。"
+msgstr "No tasks yet. Right-click an archive or file in File Explorer, or use the buttons above."
+
+msgid "任务"
+msgstr "Tasks"
+
+msgid "清除已完成"
+msgstr "Clear finished"
+
+
+# crates/onezip-app/ui/password.slint
+msgid "密码不对，请重新输入。\n"
+msgstr "Wrong password, try again.\n"
+
+msgid "{} 已加密，请输入密码："
+msgstr "{} is encrypted. Enter the password:"
+
+msgid "记住这个密码"
+msgstr "Remember this password"
+
+msgid "确定"
+msgstr "OK"
+
+
+# crates/onezip-app/ui/progress.slint
+msgid "已用时间："
+msgstr "Elapsed:"
+
+msgid "剩余时间："
+msgstr "Remaining:"
+
+msgid "速度："
+msgstr "Speed:"
+
+msgid "已处理："
+msgstr "Processed:"
+
+msgid "任务列表"
+msgstr "Task list"
+
+
+# crates/onezip-app/ui/same-names.slint
+msgid "目标位置有同名文件"
+msgstr "Files already exist"
+
+msgid "全部替换"
+msgstr "Replace all"
+
+msgid "全部跳过"
+msgstr "Skip all"
+
+msgid "都保留（新的改名）"
+msgstr "Keep both (rename the new ones)"
+
+
+# crates/onezip-app/ui/settings.slint
+msgid "OneZip 设置"
+msgstr "OneZip Settings"
+
+msgid "常规"
+msgstr "General"
+
+msgid "解压"
+msgstr "Extract"
+
+msgid "压缩"
+msgstr "Compress"
+
+msgid "密码"
+msgstr "Passwords"
+
+msgid "文件关联"
+msgstr "File associations"
+
+msgid "右键菜单"
+msgstr "Context menu"
+
+msgid "更新"
+msgstr "Updates"
+
+msgid "关于"
+msgstr "About"
+
+msgid "设置改动立即生效"
+msgstr "Changes apply immediately"
+
+msgid "外观"
+msgstr "Appearance"
+
+msgid "主题"
+msgstr "Theme"
+
+msgid "浅色、深色，或跟随 Windows 的设置"
+msgstr "Light, dark, or follow Windows"
+
+msgid "跟随系统"
+msgstr "Follow Windows"
+
+msgid "浅色"
+msgstr "Light"
+
+msgid "深色"
+msgstr "Dark"
+
+msgid "语言"
+msgstr "Language"
+
+msgid "跟随系统时，Windows 是中文就用中文，其他语言都用英文"
+msgstr "When following Windows: Chinese if Windows is in Chinese, English otherwise"
+
+msgid "全部设置"
+msgstr "All settings"
+
+msgid "恢复全部默认"
+msgstr "Restore all defaults"
+
+msgid "所有页面的设置都回到刚安装时的样子"
+msgstr "Every page goes back to how it was after installation"
+
+msgid "恢复默认"
+msgstr "Restore defaults"
+
+msgid "默认"
+msgstr "Defaults"
+
+msgid "默认解压方式"
+msgstr "Default extraction"
+
+msgid "主窗口的“解压…”使用"
+msgstr "Used by \"Extract…\" in the main window"
+
+msgid "智能解压"
+msgstr "Smart extract"
+
+msgid "解压到同名文件夹"
+msgstr "Extract to a folder named after it"
+
+msgid "解压到当前位置"
+msgstr "Extract here"
+
+msgid "遇到同名文件"
+msgstr "When a file already exists"
+
+msgid "目标位置已经有同名文件时怎么办"
+msgstr "What to do when the destination already has a file with the same name"
+
+msgid "每次询问"
+msgstr "Ask every time"
+
+msgid "替换"
+msgstr "Replace"
+
+msgid "跳过"
+msgstr "Skip"
+
+msgid "自动改名（如 a (2).txt）"
+msgstr "Rename (such as a (2).txt)"
+
+msgid "解开里面套着的压缩包"
+msgstr "Unpack nested archives"
+
+msgid "压缩包里只有一个压缩包（如 .tar）时接着解开"
+msgstr "When an archive holds just another archive (such as a .tar), unpack that too"
+
+msgid "删除压缩包"
+msgstr "Deleting archives"
+
+msgid "解压后删除的压缩包"
+msgstr "Archives deleted after extracting"
+
+msgid "全部解压成功后才删除；出错时压缩包原样保留"
+msgstr "Deleted only after everything extracted; on an error the archive is kept"
+
+msgid "移到回收站"
+msgstr "Move to the Recycle Bin"
+
+msgid "直接删除"
+msgstr "Delete permanently"
+
+msgid "边解压边删除前确认"
+msgstr "Confirm before extracting while deleting"
+
+msgid "压缩包会在解压过程中逐步删除，开始前说明一次；关掉后不再提醒"
+msgstr "The archive is deleted bit by bit while extracting; explain this before starting. Turn off to stop asking"
+
+msgid "边下载边解压"
+msgstr "Extract while downloading"
+
+msgid "默认保存位置"
+msgstr "Default location"
+
+msgid "从链接解压时，解出的文件放在这里"
+msgstr "Files extracted from a link go here"
+
+msgid "同时下载的连接数"
+msgstr "Connections"
+
+msgid "越多通常越快，服务器限制连接时请调小"
+msgstr "More is usually faster; lower it if the server limits connections"
+
+msgid "这里是默认值：“添加到压缩包…”对话框打开时用它们，右键“添加到 名字.7z / 名字.zip”直接按它们压缩。"
+msgstr "These are defaults: the \"Add to archive…\" dialog starts with them, and the context menu's \"Add to name.7z / name.zip\" compresses with them directly."
+
+msgid "默认格式"
+msgstr "Default format"
+
+msgid "“添加到压缩包…”对话框里预先选中的格式"
+msgstr "The format preselected in the \"Add to archive…\" dialog"
+
+msgid "压缩级别"
+msgstr "Compression level"
+
+msgid "越高压得越小，也越慢"
+msgstr "Higher is smaller but slower"
+
+msgid "最快"
+msgstr "Fastest"
+
+msgid "最大"
+msgstr "Maximum"
+
+msgid "极限"
+msgstr "Ultra"
+
+msgid "使用的线程数"
+msgstr "Threads"
+
+msgid "7z、tar.xz、tar.zst 可以多线程压缩"
+msgstr "7z, tar.xz, and tar.zst can compress with several threads"
+
+msgid "固实压缩"
+msgstr "Solid compression"
+
+msgid "压缩率更高，但取出单个文件要先解开前面的数据"
+msgstr "Smaller archives, but taking out one file means decoding the data before it"
+
+msgid "设了密码时加密文件名"
+msgstr "Encrypt file names when a password is set"
+
+msgid "不输密码就看不到压缩包里有哪些文件"
+msgstr "Without the password nobody can see which files are inside"
+
+msgid "解压加密的压缩包时，先自动试这里的密码（最近用过的先试），都不对才弹出密码框。在密码框里勾选“记住这个密码”，解压成功后就会保存到这里。"
+msgstr "When extracting an encrypted archive, OneZip first tries the passwords saved here (most recently used first) and asks only if none works. Tick \"Remember this password\" in the password window to save it here after a successful extraction."
+
+msgid "添加"
+msgstr "Add"
+
+msgid "保存一个密码"
+msgstr "Save a password"
+
+msgid "保存前不检查它对不对"
+msgstr "It isn't checked before saving"
+
+msgid "保存"
+msgstr "Save"
+
+msgid "已保存的密码（{}）"
+msgstr "Saved passwords ({})"
+
+msgid "正在验证…"
+msgstr "Verifying…"
+
+msgid "隐藏密码"
+msgstr "Hide passwords"
+
+msgid "显示密码"
+msgstr "Show passwords"
+
+msgid "全部删除"
+msgstr "Delete all"
+
+msgid "还没有保存的密码"
+msgstr "No saved passwords yet"
+
+msgid "删除"
+msgstr "Delete"
+
+msgid "密码用 Windows 加密后保存在本机，只有当前 Windows 用户能解开。显示密码前要先验证 Windows 身份（PIN、指纹、人脸或登录密码）。卸载 OneZip 时可以选择一并删除。"
+msgstr "Passwords are encrypted by Windows and kept on this computer; only the current Windows user can decrypt them. Showing them requires Windows verification (PIN, fingerprint, face, or sign-in password). Uninstalling OneZip can delete them too."
+
+msgid "勾选的格式双击时用 OneZip 打开：先看到里面有哪些文件，再选择解压、打开或拖出来。只影响当前 Windows 用户，取消勾选会还原成原来的打开方式。"
+msgstr "Ticked formats open in OneZip when double-clicked: see what's inside, then extract, open, or drag items out. This affects only the current Windows user; unticking restores the previous app."
+
+msgid "这些格式双击时还不会直接用 OneZip 打开：{}"
+msgstr "These formats don't open in OneZip on double-click yet: {}"
+
+msgid "Windows 要你自己确认：第一次双击时它会问用什么打开，选 OneZip 再点“始终”；也可以现在到 Windows 设置里改成 OneZip。"
+msgstr "Windows wants you to confirm: the first time you double-click one, it asks which app to use; pick OneZip and click \"Always\". Or set OneZip in Windows Settings now."
+
+msgid "打开 Windows 设置"
+msgstr "Open Windows Settings"
+
+msgid "选择常用的"
+msgstr "Choose common ones"
+
+msgid "全部取消"
+msgstr "Clear all"
+
+msgid "磁盘镜像等"
+msgstr "Disk images and more"
+
+msgid "Windows 自己能打开或挂载这些文件；关联后双击改成用 OneZip 看里面的文件。"
+msgstr "Windows can open or mount these itself; once associated, double-clicking shows their files in OneZip instead."
+
+msgid "在右键菜单里显示 OneZip"
+msgstr "Show OneZip in the context menu"
+
+msgid "Windows 11 在第一层，Windows 10 在传统菜单里"
+msgstr "At the first level on Windows 11, in the classic menu on Windows 10"
+
+msgid "右键压缩包时显示"
+msgstr "Shown when right-clicking an archive"
+
+msgid "右键任意文件、文件夹时显示"
+msgstr "Shown when right-clicking any file or folder"
+
+msgid "Windows 11 只允许每个程序在第一层放一项，所以这些都在“OneZip”子菜单里。"
+msgstr "Windows 11 allows each app only one item at the first level, so these are in the \"OneZip\" submenu."
+
+msgid "检查更新"
+msgstr "Check for updates"
+
+msgid "自动检查更新"
+msgstr "Check for updates automatically"
+
+msgid "打开 OneZip 主窗口时检查，每天最多一次，只连接 GitHub"
+msgstr "Checks when the OneZip main window opens, at most once a day, contacting only GitHub"
+
+msgid "已跳过的版本"
+msgstr "Skipped versions"
+
+msgid "在更新提示里选了“跳过这个版本”的版本不再提示"
+msgstr "Versions you chose \"Skip this version\" for aren't offered again"
+
+msgid "无"
+msgstr "None"
+
+msgid "清除"
+msgstr "Clear"
+
+msgid "更新说明"
+msgstr "Release notes"
+
+msgid "在浏览器里查看各个版本的更新内容"
+msgstr "See what changed in each version, in your browser"
+
+msgid "打开发布页"
+msgstr "Open releases page"
+
+msgid "压缩、解压、边解压边释放空间、边下载边解压"
+msgstr "Compress, extract, free space while extracting, extract while downloading"
+
+msgid "MIT 许可证 · github.com/liliwiki/OneZip"
+msgstr "MIT License · github.com/liliwiki/OneZip"
+
+msgid "用到的开源项目"
+msgstr "Open-source projects used"
+
+msgid "HatchZip —— 边解压边删除、zip / 7z / tar / rar 解压（UnRAR）"
+msgstr "HatchZip — extracting while deleting; zip / 7z / tar / rar extraction (UnRAR)"
+
+msgid "Peel —— 边下载边解压"
+msgstr "Peel — extracting while downloading"
+
+msgid "7-Zip（7z.dll）—— 保留原包解压，以及 iso、wim、cab、dmg、vhd、msi 等格式"
+msgstr "7-Zip (7z.dll) — extracting while keeping the archive, and formats such as iso, wim, cab, dmg, vhd, msi"
+
+msgid "Slint —— 界面"
+msgstr "Slint — user interface"
+
+msgid "GitHub 主页"
+msgstr "GitHub page"
+
+msgid "许可证与第三方声明"
+msgstr "Licenses and third-party notices"
+
+msgid "报告问题"
+msgstr "Report a problem"
+
+msgid "“报告问题”会在浏览器里打开 GitHub 的新问题页，自动填好版本号和最近的出错记录；提交前可以先看、可以删改。"
+msgstr "\"Report a problem\" opens a new GitHub issue in your browser with the version and recent error log filled in; you can read and edit it before submitting."
+
+
+# crates/onezip-app/ui/update.slint
+msgid "OneZip 更新"
+msgstr "OneZip Update"
+
+msgid "更新内容："
+msgstr "What's new:"
+
+msgid "以后不再自动提示"
+msgstr "Don't remind me automatically"
+
+msgid "立即更新"
+msgstr "Update now"
+
+msgid "跳过这个版本"
+msgstr "Skip this version"
+
+msgid "以后再说"
+msgstr "Later"
+
+
+# crates/onezip-cli/src/main.rs
+msgid "OneZip：压缩、解压、边解压边释放空间、边下载边解压"
+msgstr "OneZip: compress, extract, free space while extracting, extract while downloading"
+
+msgid "解压本地压缩包或 http(s) URL"
+msgstr "Extract a local archive or an http(s) URL"
+
+msgid "本地路径或 http(s):// 地址"
+msgstr "Local path or http(s):// address"
+
+msgid "输出目录（默认：智能决定）"
+msgstr "Output folder (default: decided smartly)"
+
+msgid "直接解到压缩包所在的文件夹"
+msgstr "Extract straight into the archive's folder"
+
+msgid "总是新建一个以压缩包命名的文件夹"
+msgstr "Always create a folder named after the archive"
+
+msgid "保留原压缩包，不边解边删"
+msgstr "Keep the archive; don't delete it while extracting"
+
+msgid "不询问，直接确认边解边删"
+msgstr "Don't ask; confirm deleting while extracting"
+
+msgid "动手前先完整校验一遍压缩包"
+msgstr "Verify the whole archive before starting"
+
+msgid "替换输出目录里已存在的同名文件"
+msgstr "Replace files that already exist in the output folder"
+
+msgid "跳过输出目录里已存在的同名文件"
+msgstr "Skip files that already exist in the output folder"
+
+msgid "同名文件都保留，解出的改名为“名字 (2)”"
+msgstr "Keep both; rename extracted files to \"name (2)\""
+
+msgid "解出来只有一个压缩包时继续解开它"
+msgstr "If the result is a single archive, extract it too"
+
+msgid "磁盘至少保留的空闲空间，单位 MB"
+msgstr "Free disk space to keep, in MB"
+
+msgid "压缩文件和文件夹"
+msgstr "Compress files and folders"
+
+msgid "输出的压缩包；扩展名决定格式（也可用 -t 指定）"
+msgstr "Output archive; its extension picks the format (or use -t)"
+
+msgid "要压缩的文件和文件夹"
+msgstr "Files and folders to compress"
+
+msgid "格式：7z、zip、tar.zst、tar.xz、tar.gz"
+msgstr "Format: 7z, zip, tar.zst, tar.xz, tar.gz"
+
+msgid "压缩级别 0（只存储）到 9（最强）"
+msgstr "Compression level, 0 (store) to 9 (strongest)"
+
+msgid "密码（7z 与 zip）"
+msgstr "Password (7z and zip)"
+
+msgid "7z 不使用固实压缩"
+msgstr "Don't use solid compression for 7z"
+
+msgid "覆盖已存在的压缩包"
+msgstr "Overwrite an existing archive"
+
+msgid "列出压缩包内容"
+msgstr "List an archive's contents"
+
+msgid "测试压缩包完整性"
+msgstr "Test an archive's integrity"
+
+msgid "计算校验值：CRC-32、CRC-64、MD5、SHA-1、SHA-256、SHA-512"
+msgstr "Compute checksums: CRC-32, CRC-64, MD5, SHA-1, SHA-256, SHA-512"
+
+msgid "文件或文件夹（文件夹会递归）"
+msgstr "Files or folders (folders are walked recursively)"
+
+msgid "算法，逗号分隔；* 表示全部"
+msgstr "Algorithms, comma-separated; * means all"
+
+msgid "错误：{}"
+msgstr "Error: {}"
+
+msgid "\n正在停止，到下一个安全点后保存进度…（再按一次立即退出）"
+msgstr "\nStopping; progress is saved at the next safe point… (press again to quit now)"
+
+msgid "解压到 {}，并在解压过程中删除 {}？此操作不可撤销 [y/N] "
+msgstr "Extract to {} and delete {} while extracting? This can't be undone [y/N] "
+
+msgid "警告：{}"
+msgstr "Warning: {}"
+
+msgid "完成，文件在 {}"
+msgstr "Done; files are in {}"
+
+msgid "已暂停，进度已保存。运行同样的命令即可继续。"
+msgstr "Paused, progress saved. Run the same command again to continue."
+
+msgid "不认识的格式 {}"
+msgstr "Unknown format {}"
+
+msgid "完成：{}（{}）"
+msgstr "Done: {} ({})"
+
+msgid "已取消，没有留下文件。"
+msgstr "Cancelled; no files were left behind."
+
+msgid "共 {} 个文件，解压后 {}"
+msgstr "{} files, {} extracted"
+
+msgid "不认识的算法 {}（可用：crc32 crc64 md5 sha1 sha256 sha512 *）"
+msgstr "Unknown algorithm {} (available: crc32 crc64 md5 sha1 sha256 sha512 *)"
+
+msgid "测试通过，没有发现错误。"
+msgstr "Test passed, no errors found."
+
+msgid "测试失败：{}"
+msgstr "Test failed: {}"
+
+msgid "从文件名看不出格式，请用 -t 指定"
+msgstr "Can't tell the format from the file name; specify it with -t"
+
+msgid "处理"
+msgstr "Working"
+
+msgid "压缩包剩余 {}"
+msgstr "Archive left: {}"
+
+msgid "会删除原压缩包，非交互运行时请加 --yes 确认，或用 --keep 保留压缩包"
+msgstr "This deletes the archive; when not running interactively, add --yes to confirm, or --keep to keep the archive"
+
+
+# crates/onezip-core/src/browse.rs
+msgid "没有选中要解压的项"
+msgstr "Nothing selected to extract"
+
+msgid "浏览压缩包只支持 Windows"
+msgstr "Browsing archives is only available on Windows"
+
+
+# crates/onezip-core/src/compress.rs
+msgid "没有要压缩的文件"
+msgstr "No files to compress"
+
+msgid "{} 格式不支持密码，请改用 7z 或 zip"
+msgstr "{} doesn't support passwords; use 7z or zip"
+
+msgid "{} 已存在"
+msgstr "{} already exists"
+
+msgid "创建 {}"
+msgstr "Creating {}"
+
+msgid "读取 {}"
+msgstr "Reading {}"
+
+msgid "{} 没有文件名"
+msgstr "{} has no file name"
+
+msgid "压缩包里会出现重名的 {}"
+msgstr "The archive would contain {} twice"
+
+msgid "压缩 {}"
+msgstr "Compressing {}"
+
+
+# crates/onezip-core/src/hash.rs
+msgid "名称：{}\n"
+msgstr "Name: {}\n"
+
+msgid "大小：{} 字节（{}）\n"
+msgstr "Size: {} bytes ({})\n"
+
+msgid "共 {} 个文件，{} 字节（{}）\n"
+msgstr "{} files, {} bytes ({})\n"
+
+msgid "没有选择算法"
+msgstr "No algorithm selected"
+
+msgid "打开 {}"
+msgstr "Opening {}"
+
+
+# crates/onezip-core/src/http.rs
+msgid "创建 HTTP 客户端失败"
+msgstr "Couldn't create the HTTP client"
+
+msgid "连接 {} 失败"
+msgstr "Couldn't connect to {}"
+
+msgid "服务器返回 {} {}"
+msgstr "The server returned {} {}"
+
+msgid "下载不完整"
+msgstr "The download is incomplete"
+
+
+# crates/onezip-core/src/lib.rs
+msgid "{} 里已有 {} 个同名文件（例如 {}）。什么都没改动；如要替换请选择替换"
+msgstr "{} already has {} files with the same names (such as {}). Nothing was changed; choose Replace to overwrite them"
+
+
+# crates/onezip-core/src/local.rs
+msgid "这个压缩包里已经没有剩余内容"
+msgstr "Nothing is left in this archive"
+
+msgid "这个压缩包正解到一半，不能测试；继续解压即可完成"
+msgstr "This archive is half extracted and can't be tested; continue extracting to finish it"
+
+msgid "压缩包已损坏"
+msgstr "The archive is damaged"
+
+msgid "打开 {} 失败"
+msgstr "Couldn't open {}"
+
+msgid "嵌套超过 {} 层，停止继续拆包"
+msgstr "Nested more than {} levels deep; not unpacking further"
+
+msgid "解出的是压缩包 {}，继续解开"
+msgstr "The result is an archive, {}; extracting it too"
+
+msgid "没有继续拆开：{}"
+msgstr "Didn't unpack it further: {}"
+
+msgid "{}。可以改用保留原压缩包的方式解压"
+msgstr "{}. You can extract it while keeping the archive instead"
+
+msgid "正在预先校验整个压缩包…"
+msgstr "Verifying the whole archive first…"
+
+msgid "压缩包已损坏，没有解压任何文件"
+msgstr "The archive is damaged; nothing was extracted"
+
+msgid "已取消，压缩包没有任何改动"
+msgstr "Cancelled; the archive was not changed"
+
+msgid "空间不够：最忙时需要 {} 空闲（另留 {}），现在只有 {}"
+msgstr "Not enough space: at its peak this needs {} free (plus {} reserved), but only {} is free"
+
+msgid "。瓶颈是一个固实块，它只能整块解完才能释放"
+msgstr ". The bottleneck is a solid block, which can be freed only after all of it is extracted"
+
+msgid "。这个文件系统不支持在文件中间释放空间（如 FAT32/exFAT），压缩包要到最后才能删"
+msgstr ". This file system can't free space in the middle of a file (FAT32/exFAT, for example), so the archive can be deleted only at the end"
+
+msgid "。输出和压缩包不在同一个磁盘上，释放压缩包帮不上输出"
+msgstr ". The output and the archive are on different drives, so freeing the archive doesn't help the output"
+
+msgid "{}。什么都没改动"
+msgstr "{}. Nothing was changed"
+
+
+# crates/onezip-core/src/remote.rs
+msgid "这种格式的加密压缩包暂不支持"
+msgstr "Encrypted archives in this format aren't supported yet"
+
+msgid "解压 {} 失败"
+msgstr "Couldn't extract {}"
+
+msgid "从 {} 解压失败"
+msgstr "Couldn't extract from {}"
+
+msgid "无法从 URL 推断输出名，请指定输出位置"
+msgstr "Can't work out an output name from the URL; specify the output location"
+
+
+# crates/onezip-core/src/sevenzip/archive.rs
+msgid "压缩包已加密，需要密码"
+msgstr "The archive is encrypted and needs a password"
+
+msgid "密码不对"
+msgstr "Wrong password"
+
+msgid "已停止"
+msgstr "Stopped"
+
+msgid "7z.dll 不认识这个文件，可能不是压缩包或已经损坏"
+msgstr "7z.dll doesn't recognize this file; it may not be an archive, or it may be damaged"
+
+msgid "写入解出的文件"
+msgstr "Writing an extracted file"
+
+msgid "压缩包用了不支持的压缩方法"
+msgstr "The archive uses an unsupported compression method"
+
+msgid "数据校验失败（CRC 错误），压缩包可能已损坏"
+msgstr "Data check failed (CRC error); the archive may be damaged"
+
+msgid "数据错误，压缩包可能已损坏"
+msgstr "Data error; the archive may be damaged"
+
+msgid "压缩包不完整（数据提前结束）"
+msgstr "The archive is incomplete (the data ends early)"
+
+msgid "缺少分卷或数据不可用"
+msgstr "A volume is missing or data is unavailable"
+
+msgid "解压出错（代码 {}）"
+msgstr "Extraction error (code {})"
+
+msgid "7z.dll 解压失败：{}"
+msgstr "7z.dll extraction failed: {}"
+
+
+# crates/onezip-core/src/sevenzip/fetch.rs
+msgid "下载失败：{}"
+msgstr "Download failed: {}"
+
+msgid "区间无效"
+msgstr "Invalid range"
+
+msgid "连接提前断开（{} / {} 字节）"
+msgstr "The connection closed early ({} / {} bytes)"
+
+msgid "服务器不支持分段下载（Range），这种格式没法边下载边解压；请先下载下来再解压"
+msgstr "The server doesn't support ranged downloads, so this format can't be extracted while downloading; download it first, then extract"
+
+msgid "服务器没有告诉文件大小，没法边下载边解压"
+msgstr "The server didn't report the file size, so it can't be extracted while downloading"
+
+msgid "无法从 URL 得到文件名"
+msgstr "Can't get a file name from the URL"
+
+msgid "URL 无效"
+msgstr "Invalid URL"
+
+msgid "远程文件是空的"
+msgstr "The remote file is empty"
+
+msgid "远程文件和上次没下完时不一样了。请删除 {} 和 {} 后重新开始"
+msgstr "The remote file has changed since the unfinished download. Delete {} and {} and start again"
+
+msgid "清理 {}"
+msgstr "Cleaning up {}"
+
+msgid "保存下载进度失败：{}"
+msgstr "Couldn't save the download progress: {}"
+
+
+# crates/onezip-core/src/sevenzip/ffi.rs
+msgid "找不到 7z.dll（应在 OneZip.exe 旁边）"
+msgstr "Can't find 7z.dll (it should be next to OneZip.exe)"
+
+msgid "加载 {} 失败"
+msgstr "Couldn't load {}"
+
+msgid "7z.dll 缺少 CreateObject"
+msgstr "7z.dll lacks CreateObject"
+
+msgid "7z.dll 缺少 GetNumberOfFormats"
+msgstr "7z.dll lacks GetNumberOfFormats"
+
+msgid "7z.dll 缺少 GetHandlerProperty2"
+msgstr "7z.dll lacks GetHandlerProperty2"
+
+msgid "7z.dll 不能写 {} 格式"
+msgstr "7z.dll can't write the {} format"
+
+msgid "7z.dll 没有创建 {} 处理器"
+msgstr "7z.dll didn't create a {} handler"
+
+
+# crates/onezip-core/src/sevenzip/iso.rs
+msgid "镜像被截断（读到 {} 之外）"
+msgstr "The image is truncated (read past {})"
+
+msgid "读 UDF 目录失败"
+msgstr "Couldn't read the UDF directory"
+
+msgid "读 ISO9660 目录失败"
+msgstr "Couldn't read the ISO9660 directory"
+
+msgid "不是 ISO9660"
+msgstr "Not ISO9660"
+
+msgid "没有找到卷描述符"
+msgstr "No volume descriptor found"
+
+msgid "目录有环或嵌套太深"
+msgstr "The directory has a loop or is nested too deep"
+
+msgid "目录记录越界"
+msgstr "A directory record is out of bounds"
+
+msgid "没有 UDF 锚点"
+msgstr "No UDF anchor"
+
+msgid "不支持的 UDF 块大小"
+msgstr "Unsupported UDF block size"
+
+msgid "不支持的 UDF 分区映射（元数据分区、虚拟分区等）"
+msgstr "Unsupported UDF partition map (metadata partition, virtual partition, or similar)"
+
+msgid "没有分区描述符"
+msgstr "No partition descriptor"
+
+msgid "没有逻辑卷描述符"
+msgstr "No logical volume descriptor"
+
+msgid "文件集描述符不对"
+msgstr "Bad file set descriptor"
+
+msgid "文件项标记不对（{}）"
+msgstr "Bad file entry tag ({})"
+
+msgid "文件项越界"
+msgstr "A file entry is out of bounds"
+
+msgid "不支持的 UDF 分配描述符类型 {}"
+msgstr "Unsupported UDF allocation descriptor type {}"
+
+msgid "分配描述符链太长"
+msgstr "The allocation descriptor chain is too long"
+
+msgid "跨分区的 UDF 文件"
+msgstr "A UDF file spans partitions"
+
+msgid "分配扩展描述符不对"
+msgstr "Bad allocation extent descriptor"
+
+msgid "目录项标记不对"
+msgstr "Bad directory entry tag"
+
+msgid "目录项越界"
+msgstr "A directory entry is out of bounds"
+
+msgid "文件数据和目录信息挤在同一处，不能边解边删"
+msgstr "File data and directory information share the same place, so it can't be extracted while deleting"
+
+msgid "读不懂这个镜像的目录，不能边解边删；请用保留原文件的方式解压"
+msgstr "Can't read this image's directory, so it can't be extracted while deleting; extract it while keeping the original"
+
+msgid "已取消，镜像没有任何改动"
+msgstr "Cancelled; the image was not changed"
+
+msgid "这个磁盘不支持释放部分空间，镜像会在解压完成后删除"
+msgstr "This drive can't free part of a file, so the image is deleted when extraction finishes"
+
+msgid "删除 {}"
+msgstr "Deleting {}"
+
+
+# crates/onezip-core/src/sevenzip/layout.rs
+msgid "{} 格式不支持边解边删"
+msgstr "The {} format can't be extracted while deleting"
+
+msgid "数据区间重叠"
+msgstr "Data ranges overlap"
+
+msgid "数据区间超出文件"
+msgstr "A data range goes past the end of the file"
+
+msgid "条目 {} 出现在两个单元里"
+msgstr "Entry {} appears in two units"
+
+msgid "不是 CAB"
+msgstr "Not a CAB"
+
+msgid "分卷的 CAB 不能边解边删"
+msgstr "Multi-volume CABs can't be extracted while deleting"
+
+msgid "文件跨卷或属于不存在的文件夹"
+msgstr "A file spans volumes or belongs to a folder that doesn't exist"
+
+msgid "7z.dll 没有给出 {} 所在的文件夹"
+msgstr "7z.dll didn't give the folder of {}"
+
+msgid "CAB 文件夹 {} 有 {} 个文件，7z.dll 列出 {} 个"
+msgstr "CAB folder {} has {} files, but 7z.dll lists {}"
+
+msgid "CAB 文件夹 {} 偏移 {} 的文件大小和 7z.dll 列出的不一样"
+msgstr "The size of the file at offset {1} in CAB folder {0} differs from what 7z.dll lists"
+
+msgid "7z.dll 列出了 CAB 文件表里没有的文件夹"
+msgstr "7z.dll lists folders that aren't in the CAB's file table"
+
+msgid "不是 WIM"
+msgstr "Not a WIM"
+
+msgid "分卷的 WIM（.swm）不能边解边删"
+msgstr "Split WIMs (.swm) can't be extracted while deleting"
+
+msgid "压缩过的查找表暂不支持边解边删"
+msgstr "A compressed lookup table can't be extracted while deleting yet"
+
+msgid "固实流出现在固实资源之前"
+msgstr "A solid stream appears before its solid resource"
+
+msgid "7z.dll 没有给出 SHA-1"
+msgstr "7z.dll didn't give a SHA-1"
+
+msgid "SHA-1 长度不对"
+msgstr "Wrong SHA-1 length"
+
+msgid "{} 的数据不在查找表里"
+msgstr "The data of {} isn't in the lookup table"
+
+msgid "条目数和 7z.dll 列出的不一样（{} 对 {}）"
+msgstr "The number of entries differs from what 7z.dll lists ({} vs {})"
+
+msgid "第 {} 个条目（{}）和 7z.dll 列出的 {} 对不上"
+msgstr "Entry {} ({}) doesn't match {} listed by 7z.dll"
+
+msgid "ARJ 头被截断"
+msgstr "The ARJ header is truncated"
+
+msgid "ARJ 头标记不对"
+msgstr "Bad ARJ header marker"
+
+msgid "分卷的 ARJ 不能边解边删"
+msgstr "Multi-volume ARJs can't be extracted while deleting"
+
+msgid "ARJ 文件名没有结尾"
+msgstr "An ARJ file name isn't terminated"
+
+msgid "LZH 头不对"
+msgstr "Bad LZH header"
+
+msgid "LZH 文件名超出头"
+msgstr "An LZH file name runs past its header"
+
+msgid "LZH 扩展头越界"
+msgstr "An LZH extended header is out of bounds"
+
+msgid "不支持的 LZH 头级别 {}"
+msgstr "Unsupported LZH header level {}"
+
+
+# crates/onezip-core/src/sevenzip/mod.rs
+msgid "进度文件 {} 不是本版本写的，删掉它可以从头解压"
+msgstr "The progress file {} was written by another version; delete it to extract from the start"
+
+msgid "刷盘线程出错"
+msgstr "The disk flush thread failed"
+
+msgid "这种格式不能边解压边删除；请用保留原压缩包的方式解压"
+msgstr "This format can't be extracted while deleting; extract it while keeping the archive"
+
+msgid "读不懂这个压缩包的结构，不能边解边删；请用保留原压缩包的方式解压"
+msgstr "Can't read this archive's layout, so it can't be extracted while deleting; extract it while keeping the archive"
+
+msgid "这个磁盘不支持释放部分空间，原压缩包会在解压完成后删除"
+msgstr "This drive can't free part of a file, so the archive is deleted when extraction finishes"
+
+
+# crates/onezip-core/src/sevenzip/update.rs
+msgid "7z.dll 不支持 {} 格式"
+msgstr "7z.dll doesn't support the {} format"
+
+msgid "7z.dll 压缩失败：{}"
+msgstr "7z.dll compression failed: {}"
+
+msgid "7z.dll 不接受压缩参数"
+msgstr "7z.dll didn't accept the compression settings"
+
+msgid "7z.dll 不接受压缩参数：{}"
+msgstr "7z.dll didn't accept the compression settings: {}"
+
+msgid "压缩 {}：{}"
+msgstr "Compressing {}: {}"
+
+
+# crates/onezip-menu/src/lib.rs
+msgid "解压文件…"
+msgstr "Extract files…"
+
+msgid "解压后删除压缩包"
+msgstr "Extract, then delete the archive"
+
+msgid "测试压缩包"
+msgstr "Test archive"
+
+msgid "添加到压缩包…"
+msgstr "Add to archive…"
+
+msgid "添加到 7z 压缩包"
+msgstr "Add to 7z archive"
+
+msgid "添加到 zip 压缩包"
+msgstr "Add to zip archive"
+
+msgid "校验值（全部算法）"
+msgstr "Checksums (all algorithms)"
+
+msgid "解压到 \"{}\\\""
+msgstr "Extract to \"{}\\\""
+
+msgid "解压到各自的同名文件夹"
+msgstr "Extract each to a folder named after it"
+
+msgid "添加到 \"{}.7z\""
+msgstr "Add to \"{}.7z\""
+
+msgid "添加到 \"{}.zip\""
+msgstr "Add to \"{}.zip\""
+
+
+# crates/onezip-settings/src/assoc.rs
+msgid "{} 压缩包"
+msgstr "{} archive"
+
+msgid "用 OneZip 打开"
+msgstr "Open with OneZip"
+
+msgid "压缩、解压、浏览压缩包"
+msgstr "Compress, extract, and browse archives"
+
+
+# crates/onezip-setup/src/install.rs
+msgid "{} 正在被使用，无法替换"
+msgstr "{} is in use and can't be replaced"
+
+msgid "复制 {}"
+msgstr "Copying {}"
+
+msgid "无法安装到 {}，请换一个位置"
+msgstr "Can't install to {}; choose another location"
+
+msgid "无法写入 {}，请换一个位置"
+msgstr "Can't write to {}; choose another location"
+
+msgid "正在解出安装文件…"
+msgstr "Unpacking the installation files…"
+
+msgid "正在关闭 OneZip…"
+msgstr "Closing OneZip…"
+
+msgid "正在复制文件…"
+msgstr "Copying files…"
+
+msgid "正在注册右键菜单…"
+msgstr "Registering the context menu…"
+
+msgid "右键菜单需要信任 OneZip 的签名证书"
+msgstr "The context menu needs OneZip's signing certificate to be trusted"
+
+msgid "正在创建开始菜单快捷方式…"
+msgstr "Creating the Start menu shortcut…"
+
+
+# crates/onezip-setup/src/main.rs
+msgid "选择安装位置"
+msgstr "Choose the install location"
+
+msgid "安装 OneZip"
+msgstr "Install OneZip"
+
+msgid "OneZip 正在运行，安装时会把它关掉（没做完的边解压边删除任务以后可以接着做）。继续吗？"
+msgstr "OneZip is running and will be closed during installation (unfinished extract-while-deleting tasks can continue later). Continue?"
+
+msgid "卸载 OneZip"
+msgstr "Uninstall OneZip"
+
+msgid "没有找到已安装的 OneZip。"
+msgstr "No installed OneZip was found."
+
+msgid "请选择安装位置"
+msgstr "Choose an install location"
+
+msgid "请填写完整的路径，例如 D:\\Programs\\OneZip"
+msgstr "Enter a full path, such as D:\\Programs\\OneZip"
+
+msgid "路径里有不能用的字符"
+msgstr "The path contains characters that aren't allowed"
+
+msgid "{} 已经存在并且有别的文件，请换一个位置"
+msgstr "{} already exists and holds other files; choose another location"
+
+
+# crates/onezip-setup/src/payload.rs
+msgid "安装程序不完整"
+msgstr "The installer is incomplete"
+
+msgid "安装程序里没有找到要安装的文件（安装程序不完整，请重新下载）"
+msgstr "The installer contains no files to install (it's incomplete; download it again)"
+
+msgid "安装程序已损坏，请重新下载"
+msgstr "The installer is damaged; download it again"
+
+msgid "位置越界"
+msgstr "Position out of range"
+
+msgid "解出安装文件失败"
+msgstr "Couldn't unpack the installation files"
+
+msgid "写入 {}"
+msgstr "Writing {}"
+
+msgid "安装文件里缺少 OneZip.exe"
+msgstr "The installation files lack OneZip.exe"
+
+
+# crates/onezip-setup/src/sys.rs
+msgid "运行 {}"
+msgstr "Running {}"
+
+msgid "没有得到管理员确认"
+msgstr "Administrator approval wasn't given"
+
+msgid "管理员操作没有成功（{}）"
+msgstr "The administrator step failed ({})"
+
+msgid "icacls 失败（{}）"
+msgstr "icacls failed ({})"
+
+msgid "证书文件看不懂"
+msgstr "Can't read the certificate file"
+
+msgid "注册右键菜单失败：{}（{}）"
+msgstr "Couldn't register the context menu: {} ({})"
+
+msgid "卸载旧的右键菜单失败：{}（{}）"
+msgstr "Couldn't remove the old context menu: {} ({})"
+
+
+# crates/onezip-setup/src/uninstall.rs
+msgid "正在移除右键菜单…"
+msgstr "Removing the context menu…"
+
+msgid "正在删除文件…"
+msgstr "Deleting files…"
+
+msgid "正在删除设置…"
+msgstr "Deleting settings…"
+
+msgid "这些文件删不掉（可能正在被使用），可以稍后手动删除：\n{}"
+msgstr "These files couldn't be deleted (they may be in use); you can delete them by hand later:\n{}"
+
+
+# crates/onezip-setup/ui/setup.slint
+msgid "更新 OneZip {}"
+msgstr "Update OneZip {}"
+
+msgid "安装 OneZip {}"
+msgstr "Install OneZip {}"
+
+msgid "更新已安装的 OneZip。安装位置："
+msgstr "Update the installed OneZip. Location:"
+
+msgid "安装位置（只给当前用户安装）："
+msgstr "Install location (for the current user only):"
+
+msgid "将装到：{}"
+msgstr "Installs to: {}"
+
+msgid "装到需要管理员权限的文件夹（如 C:\\Program Files）时会弹一次管理员确认。"
+msgstr "Installing into a folder that needs administrator rights (such as C:\\Program Files) asks for administrator approval once."
+
+msgid "如果是第一次安装，会弹出一次管理员确认，用来信任右键菜单的签名证书。"
+msgstr "The first installation asks once for administrator approval to trust the context menu's signing certificate."
+
+msgid "正在更新…"
+msgstr "Updating…"
+
+msgid "正在安装…"
+msgstr "Installing…"
+
+msgid "安装完成。右键文件或文件夹，在菜单里的“OneZip”中使用。"
+msgstr "Installed. Right-click a file or folder and use \"OneZip\" in the menu."
+
+msgid "如果右键菜单里暂时没有 OneZip，重启一次资源管理器或注销后即可。"
+msgstr "If OneZip isn't in the context menu yet, restart File Explorer or sign out and back in."
+
+msgid "现在打开 OneZip"
+msgstr "Open OneZip now"
+
+msgid "安装没有完成："
+msgstr "Installation didn't finish:"
+
+msgid "安装"
+msgstr "Install"
+
+msgid "卸载 OneZip {}"
+msgstr "Uninstall OneZip {}"
+
+msgid "会移除 OneZip 的程序、右键菜单和开始菜单快捷方式。解压、压缩出来的文件不受影响；正在运行的 OneZip 会被关闭。"
+msgstr "This removes OneZip's program, context menu, and Start menu shortcut. Files you extracted or compressed aren't affected; a running OneZip is closed."
+
+msgid "同时删除 OneZip 的设置、保存的密码和出错记录"
+msgstr "Also delete OneZip's settings, saved passwords, and error log"
+
+msgid "正在卸载…"
+msgstr "Uninstalling…"
+
+msgid "OneZip 已卸载。"
+msgstr "OneZip has been uninstalled."
+
+msgid "卸载没有全部完成："
+msgstr "Uninstallation didn't fully finish:"
+
+msgid "卸载"
+msgstr "Uninstall"

@@ -3,6 +3,7 @@
 //! 先写到旁边的临时文件，完成后再改名为目标名，中途取消或出错不会留下半截压缩包，
 //! 也不会覆盖已有的同名文件（除非明确要求）。
 
+use onezip_i18n::t;
 use std::fs::{self, File};
 use std::io::{self, BufWriter, Read, Write};
 use std::num::NonZeroU64;
@@ -115,13 +116,13 @@ pub fn default_output(inputs: &[PathBuf], format: Format) -> Option<PathBuf> {
 
 pub fn compress(req: &CompressRequest, observer: Observer, stop: &Arc<AtomicBool>) -> Result<()> {
     if req.inputs.is_empty() {
-        bail!("没有要压缩的文件");
+        bail!(t!("没有要压缩的文件"));
     }
     if req.password.is_some() && !req.format.supports_password() {
-        bail!("{} 格式不支持密码，请改用 7z 或 zip", req.format.extension());
+        bail!(t!("{} 格式不支持密码，请改用 7z 或 zip", req.format.extension()));
     }
     if req.output.exists() && !req.overwrite {
-        bail!("{} 已存在", req.output.display());
+        bail!(t!("{} 已存在", req.output.display()));
     }
     let output = std::path::absolute(&req.output)?;
     let items = collect(&req.inputs, &output)?;
@@ -138,7 +139,7 @@ pub fn compress(req: &CompressRequest, observer: Observer, stop: &Arc<AtomicBool
             crate::sevenzip::compress(&tmp, name, sevenzip_items(&items), &sevenzip_options(req), &observer, stop)?;
             return finish_rename(req, &output, &tmp, stop);
         }
-        let file = File::create(&tmp).with_context(|| format!("创建 {}", tmp.display()))?;
+        let file = File::create(&tmp).with_context(|| t!("创建 {}", tmp.display()))?;
         // 多线程 LZMA2/XZ：进度由编码器按块报告。
         let threads = threads(req.threads);
         let encoder_reports = threads >= 2
@@ -255,7 +256,7 @@ pub struct Cancelled;
 
 impl std::fmt::Display for Cancelled {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str("已取消")
+        f.write_str(t!("已取消"))
     }
 }
 
@@ -369,10 +370,10 @@ fn collect(inputs: &[PathBuf], output: &Path) -> Result<Vec<Item>> {
     for input in inputs {
         let input = std::path::absolute(input)?;
         let meta = fs::symlink_metadata(&input)
-            .with_context(|| format!("读取 {}", input.display()))?;
+            .with_context(|| t!("读取 {}", input.display()))?;
         let name = input
             .file_name()
-            .with_context(|| format!("{} 没有文件名", input.display()))?
+            .with_context(|| t!("{} 没有文件名", input.display()))?
             .to_string_lossy()
             .into_owned();
         walk(&input, name, &meta, output, &mut items)?;
@@ -380,7 +381,7 @@ fn collect(inputs: &[PathBuf], output: &Path) -> Result<Vec<Item>> {
     let mut seen = std::collections::HashSet::new();
     for i in &items {
         if !seen.insert(i.name.to_lowercase()) {
-            bail!("压缩包里会出现重名的 {}", i.name);
+            bail!(t!("压缩包里会出现重名的 {}", i.name));
         }
     }
     Ok(items)
@@ -466,7 +467,7 @@ fn write_zip(file: File, items: &[Item], req: &CompressRequest, ctx: &Ctx) -> Re
         }
         zw.start_file(item.name.as_str(), opts)?;
         io::copy(&mut ctx.open(item)?, &mut zw)
-            .with_context(|| format!("压缩 {}", item.path.display()))?;
+            .with_context(|| t!("压缩 {}", item.path.display()))?;
     }
     finish(zw.finish()?)
 }
@@ -547,7 +548,7 @@ fn write_tar<W: Write>(enc: W, items: &[Item], ctx: &Ctx) -> Result<W> {
             h.set_mode(0o644);
             h.set_size(item.size);
             tar.append_data(&mut h, &item.name, ctx.open(item)?)
-                .with_context(|| format!("压缩 {}", item.path.display()))?;
+                .with_context(|| t!("压缩 {}", item.path.display()))?;
         }
     }
     Ok(tar.into_inner()?)

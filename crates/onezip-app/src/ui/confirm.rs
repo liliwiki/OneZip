@@ -1,6 +1,7 @@
 //! "边解压边删除压缩包"开始前的说明。设置里关掉"边解压边删除前确认"、或在对话框里
 //! 勾了"以后不再提醒"后就不再出现，直接开始。
 
+use onezip_i18n::t;
 use std::cell::RefCell;
 use std::path::PathBuf;
 use std::rc::Rc;
@@ -23,12 +24,12 @@ pub(super) fn in_place(app: &Rc<App>, paths: &[PathBuf], go: impl FnOnce(&Rc<App
     let Ok(d) = ConfirmDialog::new() else { return };
     d.set_heading(
         match paths {
-            [one] => format!("{} 会在解压过程中逐步删除", file_name(one)),
-            _ => format!("这 {} 个压缩包会在解压过程中逐步删除", paths.len()),
+            [one] => t!("{} 会在解压过程中逐步删除", file_name(one)),
+            _ => t!("这 {} 个压缩包会在解压过程中逐步删除", paths.len()),
         }
         .into(),
     );
-    d.set_detail("解压完成后压缩包不再存在，也不会进回收站。".into());
+    d.set_detail(t!("解压完成后压缩包不再存在，也不会进回收站。").into());
 
     let go: Rc<RefCell<Option<Go>>> = Rc::new(RefCell::new(Some(Box::new(go))));
     d.on_start({

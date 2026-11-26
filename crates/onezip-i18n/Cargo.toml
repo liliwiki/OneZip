@@ -1,0 +1,11 @@
+[package]
+name = "onezip-i18n"
+description = "OneZip's interface languages: Simplified Chinese (the source text) and English. One translation table, i18n/en.po, serves both the Rust code (t!) and the Slint windows (@tr)."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish = false
+
+[target."cfg(windows)".dependencies]
+windows = { version = "0.62", features = ["Win32_Globalization"] }

@@ -6,7 +6,7 @@
 
 **English** | [简体中文](README.zh-CN.md)
 
-An all-in-one archive tool for Windows: compress, extract smartly, extract in place while freeing the archive's space, and extract while downloading. It builds on the [HatchZip](https://github.com/xevrion/hatchzip) and [Peel](https://github.com/agouin/peel) engines and adds its menu to the first level of the Windows 11 context menu. The interface is in Simplified Chinese.
+An all-in-one archive tool for Windows: compress, extract smartly, extract in place while freeing the archive's space, and extract while downloading. It builds on the [HatchZip](https://github.com/xevrion/hatchzip) and [Peel](https://github.com/agouin/peel) engines and adds its menu to the first level of the Windows 11 context menu. The interface is in English and Simplified Chinese: it follows the Windows display language (Chinese for Chinese, English for everything else), and Settings → General → Language changes it.
 
 > OneZip is an independent project. It is not affiliated with NanaZip, 7-Zip, HatchZip, or Peel.
 
@@ -51,7 +51,7 @@ Requires Windows 10 or 11 (x64).
 
 ## Context menu
 
-Right-clicking an archive shows these items in the OneZip submenu (the labels are in Chinese):
+Right-clicking an archive shows these items in the OneZip submenu:
 
 - Smart extract / Extract to "name\" / Extract here / Extract files…
 - Extract, then delete the archive / Extract while deleting the archive

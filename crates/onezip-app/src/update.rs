@@ -4,6 +4,7 @@
 //! （第一列是十六进制 SHA-256）。核对不上就不运行。安装包用 `--update` 启动：
 //! 装到原来的位置、不问问题，装完重新打开 OneZip。
 
+use onezip_i18n::t;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::AtomicBool;
 
@@ -33,8 +34,8 @@ pub fn current() -> &'static str {
 
 /// 解析 GitHub `releases/latest` 的回答。
 pub fn parse(json: &[u8]) -> Result<Release> {
-    let v: Value = serde_json::from_slice(json).context("GitHub 的回答看不懂")?;
-    let tag = v["tag_name"].as_str().ok_or_else(|| anyhow!("没有版本号"))?;
+    let v: Value = serde_json::from_slice(json).context(t!("GitHub 的回答看不懂"))?;
+    let tag = v["tag_name"].as_str().ok_or_else(|| anyhow!(t!("没有版本号")))?;
     let version = tag.trim_start_matches(['v', 'V']).to_string();
     let assets = v["assets"].as_array().cloned().unwrap_or_default();
     let find = |suffix: &str| {
@@ -43,8 +44,8 @@ pub fn parse(json: &[u8]) -> Result<Release> {
             name.ends_with(suffix).then(|| a["browser_download_url"].as_str().map(str::to_string)).flatten()
         })
     };
-    let setup_url = find("-Setup.exe").ok_or_else(|| anyhow!("{tag} 里没有安装包"))?;
-    let sha_url = find("-Setup.exe.sha256").ok_or_else(|| anyhow!("{tag} 里没有安装包的 SHA-256"))?;
+    let setup_url = find("-Setup.exe").ok_or_else(|| anyhow!(t!("{} 里没有安装包", tag)))?;
+    let sha_url = find("-Setup.exe.sha256").ok_or_else(|| anyhow!(t!("{} 里没有安装包的 SHA-256", tag)))?;
     Ok(Release {
         version,
         page: v["html_url"].as_str().unwrap_or_default().to_string(),
@@ -82,7 +83,7 @@ fn from_page(url: &str) -> Result<Release> {
         .split_once("/releases/tag/")
         .map(|(_, t)| t.trim_end_matches('/'))
         .filter(|t| !t.is_empty() && !t.contains('/'))
-        .ok_or_else(|| anyhow!("还没有正式发布的版本"))?;
+        .ok_or_else(|| anyhow!(t!("还没有正式发布的版本")))?;
     let version = tag.trim_start_matches(['v', 'V']).to_string();
     let setup = format!("OneZip-{version}-Setup.exe");
     Ok(Release {
@@ -104,13 +105,13 @@ pub fn download(rel: &Release, progress: &dyn Fn(u64, Option<u64>), stop: &Atomi
     let sha_text = String::from_utf8_lossy(&onezip_core::http::get(&rel.sha_url)?).into_owned();
     let want = sha_text.split_whitespace().next().unwrap_or_default().to_ascii_lowercase();
     if want.len() != 64 {
-        bail!("SHA-256 文件格式不对");
+        bail!(t!("SHA-256 文件格式不对"));
     }
     onezip_core::http::download(&rel.setup_url, &path, progress, stop)?;
     let got = sha256(&path)?;
     if got != want {
         let _ = std::fs::remove_file(&path);
-        bail!("下载的安装包校验不对（SHA-256 不一致），已删除，没有安装");
+        bail!(t!("下载的安装包校验不对（SHA-256 不一致），已删除，没有安装"));
     }
     Ok(path)
 }
@@ -134,7 +135,7 @@ pub fn run_installer(setup: &Path) -> Result<()> {
     std::process::Command::new(setup)
         .arg("--update")
         .spawn()
-        .with_context(|| format!("启动 {} 失败", setup.display()))?;
+        .with_context(|| t!("启动 {} 失败", setup.display()))?;
     Ok(())
 }
 

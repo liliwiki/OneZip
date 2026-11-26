@@ -1,6 +1,7 @@
 //! 检查更新的界面部分：自动检查（主窗口打开时、每天最多一次）、手动检查、更新提示窗口、
 //! 下载进度，以及"报告问题"。网络都在后台线程，结果经通道交回界面线程（[`poll`]）。
 
+use onezip_i18n::t;
 use std::path::PathBuf;
 use std::rc::Rc;
 use std::sync::Arc;
@@ -109,11 +110,7 @@ pub(super) fn poll(app: &Rc<App>) {
                 if let Some((d, _)) = &app.update.borrow().dialog {
                     d.set_progress(total.map_or(-1.0, |t| done as f32 / t.max(1) as f32));
                     d.set_status(
-                        format!(
-                            "正在下载 {} / {}",
-                            onezip_core::human(done),
-                            total.map_or("?".into(), onezip_core::human)
-                        )
+                        t!("正在下载 {} / {}", onezip_core::human(done), total.map_or("?".into(), onezip_core::human))
                         .into(),
                     );
                 }
@@ -149,7 +146,7 @@ fn checked(app: &Rc<App>, manual: bool, result: Result<Release, String>) {
         }
         Ok(_) => app.update.borrow_mut().last = Last::UpToDate,
         Err(e) => {
-            crate::log::error(&format!("检查更新失败：{e}"));
+            crate::log::error(&t!("检查更新失败：{}", e));
             app.update.borrow_mut().last = Last::Failed(e);
         }
     }
@@ -167,22 +164,22 @@ pub(super) fn show_status(app: &Rc<App>, d: &SettingsWindow) {
     let st = app.update.borrow();
     let last_check = app.settings.borrow().last_check;
     let ago = match now().saturating_sub(last_check) {
-        _ if last_check == 0 => "还没有检查过".to_string(),
-        s if s < 120 => "上次检查：刚才".into(),
-        s if s < 3600 => format!("上次检查：{} 分钟前", s / 60),
-        s if s < 86_400 => format!("上次检查：{} 小时前", s / 3600),
-        s => format!("上次检查：{} 天前", s / 86_400),
+        _ if last_check == 0 => t!("还没有检查过").to_string(),
+        s if s < 120 => t!("上次检查：刚才").into(),
+        s if s < 3600 => t!("上次检查：{} 分钟前", s / 60),
+        s if s < 86_400 => t!("上次检查：{} 小时前", s / 3600),
+        s => t!("上次检查：{} 天前", s / 86_400),
     };
     let text = match &st.last {
         Last::Never => ago,
-        Last::Checking => "正在检查…".into(),
-        Last::UpToDate => format!("已是最新版 · {ago}"),
-        Last::Found(v) => format!("有新版本 {v} · {ago}"),
-        Last::Failed(e) => format!("检查失败：{e}"),
+        Last::Checking => t!("正在检查…").into(),
+        Last::UpToDate => t!("已是最新版 · {}", ago),
+        Last::Found(v) => t!("有新版本 {} · {}", v, ago),
+        Last::Failed(e) => t!("检查失败：{}", e),
     };
     d.set_update_status(text.into());
     d.set_checking(matches!(st.last, Last::Checking));
-    d.set_skipped(app.settings.borrow().skipped.join("、").into());
+    d.set_skipped(app.settings.borrow().skipped.join(t!("、")).into());
 }
 
 fn show(app: &Rc<App>, rel: Release, automatic: bool) {
@@ -190,9 +187,9 @@ fn show(app: &Rc<App>, rel: Release, automatic: bool) {
         let _ = old.hide();
     }
     let Ok(d) = UpdateDialog::new() else { return };
-    d.set_heading(format!("OneZip {} 已发布（你现在用的是 {}）", rel.version, update::current()).into());
+    d.set_heading(t!("OneZip {} 已发布（你现在用的是 {}）", rel.version, update::current()).into());
     d.set_notes(if rel.notes.trim().is_empty() {
-        format!("更新说明见发布页：\n{}", rel.page).into()
+        t!("更新说明见发布页：\n{}", rel.page).into()
     } else {
         rel.notes.clone().into()
     });
@@ -209,7 +206,7 @@ fn show(app: &Rc<App>, rel: Release, automatic: bool) {
                     d.set_busy(true);
                     d.set_failed(false);
                     d.set_progress(-1.0);
-                    d.set_status("还有任务在进行，等它们完成后自动开始更新…".into());
+                    d.set_status(t!("还有任务在进行，等它们完成后自动开始更新…").into());
                 }
             } else {
                 start_download(&app);
@@ -284,7 +281,7 @@ fn start_download(app: &Rc<App>) {
     d.set_busy(true);
     d.set_failed(false);
     d.set_progress(-1.0);
-    d.set_status("正在下载…".into());
+    d.set_status(t!("正在下载…").into());
     let rel = rel.clone();
     let stop = Arc::new(AtomicBool::new(false));
     st.downloading = Some(stop.clone());
@@ -315,22 +312,22 @@ fn downloaded(app: &Rc<App>, r: Result<PathBuf, String>) {
     let setup = match r {
         Ok(p) => p,
         Err(e) => {
-            crate::log::error(&format!("下载更新失败：{e}"));
+            crate::log::error(&t!("下载更新失败：{}", e));
             if let Some((d, _)) = &app.update.borrow().dialog {
                 d.set_busy(false);
                 d.set_failed(true);
-                d.set_status(format!("更新失败：{e}").into());
+                d.set_status(t!("更新失败：{}", e).into());
             }
             return;
         }
     };
-    crate::log::info(&format!("开始安装更新 {}", setup.display()));
+    crate::log::info(&t!("开始安装更新 {}", setup.display()));
     if let Err(e) = update::run_installer(&setup) {
         crate::log::error(&format!("{e:#}"));
         if let Some((d, _)) = &app.update.borrow().dialog {
             d.set_busy(false);
             d.set_failed(true);
-            d.set_status(format!("更新失败：{e:#}").into());
+            d.set_status(t!("更新失败：{}", format!("{:#}", e)).into());
         }
         return;
     }
@@ -347,13 +344,9 @@ pub(super) fn report_issue() {
         log = log.chars().rev().take(1500).collect::<Vec<_>>().into_iter().rev().collect();
     }
     if log.is_empty() {
-        log = "（没有出错记录）".into();
+        log = t!("（没有出错记录）").into();
     }
-    let body = format!(
-        "**OneZip 版本**：{}\n**Windows**：{}\n\n**发生了什么、怎么操作的**：\n\n\n**最近的出错记录**（可删改）：\n```\n{log}\n```\n",
-        update::current(),
-        crate::win::windows_version(),
-    );
+    let body = t!("**OneZip 版本**：{}\n**Windows**：{}\n\n**发生了什么、怎么操作的**：\n\n\n**最近的出错记录**（可删改）：\n```\n{}\n```\n", update::current(), crate::win::windows_version(), log);
     open_url(&format!("{GITHUB}/issues/new?body={}", percent_encode(&body)));
 }
 

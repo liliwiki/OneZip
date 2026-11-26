@@ -8,4 +8,5 @@ license.workspace = true
 publish = false
 
 [dependencies]
+onezip-i18n.workspace = true
 onezip-formats.workspace = true

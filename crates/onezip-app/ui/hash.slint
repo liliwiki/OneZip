@@ -3,7 +3,7 @@ import { ThemedWindow } from "theme.slint";
 
 /// 校验值结果（右键菜单 "CRC SHA"）。
 export component HashDialog inherits ThemedWindow {
-    title: "校验值";
+    title: @tr("校验值");
     preferred-width: 720px;
     preferred-height: 420px;
     min-width: 420px;
@@ -33,11 +33,11 @@ export component HashDialog inherits ThemedWindow {
                 horizontal-stretch: 1;
             }
             Button {
-                text: "复制";
+                text: @tr("复制");
                 clicked => { root.copy(); }
             }
             Button {
-                text: "关闭";
+                text: @tr("关闭");
                 primary: true;
                 clicked => { root.dismiss(); }
             }

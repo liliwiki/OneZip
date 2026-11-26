@@ -2,6 +2,7 @@
 //!
 //! 文件夹会递归展开；每个文件只读一遍，同时喂给所有选中的算法。
 
+use onezip_i18n::t;
 use std::fs::File;
 use std::io::Read;
 use std::path::{Path, PathBuf};
@@ -102,20 +103,15 @@ impl HashReport {
         let mut s = String::new();
         let width = self.kinds.iter().map(|k| k.name().len()).max().unwrap_or(0);
         for f in &self.files {
-            s.push_str(&format!("名称：{}\n", f.name));
-            s.push_str(&format!("大小：{} 字节（{}）\n", group(f.size), human(f.size)));
+            s.push_str(&t!("名称：{}\n", f.name));
+            s.push_str(&t!("大小：{} 字节（{}）\n", group(f.size), human(f.size)));
             for (k, d) in &f.digests {
                 s.push_str(&format!("{:<width$}  {d}\n", k.name()));
             }
             s.push('\n');
         }
         if self.files.len() > 1 {
-            s.push_str(&format!(
-                "共 {} 个文件，{} 字节（{}）\n",
-                self.files.len(),
-                group(self.total_size),
-                human(self.total_size)
-            ));
+            s.push_str(&t!("共 {} 个文件，{} 字节（{}）\n", self.files.len(), group(self.total_size), human(self.total_size)));
         }
         s
     }
@@ -188,7 +184,7 @@ fn hex(bytes: &[u8]) -> String {
 fn expand(paths: &[PathBuf]) -> Result<Vec<(String, PathBuf, u64)>> {
     fn walk(dir: &Path, prefix: &str, out: &mut Vec<(String, PathBuf, u64)>) -> Result<()> {
         let mut entries: Vec<_> = std::fs::read_dir(dir)
-            .with_context(|| format!("读取 {}", dir.display()))?
+            .with_context(|| t!("读取 {}", dir.display()))?
             .collect::<std::io::Result<_>>()?;
         entries.sort_by_key(|e| e.file_name());
         for e in entries {
@@ -204,7 +200,7 @@ fn expand(paths: &[PathBuf]) -> Result<Vec<(String, PathBuf, u64)>> {
     }
     let mut out = Vec::new();
     for p in paths {
-        let meta = std::fs::metadata(p).with_context(|| format!("读取 {}", p.display()))?;
+        let meta = std::fs::metadata(p).with_context(|| t!("读取 {}", p.display()))?;
         let name = p
             .file_name()
             .map(|n| n.to_string_lossy().into_owned())
@@ -226,7 +222,7 @@ pub fn hash(
     stop: &Arc<AtomicBool>,
 ) -> Result<HashReport> {
     if kinds.is_empty() {
-        bail!("没有选择算法");
+        bail!(t!("没有选择算法"));
     }
     let files = expand(paths)?;
     let total_size: u64 = files.iter().map(|f| f.2).sum();
@@ -237,7 +233,7 @@ pub fn hash(
     let mut buf = vec![0u8; 1 << 20];
     let mut out = Vec::with_capacity(files.len());
     for (name, path, _) in files {
-        let mut file = File::open(&path).with_context(|| format!("打开 {}", path.display()))?;
+        let mut file = File::open(&path).with_context(|| t!("打开 {}", path.display()))?;
         let mut hashers: Vec<Hasher> = kinds.iter().map(|&k| Hasher::new(k)).collect();
         let mut size = 0u64;
         loop {
@@ -246,7 +242,7 @@ pub fn hash(
             }
             let n = file
                 .read(&mut buf)
-                .with_context(|| format!("读取 {}", path.display()))?;
+                .with_context(|| t!("读取 {}", path.display()))?;
             if n == 0 {
                 break;
             }

@@ -192,7 +192,7 @@ export struct SavedPassword {
 // ---- 窗口 ----
 
 export component SettingsWindow inherits ThemedWindow {
-    title: "OneZip 设置";
+    title: @tr("OneZip 设置");
     preferred-width: 880px;
     preferred-height: 620px;
     min-width: 720px;
@@ -202,6 +202,8 @@ export component SettingsWindow inherits ThemedWindow {
 
     // 常规
     in-out property <int> theme-index: 0;
+    // 0 跟随系统，1 简体中文，2 English
+    in-out property <int> language-index: 0;
     // 解压
     in-out property <int> extract-mode;
     in-out property <int> conflict;
@@ -283,23 +285,23 @@ export component SettingsWindow inherits ThemedWindow {
                     height: 28px;
                 }
                 Text {
-                    text: "设置";
+                    text: @tr("设置");
                     font-size: 18px;
                     font-weight: 600;
                     vertical-alignment: center;
                 }
             }
-            NavItem { icon: "\u{E713}"; label: "常规"; selected: page == 0; clicked => { page = 0; } }
-            NavItem { icon: "\u{E8B7}"; label: "解压"; selected: page == 1; clicked => { page = 1; } }
-            NavItem { icon: "\u{E7B8}"; label: "压缩"; selected: page == 2; clicked => { page = 2; } }
-            NavItem { icon: "\u{E72E}"; label: "密码"; selected: page == 6; clicked => { page = 6; } }
-            NavItem { icon: "\u{E8A5}"; label: "文件关联"; selected: page == 7; clicked => { page = 7; root.assoc-refresh(); } }
-            NavItem { icon: "\u{E700}"; label: "右键菜单"; selected: page == 3; clicked => { page = 3; } }
-            NavItem { icon: "\u{E895}"; label: "更新"; selected: page == 4; clicked => { page = 4; } }
-            NavItem { icon: "\u{E946}"; label: "关于"; selected: page == 5; clicked => { page = 5; } }
+            NavItem { icon: "\u{E713}"; label: @tr("常规"); selected: page == 0; clicked => { page = 0; } }
+            NavItem { icon: "\u{E8B7}"; label: @tr("解压"); selected: page == 1; clicked => { page = 1; } }
+            NavItem { icon: "\u{E7B8}"; label: @tr("压缩"); selected: page == 2; clicked => { page = 2; } }
+            NavItem { icon: "\u{E72E}"; label: @tr("密码"); selected: page == 6; clicked => { page = 6; } }
+            NavItem { icon: "\u{E8A5}"; label: @tr("文件关联"); selected: page == 7; clicked => { page = 7; root.assoc-refresh(); } }
+            NavItem { icon: "\u{E700}"; label: @tr("右键菜单"); selected: page == 3; clicked => { page = 3; } }
+            NavItem { icon: "\u{E895}"; label: @tr("更新"); selected: page == 4; clicked => { page = 4; } }
+            NavItem { icon: "\u{E946}"; label: @tr("关于"); selected: page == 5; clicked => { page = 5; } }
             Rectangle { vertical-stretch: 1; }
             Note {
-                text: "设置改动立即生效";
+                text: @tr("设置改动立即生效");
                 horizontal-alignment: center;
             }
         }
@@ -310,26 +312,38 @@ export component SettingsWindow inherits ThemedWindow {
 
             // ---- 常规 ----
             if page == 0: Page {
-                title: "常规";
-                Section { text: "外观"; }
+                title: @tr("常规");
+                Section { text: @tr("外观"); }
                 Card {
                     icon: "\u{E790}";
-                    title: "主题";
-                    desc: "浅色、深色，或跟随 Windows 的设置";
+                    title: @tr("主题");
+                    desc: @tr("浅色、深色，或跟随 Windows 的设置");
                     ComboBox {
                         width: 160px;
-                        model: ["跟随系统", "浅色", "深色"];
+                        model: [@tr("跟随系统"), @tr("浅色"), @tr("深色")];
                         current-index <=> root.theme-index;
                         selected => { root.changed(); }
                     }
                 }
-                Section { text: "全部设置"; }
+                Card {
+                    icon: "\u{E774}";
+                    title: @tr("语言");
+                    desc: @tr("跟随系统时，Windows 是中文就用中文，其他语言都用英文");
+                    ComboBox {
+                        width: 160px;
+                        // 语言名字不翻译，用各自的写法
+                        model: [@tr("跟随系统"), "简体中文", "English"];
+                        current-index <=> root.language-index;
+                        selected => { root.changed(); }
+                    }
+                }
+                Section { text: @tr("全部设置"); }
                 Card {
                     icon: "\u{E777}";
-                    title: "恢复全部默认";
-                    desc: "所有页面的设置都回到刚安装时的样子";
+                    title: @tr("恢复全部默认");
+                    desc: @tr("所有页面的设置都回到刚安装时的样子");
                     Button {
-                        text: "恢复默认";
+                        text: @tr("恢复默认");
                         clicked => { root.reset-all(); }
                     }
                 }
@@ -337,59 +351,59 @@ export component SettingsWindow inherits ThemedWindow {
 
             // ---- 解压 ----
             if page == 1: Page {
-                title: "解压";
-                Section { text: "默认"; }
+                title: @tr("解压");
+                Section { text: @tr("默认"); }
                 Card {
-                    title: "默认解压方式";
-                    desc: "主窗口的“解压…”使用";
+                    title: @tr("默认解压方式");
+                    desc: @tr("主窗口的“解压…”使用");
                     ComboBox {
                         width: 190px;
-                        model: ["智能解压", "解压到同名文件夹", "解压到当前位置"];
+                        model: [@tr("智能解压"), @tr("解压到同名文件夹"), @tr("解压到当前位置")];
                         current-index <=> root.extract-mode;
                         selected => { root.changed(); }
                     }
                 }
                 Card {
-                    title: "遇到同名文件";
-                    desc: "目标位置已经有同名文件时怎么办";
+                    title: @tr("遇到同名文件");
+                    desc: @tr("目标位置已经有同名文件时怎么办");
                     ComboBox {
                         width: 190px;
-                        model: ["每次询问", "替换", "跳过", "自动改名（如 a (2).txt）"];
+                        model: [@tr("每次询问"), @tr("替换"), @tr("跳过"), @tr("自动改名（如 a (2).txt）")];
                         current-index <=> root.conflict;
                         selected => { root.changed(); }
                     }
                 }
                 Card {
-                    title: "解开里面套着的压缩包";
-                    desc: "压缩包里只有一个压缩包（如 .tar）时接着解开";
+                    title: @tr("解开里面套着的压缩包");
+                    desc: @tr("压缩包里只有一个压缩包（如 .tar）时接着解开");
                     Switch {
                         checked <=> root.nested;
                         toggled => { root.changed(); }
                     }
                 }
-                Section { text: "删除压缩包"; }
+                Section { text: @tr("删除压缩包"); }
                 Card {
-                    title: "解压后删除的压缩包";
-                    desc: "全部解压成功后才删除；出错时压缩包原样保留";
+                    title: @tr("解压后删除的压缩包");
+                    desc: @tr("全部解压成功后才删除；出错时压缩包原样保留");
                     ComboBox {
                         width: 190px;
-                        model: ["移到回收站", "直接删除"];
+                        model: [@tr("移到回收站"), @tr("直接删除")];
                         current-index <=> root.delete-mode;
                         selected => { root.changed(); }
                     }
                 }
                 Card {
-                    title: "边解压边删除前确认";
-                    desc: "压缩包会在解压过程中逐步删除，开始前说明一次；关掉后不再提醒";
+                    title: @tr("边解压边删除前确认");
+                    desc: @tr("压缩包会在解压过程中逐步删除，开始前说明一次；关掉后不再提醒");
                     Switch {
                         checked <=> root.confirm-in-place;
                         toggled => { root.changed(); }
                     }
                 }
-                Section { text: "边下载边解压"; }
+                Section { text: @tr("边下载边解压"); }
                 Card {
-                    title: "默认保存位置";
-                    desc: "从链接解压时，解出的文件放在这里";
+                    title: @tr("默认保存位置");
+                    desc: @tr("从链接解压时，解出的文件放在这里");
                     LineEdit {
                         width: 230px;
                         text <=> root.download-dir;
@@ -397,13 +411,13 @@ export component SettingsWindow inherits ThemedWindow {
                         edited => { root.changed(); }
                     }
                     Button {
-                        text: "浏览…";
+                        text: @tr("浏览…");
                         clicked => { root.browse-download(); }
                     }
                 }
                 Card {
-                    title: "同时下载的连接数";
-                    desc: "越多通常越快，服务器限制连接时请调小";
+                    title: @tr("同时下载的连接数");
+                    desc: @tr("越多通常越快，服务器限制连接时请调小");
                     SpinBox {
                         width: 110px;
                         minimum: 1;
@@ -416,12 +430,12 @@ export component SettingsWindow inherits ThemedWindow {
 
             // ---- 压缩 ----
             if page == 2: Page {
-                title: "压缩";
-                Note { text: "这里是默认值：“添加到压缩包…”对话框打开时用它们，右键“添加到 名字.7z / 名字.zip”直接按它们压缩。"; }
-                Section { text: "默认"; }
+                title: @tr("压缩");
+                Note { text: @tr("这里是默认值：“添加到压缩包…”对话框打开时用它们，右键“添加到 名字.7z / 名字.zip”直接按它们压缩。"); }
+                Section { text: @tr("默认"); }
                 Card {
-                    title: "默认格式";
-                    desc: "“添加到压缩包…”对话框里预先选中的格式";
+                    title: @tr("默认格式");
+                    desc: @tr("“添加到压缩包…”对话框里预先选中的格式");
                     ComboBox {
                         width: 160px;
                         model: root.formats;
@@ -430,18 +444,18 @@ export component SettingsWindow inherits ThemedWindow {
                     }
                 }
                 Card {
-                    title: "压缩级别";
-                    desc: "越高压得越小，也越慢";
+                    title: @tr("压缩级别");
+                    desc: @tr("越高压得越小，也越慢");
                     ComboBox {
                         width: 160px;
-                        model: ["仅存储", "最快", "快速", "标准", "最大", "极限"];
+                        model: [@tr("仅存储"), @tr("最快"), @tr("快速"), @tr("标准"), @tr("最大"), @tr("极限")];
                         current-index <=> root.level-index;
                         selected => { root.changed(); }
                     }
                 }
                 Card {
-                    title: "使用的线程数";
-                    desc: "7z、tar.xz、tar.zst 可以多线程压缩";
+                    title: @tr("使用的线程数");
+                    desc: @tr("7z、tar.xz、tar.zst 可以多线程压缩");
                     ComboBox {
                         width: 160px;
                         model: root.thread-choices;
@@ -451,16 +465,16 @@ export component SettingsWindow inherits ThemedWindow {
                 }
                 Section { text: "7z"; }
                 Card {
-                    title: "固实压缩";
-                    desc: "压缩率更高，但取出单个文件要先解开前面的数据";
+                    title: @tr("固实压缩");
+                    desc: @tr("压缩率更高，但取出单个文件要先解开前面的数据");
                     Switch {
                         checked <=> root.solid;
                         toggled => { root.changed(); }
                     }
                 }
                 Card {
-                    title: "设了密码时加密文件名";
-                    desc: "不输密码就看不到压缩包里有哪些文件";
+                    title: @tr("设了密码时加密文件名");
+                    desc: @tr("不输密码就看不到压缩包里有哪些文件");
                     Switch {
                         checked <=> root.encrypt-names;
                         toggled => { root.changed(); }
@@ -470,21 +484,21 @@ export component SettingsWindow inherits ThemedWindow {
 
             // ---- 密码 ----
             if page == 6: Page {
-                title: "密码";
-                Note { text: "解压加密的压缩包时，先自动试这里的密码（最近用过的先试），都不对才弹出密码框。在密码框里勾选“记住这个密码”，解压成功后就会保存到这里。"; }
-                Section { text: "添加"; }
+                title: @tr("密码");
+                Note { text: @tr("解压加密的压缩包时，先自动试这里的密码（最近用过的先试），都不对才弹出密码框。在密码框里勾选“记住这个密码”，解压成功后就会保存到这里。"); }
+                Section { text: @tr("添加"); }
                 Card {
-                    title: "保存一个密码";
-                    desc: "保存前不检查它对不对";
+                    title: @tr("保存一个密码");
+                    desc: @tr("保存前不检查它对不对");
                     LineEdit {
                         width: 230px;
                         input-type: InputType.password;
-                        placeholder-text: "输入密码";
+                        placeholder-text: @tr("输入密码");
                         text <=> root.new-password;
                         accepted => { root.add-password(); }
                     }
                     Button {
-                        text: "保存";
+                        text: @tr("保存");
                         enabled: root.new-password != "";
                         clicked => { root.add-password(); }
                     }
@@ -492,13 +506,13 @@ export component SettingsWindow inherits ThemedWindow {
                 HorizontalLayout {
                     spacing: 8px;
                     Section {
-                        text: "已保存的密码（" + root.saved-passwords.length + "）";
+                        text: @tr("已保存的密码（{}）", root.saved-passwords.length);
                         horizontal-stretch: 1;
                     }
                     VerticalLayout {
                         alignment: end;
                         Button {
-                            text: root.verifying ? "正在验证…" : root.passwords-shown ? "隐藏密码" : "显示密码";
+                            text: root.verifying ? @tr("正在验证…") : root.passwords-shown ? @tr("隐藏密码") : @tr("显示密码");
                             enabled: !root.verifying && root.saved-passwords.length > 0;
                             clicked => { root.toggle-passwords(); }
                         }
@@ -506,14 +520,14 @@ export component SettingsWindow inherits ThemedWindow {
                     VerticalLayout {
                         alignment: end;
                         Button {
-                            text: "全部删除";
+                            text: @tr("全部删除");
                             enabled: root.saved-passwords.length > 0;
                             clicked => { root.remove-all-passwords(); }
                         }
                     }
                 }
                 Panel {
-                    if root.saved-passwords.length == 0: Note { text: "还没有保存的密码"; }
+                    if root.saved-passwords.length == 0: Note { text: @tr("还没有保存的密码"); }
                     for p[i] in root.saved-passwords: HorizontalLayout {
                         spacing: 12px;
                         Text {
@@ -530,44 +544,44 @@ export component SettingsWindow inherits ThemedWindow {
                             overflow: elide;
                         }
                         Button {
-                            text: "删除";
+                            text: @tr("删除");
                             clicked => { root.remove-password(i); }
                         }
                     }
                 }
-                Note { text: "密码用 Windows 加密后保存在本机，只有当前 Windows 用户能解开。显示密码前要先验证 Windows 身份（PIN、指纹、人脸或登录密码）。卸载 OneZip 时可以选择一并删除。"; }
+                Note { text: @tr("密码用 Windows 加密后保存在本机，只有当前 Windows 用户能解开。显示密码前要先验证 Windows 身份（PIN、指纹、人脸或登录密码）。卸载 OneZip 时可以选择一并删除。"); }
             }
 
             // ---- 文件关联 ----
             if page == 7: Page {
-                title: "文件关联";
-                Note { text: "勾选的格式双击时用 OneZip 打开：先看到里面有哪些文件，再选择解压、打开或拖出来。只影响当前 Windows 用户，取消勾选会还原成原来的打开方式。"; }
+                title: @tr("文件关联");
+                Note { text: @tr("勾选的格式双击时用 OneZip 打开：先看到里面有哪些文件，再选择解压、打开或拖出来。只影响当前 Windows 用户，取消勾选会还原成原来的打开方式。"); }
                 if root.assoc-overridden != "": Card {
                     icon: "\u{E7BA}";
-                    title: "这些格式双击时还不会直接用 OneZip 打开：" + root.assoc-overridden;
-                    desc: "Windows 要你自己确认：第一次双击时它会问用什么打开，选 OneZip 再点“始终”；也可以现在到 Windows 设置里改成 OneZip。";
+                    title: @tr("这些格式双击时还不会直接用 OneZip 打开：{}", root.assoc-overridden);
+                    desc: @tr("Windows 要你自己确认：第一次双击时它会问用什么打开，选 OneZip 再点“始终”；也可以现在到 Windows 设置里改成 OneZip。");
                     Button {
-                        text: "打开 Windows 设置";
+                        text: @tr("打开 Windows 设置");
                         clicked => { root.open-default-apps(); }
                     }
                 }
                 HorizontalLayout {
                     spacing: 8px;
                     Section {
-                        text: "压缩包";
+                        text: @tr("压缩包");
                         horizontal-stretch: 1;
                     }
                     VerticalLayout {
                         alignment: end;
                         Button {
-                            text: "选择常用的";
+                            text: @tr("选择常用的");
                             clicked => { root.assoc-common(); }
                         }
                     }
                     VerticalLayout {
                         alignment: end;
                         Button {
-                            text: "全部取消";
+                            text: @tr("全部取消");
                             clicked => { root.assoc-none(); }
                         }
                     }
@@ -576,8 +590,8 @@ export component SettingsWindow inherits ThemedWindow {
                     rows: root.assoc-archives;
                     toggled(id, on) => { root.assoc-toggled(id, on); }
                 }
-                Section { text: "磁盘镜像等"; }
-                Note { text: "Windows 自己能打开或挂载这些文件；关联后双击改成用 OneZip 看里面的文件。"; }
+                Section { text: @tr("磁盘镜像等"); }
+                Note { text: @tr("Windows 自己能打开或挂载这些文件；关联后双击改成用 OneZip 看里面的文件。"); }
                 AssocGrid {
                     rows: root.assoc-images;
                     toggled(id, on) => { root.assoc-toggled(id, on); }
@@ -586,23 +600,23 @@ export component SettingsWindow inherits ThemedWindow {
 
             // ---- 右键菜单 ----
             if page == 3: Page {
-                title: "右键菜单";
+                title: @tr("右键菜单");
                 Card {
                     icon: "\u{E700}";
-                    title: "在右键菜单里显示 OneZip";
-                    desc: "Windows 11 在第一层，Windows 10 在传统菜单里";
+                    title: @tr("在右键菜单里显示 OneZip");
+                    desc: @tr("Windows 11 在第一层，Windows 10 在传统菜单里");
                     Switch {
                         checked <=> root.menu-enabled;
                         toggled => { root.changed(); }
                     }
                 }
-                Section { text: "右键压缩包时显示"; }
+                Section { text: @tr("右键压缩包时显示"); }
                 MenuGrid {
                     rows: root.archive-items;
                     enabled: root.menu-enabled;
                     toggled(id, on) => { root.menu-toggled(id, on); }
                 }
-                Section { text: "右键任意文件、文件夹时显示"; }
+                Section { text: @tr("右键任意文件、文件夹时显示"); }
                 MenuGrid {
                     rows: root.file-items;
                     enabled: root.menu-enabled;
@@ -612,12 +626,12 @@ export component SettingsWindow inherits ThemedWindow {
                     padding-top: 6px;
                     spacing: 12px;
                     Note {
-                        text: "Windows 11 只允许每个程序在第一层放一项，所以这些都在“OneZip”子菜单里。";
+                        text: @tr("Windows 11 只允许每个程序在第一层放一项，所以这些都在“OneZip”子菜单里。");
                         vertical-alignment: center;
                         horizontal-stretch: 1;
                     }
                     Button {
-                        text: "恢复默认";
+                        text: @tr("恢复默认");
                         clicked => { root.reset-menu(); }
                     }
                 }
@@ -625,45 +639,45 @@ export component SettingsWindow inherits ThemedWindow {
 
             // ---- 更新 ----
             if page == 4: Page {
-                title: "更新";
+                title: @tr("更新");
                 Card {
                     icon: "\u{E895}";
                     title: "OneZip " + root.version;
                     desc: root.update-status;
                     Button {
-                        text: root.checking ? "正在检查…" : "检查更新";
+                        text: root.checking ? @tr("正在检查…") : @tr("检查更新");
                         primary: true;
                         enabled: !root.checking;
                         clicked => { root.check-update(); }
                     }
                 }
                 Card {
-                    title: "自动检查更新";
-                    desc: "打开 OneZip 主窗口时检查，每天最多一次，只连接 GitHub";
+                    title: @tr("自动检查更新");
+                    desc: @tr("打开 OneZip 主窗口时检查，每天最多一次，只连接 GitHub");
                     Switch {
                         checked <=> root.auto-update;
                         toggled => { root.changed(); }
                     }
                 }
                 Card {
-                    title: "已跳过的版本";
-                    desc: "在更新提示里选了“跳过这个版本”的版本不再提示";
+                    title: @tr("已跳过的版本");
+                    desc: @tr("在更新提示里选了“跳过这个版本”的版本不再提示");
                     Text {
-                        text: root.skipped == "" ? "无" : root.skipped;
+                        text: root.skipped == "" ? @tr("无") : root.skipped;
                         vertical-alignment: center;
                         opacity: 0.65;
                     }
                     Button {
-                        text: "清除";
+                        text: @tr("清除");
                         enabled: root.skipped != "";
                         clicked => { root.clear-skipped(); }
                     }
                 }
                 Card {
-                    title: "更新说明";
-                    desc: "在浏览器里查看各个版本的更新内容";
+                    title: @tr("更新说明");
+                    desc: @tr("在浏览器里查看各个版本的更新内容");
                     Button {
-                        text: "打开发布页";
+                        text: @tr("打开发布页");
                         clicked => { root.open-releases(); }
                     }
                 }
@@ -671,7 +685,7 @@ export component SettingsWindow inherits ThemedWindow {
 
             // ---- 关于 ----
             if page == 5: Page {
-                title: "关于";
+                title: @tr("关于");
                 Panel {
                     HorizontalLayout {
                         spacing: 18px;
@@ -688,36 +702,36 @@ export component SettingsWindow inherits ThemedWindow {
                                 font-size: 20px;
                                 font-weight: 600;
                             }
-                            Note { text: "压缩、解压、边解压边释放空间、边下载边解压"; }
-                            Note { text: "MIT 许可证 · github.com/liliwiki/OneZip"; }
+                            Note { text: @tr("压缩、解压、边解压边释放空间、边下载边解压"); }
+                            Note { text: @tr("MIT 许可证 · github.com/liliwiki/OneZip"); }
                         }
                     }
                 }
-                Section { text: "用到的开源项目"; }
+                Section { text: @tr("用到的开源项目"); }
                 Panel {
-                    Text { text: "HatchZip —— 边解压边删除、zip / 7z / tar / rar 解压（UnRAR）"; }
-                    Text { text: "Peel —— 边下载边解压"; }
-                    Text { text: "7-Zip（7z.dll）—— 保留原包解压，以及 iso、wim、cab、dmg、vhd、msi 等格式"; }
-                    Text { text: "Slint —— 界面"; }
+                    Text { text: @tr("HatchZip —— 边解压边删除、zip / 7z / tar / rar 解压（UnRAR）"); }
+                    Text { text: @tr("Peel —— 边下载边解压"); }
+                    Text { text: @tr("7-Zip（7z.dll）—— 保留原包解压，以及 iso、wim、cab、dmg、vhd、msi 等格式"); }
+                    Text { text: @tr("Slint —— 界面"); }
                 }
                 HorizontalLayout {
                     padding-top: 8px;
                     spacing: 8px;
                     alignment: start;
                     Button {
-                        text: "GitHub 主页";
+                        text: @tr("GitHub 主页");
                         clicked => { root.open-github(); }
                     }
                     Button {
-                        text: "许可证与第三方声明";
+                        text: @tr("许可证与第三方声明");
                         clicked => { root.open-licenses(); }
                     }
                     Button {
-                        text: "报告问题";
+                        text: @tr("报告问题");
                         clicked => { root.report-issue(); }
                     }
                 }
-                Note { text: "“报告问题”会在浏览器里打开 GitHub 的新问题页，自动填好版本号和最近的出错记录；提交前可以先看、可以删改。"; }
+                Note { text: @tr("“报告问题”会在浏览器里打开 GitHub 的新问题页，自动填好版本号和最近的出错记录；提交前可以先看、可以删改。"); }
             }
         }
     }

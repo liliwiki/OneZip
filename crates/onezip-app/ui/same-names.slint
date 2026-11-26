@@ -4,7 +4,7 @@ import { ThemedWindow } from "theme.slint";
 import { Note } from "settings.slint";
 
 export component SameNamesDialog inherits ThemedWindow {
-    title: "目标位置有同名文件";
+    title: @tr("目标位置有同名文件");
     width: 600px;
 
     in property <string> heading;
@@ -56,10 +56,10 @@ export component SameNamesDialog inherits ThemedWindow {
         HorizontalLayout {
             spacing: 8px;
             alignment: end;
-            Button { text: "全部替换"; clicked => { root.replace(); } }
-            Button { text: "全部跳过"; clicked => { root.skip(); } }
-            Button { text: "都保留（新的改名）"; primary: true; clicked => { root.rename(); } }
-            Button { text: "取消"; width: 80px; clicked => { root.cancel(); } }
+            Button { text: @tr("全部替换"); clicked => { root.replace(); } }
+            Button { text: @tr("全部跳过"); clicked => { root.skip(); } }
+            Button { text: @tr("都保留（新的改名）"); primary: true; clicked => { root.rename(); } }
+            Button { text: @tr("取消"); width: 80px; clicked => { root.cancel(); } }
         }
     }
 }

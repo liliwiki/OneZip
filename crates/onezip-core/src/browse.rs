@@ -51,6 +51,7 @@ fn picked(path: &str, picks: &[String]) -> bool {
 
 #[cfg(windows)]
 mod imp {
+    use onezip_i18n::t;
     use std::collections::HashMap;
     use std::fs;
 
@@ -89,7 +90,7 @@ mod imp {
             }
         }
         if files.is_empty() && dirs.is_empty() {
-            bail!("没有选中要解压的项");
+            bail!(t!("没有选中要解压的项"));
         }
 
         // 同名文件：先全部查出来再决定，什么都没动之前就能停下。
@@ -153,14 +154,15 @@ mod imp {
 
 #[cfg(not(windows))]
 mod imp {
+    use onezip_i18n::t;
     use super::*;
 
     pub fn items(_archive: &Path, _password: Option<String>) -> Result<Vec<Item>> {
-        anyhow::bail!("浏览压缩包只支持 Windows")
+        anyhow::bail!(t!("浏览压缩包只支持 Windows"))
     }
 
     pub fn extract(_req: &PickRequest, _observer: Observer, _stop: &Arc<AtomicBool>) -> Result<PathBuf> {
-        anyhow::bail!("浏览压缩包只支持 Windows")
+        anyhow::bail!(t!("浏览压缩包只支持 Windows"))
     }
 }
 

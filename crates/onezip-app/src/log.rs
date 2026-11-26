@@ -1,6 +1,7 @@
 //! 出错记录：`%LOCALAPPDATA%\OneZip\onezip.log`，只记出错和少量关键事件。
 //! 超过 512 KB 时把旧的改名为 `onezip.old.log`，只留这两份。设置里的"报告问题"会附上最近几条。
 
+use onezip_i18n::t;
 use std::fs::{self, OpenOptions};
 use std::io::Write;
 use std::path::PathBuf;
@@ -18,12 +19,12 @@ pub fn path() -> Option<PathBuf> {
 
 /// 记一条出错。写日志本身失败时什么也不做（不能因为日志让程序出错）。
 pub fn error(msg: &str) {
-    write("错误", msg);
+    write(t!("错误"), msg);
 }
 
 /// 记一条值得留意的事件（如开始更新）。
 pub fn info(msg: &str) {
-    write("信息", msg);
+    write(t!("信息"), msg);
 }
 
 fn write(level: &str, msg: &str) {
@@ -74,7 +75,7 @@ fn utc_text(secs: u64) -> String {
 pub fn install_panic_hook() {
     let previous = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |info| {
-        error(&format!("程序崩溃：{info}"));
+        error(&t!("程序崩溃：{}", info));
         previous(info);
     }));
 }

@@ -8,6 +8,7 @@
 //!
 //! 普通（保留原文件）解压不走这里，交给 7z.dll。
 
+use onezip_i18n::t;
 use std::collections::HashSet;
 use std::fs::{self, File, OpenOptions};
 use std::io::{Read, Seek, SeekFrom, Write};
@@ -53,7 +54,7 @@ impl Reader {
         self.bytes(n * SECTOR, SECTOR as usize)
     }
     fn bytes(&mut self, pos: u64, len: usize) -> Result<Vec<u8>> {
-        ensure!(pos + len as u64 <= self.len, "镜像被截断（读到 {} 之外）", pos + len as u64);
+        ensure!(pos + len as u64 <= self.len, t!("镜像被截断（读到 {} 之外）", pos + len as u64));
         let mut b = vec![0u8; len];
         self.f.seek(SeekFrom::Start(pos))?;
         self.f.read_exact(&mut b)?;
@@ -108,9 +109,9 @@ fn open(path: &Path) -> Result<Image> {
         }
     }
     let mut img = if udf {
-        udf_open(&mut r).context("读 UDF 目录失败")?
+        udf_open(&mut r).context(t!("读 UDF 目录失败"))?
     } else {
-        iso9660_open(&mut r).context("读 ISO9660 目录失败")?
+        iso9660_open(&mut r).context(t!("读 ISO9660 目录失败"))?
     };
     img.meta = std::mem::take(&mut r.meta);
     Ok(img)
@@ -123,7 +124,7 @@ fn iso9660_open(r: &mut Reader) -> Result<Image> {
     let mut joliet = None;
     for n in 16..64u64 {
         let s = r.sector(n)?;
-        ensure!(&s[1..6] == b"CD001", "不是 ISO9660");
+        ensure!(&s[1..6] == b"CD001", t!("不是 ISO9660"));
         match s[0] {
             1 => primary = Some(s),
             2 if &s[88..90] == b"%/" && matches!(s[90], b'@' | b'C' | b'E') => joliet = Some(s),
@@ -134,7 +135,7 @@ fn iso9660_open(r: &mut Reader) -> Result<Image> {
     let (desc, is_joliet) = match (joliet, primary) {
         (Some(j), _) => (j, true),
         (None, Some(p)) => (p, false),
-        _ => bail!("没有找到卷描述符"),
+        _ => bail!(t!("没有找到卷描述符")),
     };
     let root = &desc[156..190];
     let mut img = Image { files: Vec::new(), dirs: Vec::new(), meta: Vec::new() };
@@ -154,7 +155,7 @@ fn walk_iso(
     seen: &mut HashSet<u64>,
     depth: usize,
 ) -> Result<()> {
-    ensure!(depth < 64 && seen.insert(lba), "目录有环或嵌套太深");
+    ensure!(depth < 64 && seen.insert(lba), t!("目录有环或嵌套太深"));
     let data = r.bytes(lba * SECTOR, size as usize)?;
     let mut p = 0usize;
     let mut pending: Option<IsoFile> = None;
@@ -164,7 +165,7 @@ fn walk_iso(
             p = (p / SECTOR as usize + 1) * SECTOR as usize; // 下一扇区
             continue;
         }
-        ensure!(p + len <= data.len() && len >= 34, "目录记录越界");
+        ensure!(p + len <= data.len() && len >= 34, t!("目录记录越界"));
         let rec = &data[p..p + len];
         p += len;
         let nlen = rec[32] as usize;
@@ -230,7 +231,7 @@ struct Udf {
 
 fn udf_open(r: &mut Reader) -> Result<Image> {
     let avdp = r.sector(256)?;
-    ensure!(u16le(&avdp, 0) == 2, "没有 UDF 锚点");
+    ensure!(u16le(&avdp, 0) == 2, t!("没有 UDF 锚点"));
     let vds_len = u32le(&avdp, 16) as u64;
     let vds_loc = u32le(&avdp, 20) as u64;
     let mut part = None;
@@ -240,13 +241,13 @@ fn udf_open(r: &mut Reader) -> Result<Image> {
         match u16le(&s, 0) {
             5 => part = Some(u32le(&s, 188) as u64),
             6 => {
-                ensure!(u32le(&s, 212) as u64 == SECTOR, "不支持的 UDF 块大小");
+                ensure!(u32le(&s, 212) as u64 == SECTOR, t!("不支持的 UDF 块大小"));
                 let nmaps = u32le(&s, 268);
                 let mut p = 440;
                 for _ in 0..nmaps {
                     let kind = s[p];
                     let len = s[p + 1] as usize;
-                    ensure!(kind == 1, "不支持的 UDF 分区映射（元数据分区、虚拟分区等）");
+                    ensure!(kind == 1, t!("不支持的 UDF 分区映射（元数据分区、虚拟分区等）"));
                     p += len.max(6);
                 }
                 fsd_lbn = Some(u32le(&s, 252) as u64);
@@ -255,9 +256,9 @@ fn udf_open(r: &mut Reader) -> Result<Image> {
             _ => {}
         }
     }
-    let u = Udf { part_start: part.context("没有分区描述符")? };
-    let fsd = r.sector(u.part_start + fsd_lbn.context("没有逻辑卷描述符")?)?;
-    ensure!(u16le(&fsd, 0) == 256, "文件集描述符不对");
+    let u = Udf { part_start: part.context(t!("没有分区描述符"))? };
+    let fsd = r.sector(u.part_start + fsd_lbn.context(t!("没有逻辑卷描述符"))?)?;
+    ensure!(u16le(&fsd, 0) == 256, t!("文件集描述符不对"));
     let root_lbn = u32le(&fsd, 404) as u64;
     let mut img = Image { files: Vec::new(), dirs: Vec::new(), meta: Vec::new() };
     let mut seen = HashSet::new();
@@ -285,7 +286,7 @@ fn udf_fe(r: &mut Reader, u: &Udf, lbn: u64) -> Result<Fe> {
     let (l_ea_at, base, mt) = match tag {
         261 => (168, 176, 84),
         266 => (208, 216, 92),
-        _ => bail!("文件项标记不对（{tag}）"),
+        _ => bail!(t!("文件项标记不对（{}）", tag)),
     };
     let kind = s[27];
     let ad_type = u16le(&s, 34) & 7;
@@ -293,19 +294,19 @@ fn udf_fe(r: &mut Reader, u: &Udf, lbn: u64) -> Result<Fe> {
     let l_ea = u32le(&s, l_ea_at) as usize;
     let l_ad = u32le(&s, l_ea_at + 4) as usize;
     let start = base + l_ea;
-    ensure!(start + l_ad <= s.len(), "文件项越界");
+    ensure!(start + l_ad <= s.len(), t!("文件项越界"));
     let ads = s[start..start + l_ad].to_vec();
     let mut fe = Fe { kind, size, extents: Vec::new(), embedded: None, mtime: udf_time(&s[mt..mt + 12]) };
     match ad_type {
         3 => fe.embedded = Some(ads[..(size as usize).min(ads.len())].to_vec()),
         0 | 1 => read_ads(r, u, &ads, ad_type, &mut fe.extents, 0)?,
-        _ => bail!("不支持的 UDF 分配描述符类型 {ad_type}"),
+        _ => bail!(t!("不支持的 UDF 分配描述符类型 {}", ad_type)),
     }
     Ok(fe)
 }
 
 fn read_ads(r: &mut Reader, u: &Udf, ads: &[u8], ad_type: u16, out: &mut Vec<(u64, u64, bool)>, depth: usize) -> Result<()> {
-    ensure!(depth < 16, "分配描述符链太长");
+    ensure!(depth < 16, t!("分配描述符链太长"));
     let step = if ad_type == 0 { 8 } else { 16 };
     for ad in ads.chunks_exact(step) {
         let raw = u32le(ad, 0);
@@ -316,7 +317,7 @@ fn read_ads(r: &mut Reader, u: &Udf, ads: &[u8], ad_type: u16, out: &mut Vec<(u6
             break;
         }
         if ad_type == 1 {
-            ensure!(u16le(ad, 8) == 0, "跨分区的 UDF 文件");
+            ensure!(u16le(ad, 8) == 0, t!("跨分区的 UDF 文件"));
         }
         match kind {
             0 => out.push(((u.part_start + lbn) * SECTOR, len, false)),
@@ -324,7 +325,7 @@ fn read_ads(r: &mut Reader, u: &Udf, ads: &[u8], ad_type: u16, out: &mut Vec<(u6
             _ => {
                 // 下一段分配描述符
                 let s = r.sector(u.part_start + lbn)?;
-                ensure!(u16le(&s, 0) == 258, "分配扩展描述符不对");
+                ensure!(u16le(&s, 0) == 258, t!("分配扩展描述符不对"));
                 let l = u32le(&s, 20) as usize;
                 read_ads(r, u, &s[24..24 + l.min(s.len() - 24)], ad_type, out, depth + 1)?;
             }
@@ -356,7 +357,7 @@ fn udf_dir(
     seen: &mut HashSet<u64>,
     depth: usize,
 ) -> Result<()> {
-    ensure!(depth < 64 && seen.insert(lbn), "目录有环或嵌套太深");
+    ensure!(depth < 64 && seen.insert(lbn), t!("目录有环或嵌套太深"));
     let fe = udf_fe(r, u, lbn)?;
     let data = match fe.embedded {
         Some(d) => d,
@@ -364,13 +365,13 @@ fn udf_dir(
     };
     let mut p = 0usize;
     while p + 38 <= data.len() {
-        ensure!(u16le(&data, p) == 257, "目录项标记不对");
+        ensure!(u16le(&data, p) == 257, t!("目录项标记不对"));
         let chars = data[p + 18];
         let l_fi = data[p + 19] as usize;
         let child = u32le(&data, p + 24) as u64;
         let l_iu = u16le(&data, p + 36) as usize;
         let name_at = p + 38 + l_iu;
-        ensure!(name_at + l_fi <= data.len(), "目录项越界");
+        ensure!(name_at + l_fi <= data.len(), t!("目录项越界"));
         let raw = &data[name_at..name_at + l_fi];
         p += (38 + l_iu + l_fi).div_ceil(4) * 4;
         if chars & 0x08 != 0 || chars & 0x04 != 0 || l_fi == 0 {
@@ -446,7 +447,7 @@ fn units(img: &Image) -> Result<Vec<IsoUnit>> {
     meta.sort_unstable();
     for &(s, e, _) in &merged {
         let hit = meta.iter().any(|&(ms, me)| ms < e && s < me);
-        ensure!(!hit, "文件数据和目录信息挤在同一处，不能边解边删");
+        ensure!(!hit, t!("文件数据和目录信息挤在同一处，不能边解边删"));
     }
     let mut groups: std::collections::BTreeMap<usize, IsoUnit> = Default::default();
     for (s, e, i) in merged {
@@ -471,7 +472,7 @@ fn copy_file(src: &mut Src, f: &IsoFile, dest: &Path, observer: &Observer, stop:
     let mut name = dest.file_name().unwrap_or_default().to_os_string();
     name.push(".onezip-part");
     let part = dest.with_file_name(name);
-    let mut out = File::create(&part).with_context(|| format!("创建 {}", dest.display()))?;
+    let mut out = File::create(&part).with_context(|| t!("创建 {}", dest.display()))?;
     let mut left = f.size;
     let mut buf = vec![0u8; 1 << 20];
     if let Some(e) = &f.embedded {
@@ -521,7 +522,7 @@ pub(super) fn extract_in_place(
     stop: &Arc<AtomicBool>,
     confirm: &mut dyn FnMut(&Confirm) -> bool,
 ) -> Result<Outcome> {
-    let img = open(archive).context("读不懂这个镜像的目录，不能边解边删；请用保留原文件的方式解压")?;
+    let img = open(archive).context(t!("读不懂这个镜像的目录，不能边解边删；请用保留原文件的方式解压"))?;
     let units = units(&img)?;
     let paths: Vec<&str> = img.files.iter().map(|f| f.path.as_str()).chain(img.dirs.iter().map(String::as_str)).collect();
     let resuming = journal.is_some();
@@ -532,7 +533,7 @@ pub(super) fn extract_in_place(
             let files: Vec<(u32, &str)> = img.files.iter().enumerate().map(|(n, f)| (n as u32, f.path.as_str())).collect();
             let plan = plan_clashes(&output, &files, req.conflict)?;
             if !confirm(&Confirm { archive: &archive.file_name().unwrap_or_default().to_string_lossy(), output: &output }) {
-                bail!("已取消，镜像没有任何改动");
+                bail!(t!("已取消，镜像没有任何改动"));
             }
             Journal::create(archive, &output, true, plan)?
         }
@@ -583,7 +584,7 @@ pub(super) fn extract_in_place(
             for (s, e) in super::merged(batch.iter().flat_map(|(_, u)| u.ranges.iter())) {
                 if !super::punch::punch(&hole, s, e)? {
                     can_punch = false;
-                    observer(Event::Note("这个磁盘不支持释放部分空间，镜像会在解压完成后删除".into()));
+                    observer(Event::Note(t!("这个磁盘不支持释放部分空间，镜像会在解压完成后删除").into()));
                     break;
                 }
             }
@@ -599,7 +600,7 @@ pub(super) fn extract_in_place(
     drop(src);
     drop(hole);
     let reported = reported_output(archive, &output, &paths);
-    fs::remove_file(archive).with_context(|| format!("删除 {}", archive.display()))?;
+    fs::remove_file(archive).with_context(|| t!("删除 {}", archive.display()))?;
     journal.remove();
     Ok(Outcome::Finished { output: reported, warning: None })
 }

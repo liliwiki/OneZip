@@ -2,6 +2,7 @@
 
 #![allow(non_snake_case)]
 
+use onezip_i18n::t;
 use std::ffi::c_void;
 use std::fs::File;
 use std::io::{BufWriter, Read, Seek, SeekFrom, Write};
@@ -36,7 +37,7 @@ pub struct Item {
 pub struct NeedPassword;
 impl std::fmt::Display for NeedPassword {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str("压缩包已加密，需要密码")
+        f.write_str(t!("压缩包已加密，需要密码"))
     }
 }
 impl std::error::Error for NeedPassword {}
@@ -46,7 +47,7 @@ impl std::error::Error for NeedPassword {}
 pub struct BadPassword;
 impl std::fmt::Display for BadPassword {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str("密码不对")
+        f.write_str(t!("密码不对"))
     }
 }
 impl std::error::Error for BadPassword {}
@@ -56,7 +57,7 @@ impl std::error::Error for BadPassword {}
 pub struct Stopped;
 impl std::fmt::Display for Stopped {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str("已停止")
+        f.write_str(t!("已停止"))
     }
 }
 impl std::error::Error for Stopped {}
@@ -241,7 +242,7 @@ pub fn open(path: &Path, password: Option<String>) -> Result<Archive> {
             return Err(if password.is_some() { anyhow!(BadPassword) } else { anyhow!(NeedPassword) });
         }
     }
-    bail!("7z.dll 不认识这个文件，可能不是压缩包或已经损坏")
+    bail!(t!("7z.dll 不认识这个文件，可能不是压缩包或已经损坏"))
 }
 
 fn prop(arc: &IInArchive, index: u32, id: u32) -> PropVariant {
@@ -469,7 +470,7 @@ impl IArchiveExtractCallback_Impl for ExtractCallback_Impl {
                 let file = match File::create(&part) {
                     Ok(f) => f,
                     Err(e) => {
-                        st.error = Some(anyhow!(e).context(format!("创建 {}", final_path.display())));
+                        st.error = Some(anyhow!(e).context(t!("创建 {}", final_path.display())));
                         return E_FAIL;
                     }
                 };
@@ -493,7 +494,7 @@ impl IArchiveExtractCallback_Impl for ExtractCallback_Impl {
     unsafe fn SetOperationResult(&self, result: i32) -> HRESULT {
         let ok = result == op_result::OK;
         if let Err(e) = self.finish_current(ok) {
-            self.state.lock().unwrap().error = Some(anyhow!(e).context("写入解出的文件"));
+            self.state.lock().unwrap().error = Some(anyhow!(e).context(t!("写入解出的文件")));
             return E_FAIL;
         }
         if !ok {
@@ -502,12 +503,12 @@ impl IArchiveExtractCallback_Impl for ExtractCallback_Impl {
                 st.error = Some(match result {
                     op_result::WRONG_PASSWORD => anyhow!(BadPassword),
                     op_result::DATA_ERROR | op_result::CRC_ERROR if st.asked_password => anyhow!(BadPassword),
-                    op_result::UNSUPPORTED_METHOD => anyhow!("压缩包用了不支持的压缩方法"),
-                    op_result::CRC_ERROR => anyhow!("数据校验失败（CRC 错误），压缩包可能已损坏"),
-                    op_result::DATA_ERROR => anyhow!("数据错误，压缩包可能已损坏"),
-                    op_result::UNEXPECTED_END => anyhow!("压缩包不完整（数据提前结束）"),
-                    op_result::UNAVAILABLE => anyhow!("缺少分卷或数据不可用"),
-                    _ => anyhow!("解压出错（代码 {result}）"),
+                    op_result::UNSUPPORTED_METHOD => anyhow!(t!("压缩包用了不支持的压缩方法")),
+                    op_result::CRC_ERROR => anyhow!(t!("数据校验失败（CRC 错误），压缩包可能已损坏")),
+                    op_result::DATA_ERROR => anyhow!(t!("数据错误，压缩包可能已损坏")),
+                    op_result::UNEXPECTED_END => anyhow!(t!("压缩包不完整（数据提前结束）")),
+                    op_result::UNAVAILABLE => anyhow!(t!("缺少分卷或数据不可用")),
+                    _ => anyhow!(t!("解压出错（代码 {}）", result)),
                 });
             }
         }
@@ -591,7 +592,7 @@ impl Archive {
         if stop.load(Ordering::Relaxed) || hr == E_ABORT {
             return Err(anyhow!(Stopped));
         }
-        hr.ok().map_err(|e| anyhow!("7z.dll 解压失败：{e}"))?;
+        hr.ok().map_err(|e| anyhow!(t!("7z.dll 解压失败：{}", e)))?;
         Ok(())
     }
 }

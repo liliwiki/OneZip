@@ -1,5 +1,6 @@
 //! 主窗口：按钮、勾选项、关闭时的处理。
 
+use onezip_i18n::t;
 use std::rc::Rc;
 
 use rfd::{MessageButtons, MessageDialogResult, MessageLevel};
@@ -12,13 +13,13 @@ use crate::request::{Action, Delete, Request};
 
 pub(super) fn status_text(s: &onezip_settings::Settings) -> String {
     if !s.menu_enabled {
-        "右键菜单已关闭：可以在“设置 → 右键菜单”里打开。".into()
+        t!("右键菜单已关闭：可以在“设置 → 右键菜单”里打开。").into()
     } else if menu::shell_package_installed() {
-        "右键菜单已启用（Windows 11 第一层菜单）。".into()
+        t!("右键菜单已启用（Windows 11 第一层菜单）。").into()
     } else if menu::is_registered() {
-        "右键菜单已启用。".into()
+        t!("右键菜单已启用。").into()
     } else {
-        "右键菜单尚未启用：在“设置 → 右键菜单”里打开。".into()
+        t!("右键菜单尚未启用：在“设置 → 右键菜单”里打开。").into()
     }
 }
 
@@ -71,9 +72,9 @@ pub(super) fn wire(app: &Rc<App>) {
         move || {
             let Some(app) = app.upgrade() else { return };
             let Some(files) = file_dialog(app.window.window())
-                .set_title("选择要解压的压缩包")
-                .add_filter("压缩包", &onezip_formats::archive_extensions().collect::<Vec<_>>())
-                .add_filter("所有文件", &["*"])
+                .set_title(t!("选择要解压的压缩包"))
+                .add_filter(t!("压缩包"), &onezip_formats::archive_extensions().collect::<Vec<_>>())
+                .add_filter(t!("所有文件"), &["*"])
                 .pick_files()
             else {
                 return;
@@ -87,13 +88,10 @@ pub(super) fn wire(app: &Rc<App>) {
                     .collect();
                 if !no.is_empty() {
                     message(app.window.window())
-                        .set_title("边解压边删除压缩包")
+                        .set_title(t!("边解压边删除压缩包"))
                         .set_level(MessageLevel::Warning)
-                        .set_description(format!(
-                            "这些文件的格式（磁盘镜像、安装包等）不能边解压边删除，\
-                             请取消勾选“解压时释放原压缩包空间”后再解压：\n\n{}",
-                            no.join("\n")
-                        ))
+                        .set_description(t!("这些文件的格式（磁盘镜像、安装包等）不能边解压边删除，\
+                             请取消勾选“解压时释放原压缩包空间”后再解压：\n\n{}", no.join("\n")))
                         .show();
                     return;
                 }
@@ -116,9 +114,9 @@ pub(super) fn wire(app: &Rc<App>) {
         move || {
             let Some(app) = app.upgrade() else { return };
             let Some(files) = file_dialog(app.window.window())
-                .set_title("打开压缩包，看看里面有什么")
-                .add_filter("压缩包", &onezip_formats::archive_extensions().collect::<Vec<_>>())
-                .add_filter("所有文件", &["*"])
+                .set_title(t!("打开压缩包，看看里面有什么"))
+                .add_filter(t!("压缩包"), &onezip_formats::archive_extensions().collect::<Vec<_>>())
+                .add_filter(t!("所有文件"), &["*"])
                 .pick_files()
             else {
                 return;
@@ -149,7 +147,7 @@ pub(super) fn wire(app: &Rc<App>) {
         move || {
             let Some(app) = app.upgrade() else { return };
             if let Some(files) = file_dialog(app.window.window())
-                .set_title("选择要压缩的文件")
+                .set_title(t!("选择要压缩的文件"))
                 .pick_files() {
                 compress::open_compress_dialog(&app, files, false);
             }
@@ -160,7 +158,7 @@ pub(super) fn wire(app: &Rc<App>) {
         move || {
             let Some(app) = app.upgrade() else { return };
             if let Some(dir) = file_dialog(app.window.window())
-                .set_title("选择要压缩的文件夹")
+                .set_title(t!("选择要压缩的文件夹"))
                 .pick_folder() {
                 compress::open_compress_dialog(&app, vec![dir], false);
             }
@@ -192,8 +190,8 @@ pub(super) fn wire(app: &Rc<App>) {
                 let r = message(w.window())
                     .set_level(MessageLevel::Warning)
                     .set_description(
-                        "还有任务在进行。退出后，解压任务会在安全点暂停并保存进度，下次可以继续；\
-                         压缩任务会被取消。确定退出吗？",
+                        t!("还有任务在进行。退出后，解压任务会在安全点暂停并保存进度，下次可以继续；\
+                         压缩任务会被取消。确定退出吗？"),
                     )
                     .set_buttons(MessageButtons::OkCancel)
                     .show();

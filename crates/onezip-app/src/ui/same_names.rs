@@ -1,6 +1,7 @@
 //! 设置为"每次询问"时，解压前发现目标位置已有同名文件：任务停下（什么都没动），
 //! 弹窗列出这些文件，选"全部替换 / 全部跳过 / 都保留 / 取消"后按选择重新开始。
 
+use onezip_i18n::t;
 use std::rc::Rc;
 
 use onezip_core::Conflict;
@@ -23,17 +24,14 @@ pub(super) fn prompt_next(app: &Rc<App>) {
     };
     let Status::SameNames { output, files } = &task.status else { return };
     let Ok(d) = SameNamesDialog::new() else { return };
-    d.set_heading(format!("{} 里已有 {} 个同名文件", output.display(), files.len()).into());
+    d.set_heading(t!("{} 里已有 {} 个同名文件", output.display(), files.len()).into());
     d.set_detail(
-        format!(
-            "解压 {} 会用到下面这些名字。什么都还没改动，请选择怎么办：",
-            task.archive_name()
-        )
+        t!("解压 {} 会用到下面这些名字。什么都还没改动，请选择怎么办：", task.archive_name())
         .into(),
     );
     let mut rows: Vec<SharedString> = files.iter().take(SHOW_AT_MOST).map(|f| f.display().to_string().into()).collect();
     if files.len() > SHOW_AT_MOST {
-        rows.push(format!("……还有 {} 个", files.len() - SHOW_AT_MOST).into());
+        rows.push(t!("……还有 {} 个", files.len() - SHOW_AT_MOST).into());
     }
     d.set_files(ModelRc::new(VecModel::from(rows)));
 

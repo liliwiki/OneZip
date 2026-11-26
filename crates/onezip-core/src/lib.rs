@@ -20,6 +20,7 @@ mod route;
 mod smart;
 mod source;
 
+use onezip_i18n::t;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
@@ -88,11 +89,7 @@ impl std::fmt::Display for SameNames {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(
             f,
-            "{} 里已有 {} 个同名文件（例如 {}）。什么都没改动；如要替换请选择替换",
-            self.output.display(),
-            self.files.len(),
-            self.files.first().map(|p| self.output.join(p)).unwrap_or_default().display()
-        )
+            "{}", t!("{} 里已有 {} 个同名文件（例如 {}）。什么都没改动；如要替换请选择替换", self.output.display(), self.files.len(), self.files.first().map(|p| self.output.join(p)).unwrap_or_default().display()))
     }
 }
 

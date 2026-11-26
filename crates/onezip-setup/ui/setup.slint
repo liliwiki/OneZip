@@ -21,7 +21,7 @@ export component SetupWindow inherits Window {
     callback finish();
     callback quit();
 
-    title: (updating ? "更新 OneZip " : "安装 OneZip ") + version;
+    title: updating ? @tr("更新 OneZip {}", version) : @tr("安装 OneZip {}", version);
     icon: @image-url("../../../assets/onezip-256.png");
     width: 520px;
     height: 380px;
@@ -45,7 +45,7 @@ export component SetupWindow inherits Window {
                     font-weight: 600;
                 }
                 Text {
-                    text: "压缩、解压、边解压边释放空间、边下载边解压";
+                    text: @tr("压缩、解压、边解压边释放空间、边下载边解压");
                     opacity: 0.7;
                 }
             }
@@ -54,7 +54,7 @@ export component SetupWindow inherits Window {
         if stage == "ready": VerticalLayout {
             spacing: 6px;
             Text {
-                text: upgrade ? "更新已安装的 OneZip。安装位置：" : "安装位置（只给当前用户安装）：";
+                text: upgrade ? @tr("更新已安装的 OneZip。安装位置：") : @tr("安装位置（只给当前用户安装）：");
             }
             HorizontalLayout {
                 spacing: 8px;
@@ -64,55 +64,55 @@ export component SetupWindow inherits Window {
                     edited(t) => { root.location-edited(t); }
                 }
                 Button {
-                    text: "浏览…";
+                    text: @tr("浏览…");
                     clicked => { root.browse(); }
                 }
             }
             Text {
-                text: problem != "" ? problem : "将装到：" + target;
+                text: problem != "" ? problem : @tr("将装到：{}", target);
                 color: problem != "" ? #e05050 : Palette.foreground;
                 wrap: word-wrap;
                 opacity: problem != "" ? 1 : 0.7;
                 visible: problem != "" || target != location;
             }
             Text {
-                text: "装到需要管理员权限的文件夹（如 C:\\Program Files）时会弹一次管理员确认。";
+                text: @tr("装到需要管理员权限的文件夹（如 C:\\Program Files）时会弹一次管理员确认。");
                 wrap: word-wrap;
                 opacity: 0.7;
             }
             Text {
                 visible: win11;
-                text: "如果是第一次安装，会弹出一次管理员确认，用来信任右键菜单的签名证书。";
+                text: @tr("如果是第一次安装，会弹出一次管理员确认，用来信任右键菜单的签名证书。");
                 wrap: word-wrap;
                 opacity: 0.7;
             }
         }
         if stage == "installing": VerticalLayout {
             spacing: 8px;
-            Text { text: status != "" ? status : (updating ? "正在更新…" : "正在安装…"); }
+            Text { text: status != "" ? status : (updating ? @tr("正在更新…") : @tr("正在安装…")); }
             ProgressIndicator { indeterminate: true; }
         }
         if stage == "done": VerticalLayout {
             spacing: 8px;
             Text {
-                text: "安装完成。右键文件或文件夹，在菜单里的“OneZip”中使用。";
+                text: @tr("安装完成。右键文件或文件夹，在菜单里的“OneZip”中使用。");
                 wrap: word-wrap;
             }
             Text {
                 visible: win11;
-                text: "如果右键菜单里暂时没有 OneZip，重启一次资源管理器或注销后即可。";
+                text: @tr("如果右键菜单里暂时没有 OneZip，重启一次资源管理器或注销后即可。");
                 wrap: word-wrap;
                 opacity: 0.7;
             }
             CheckBox {
-                text: "现在打开 OneZip";
+                text: @tr("现在打开 OneZip");
                 checked <=> root.launch;
             }
         }
         if stage == "failed": VerticalLayout {
             spacing: 6px;
             Text {
-                text: "安装没有完成：";
+                text: @tr("安装没有完成：");
                 font-weight: 600;
             }
             Text {
@@ -128,17 +128,17 @@ export component SetupWindow inherits Window {
             alignment: end;
             spacing: 8px;
             if stage == "ready": Button {
-                text: "安装";
+                text: @tr("安装");
                 primary: true;
                 enabled: problem == "";
                 clicked => { root.install(); }
             }
             if stage == "ready" || stage == "failed": Button {
-                text: stage == "failed" ? "关闭" : "取消";
+                text: stage == "failed" ? @tr("关闭") : @tr("取消");
                 clicked => { root.quit(); }
             }
             if stage == "done": Button {
-                text: "完成";
+                text: @tr("完成");
                 primary: true;
                 clicked => { root.finish(); }
             }
@@ -158,7 +158,7 @@ export component UninstallWindow inherits Window {
     callback uninstall();
     callback quit();
 
-    title: "卸载 OneZip";
+    title: @tr("卸载 OneZip");
     icon: @image-url("../../../assets/onezip-256.png");
     width: 480px;
     height: 300px;
@@ -177,7 +177,7 @@ export component UninstallWindow inherits Window {
                 alignment: center;
                 spacing: 4px;
                 Text {
-                    text: "卸载 OneZip " + version;
+                    text: @tr("卸载 OneZip {}", version);
                     font-size: 18px;
                     font-weight: 600;
                 }
@@ -191,27 +191,27 @@ export component UninstallWindow inherits Window {
         if stage == "confirm": VerticalLayout {
             spacing: 8px;
             Text {
-                text: "会移除 OneZip 的程序、右键菜单和开始菜单快捷方式。解压、压缩出来的文件不受影响；正在运行的 OneZip 会被关闭。";
+                text: @tr("会移除 OneZip 的程序、右键菜单和开始菜单快捷方式。解压、压缩出来的文件不受影响；正在运行的 OneZip 会被关闭。");
                 wrap: word-wrap;
             }
             CheckBox {
-                text: "同时删除 OneZip 的设置、保存的密码和出错记录";
+                text: @tr("同时删除 OneZip 的设置、保存的密码和出错记录");
                 checked <=> root.delete-settings;
             }
         }
         if stage == "working": VerticalLayout {
             spacing: 8px;
-            Text { text: status != "" ? status : "正在卸载…"; }
+            Text { text: status != "" ? status : @tr("正在卸载…"); }
             ProgressIndicator { indeterminate: true; }
         }
         if stage == "done": Text {
-            text: "OneZip 已卸载。";
+            text: @tr("OneZip 已卸载。");
             wrap: word-wrap;
         }
         if stage == "failed": VerticalLayout {
             spacing: 6px;
             Text {
-                text: "卸载没有全部完成：";
+                text: @tr("卸载没有全部完成：");
                 font-weight: 600;
             }
             Text {
@@ -227,12 +227,12 @@ export component UninstallWindow inherits Window {
             alignment: end;
             spacing: 8px;
             if stage == "confirm": Button {
-                text: "卸载";
+                text: @tr("卸载");
                 primary: true;
                 clicked => { root.uninstall(); }
             }
             if stage != "working": Button {
-                text: stage == "confirm" ? "取消" : "关闭";
+                text: stage == "confirm" ? @tr("取消") : @tr("关闭");
                 primary: stage == "done";
                 clicked => { root.quit(); }
             }

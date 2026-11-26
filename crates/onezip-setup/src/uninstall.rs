@@ -1,6 +1,7 @@
 //! 卸载：只删安装时放进去的文件，文件夹空了才删；文件关联总是还原。解压、压缩出来的文件、未完成任务的进度都不动；
 //! 设置、保存的密码和出错记录只在用户勾选时删除。导入"受信任的人"的签名证书保留。
 
+use onezip_i18n::t;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
@@ -24,11 +25,11 @@ pub fn target() -> Option<PathBuf> {
 
 pub fn uninstall(dest: &Path, delete_settings: bool, say: &dyn Fn(&str)) -> Result<()> {
     sys::init_com();
-    say("正在关闭 OneZip…");
+    say(t!("正在关闭 OneZip…"));
     sys::close_onezip(&[dest.to_path_buf()], Duration::ZERO);
     sys::release_menu_dll();
 
-    say("正在移除右键菜单…");
+    say(t!("正在移除右键菜单…"));
     let _ = sys::remove_shell_package();
     let onezip = dest.join("OneZip.exe");
     if onezip.exists() {
@@ -43,7 +44,7 @@ pub fn uninstall(dest: &Path, delete_settings: bool, say: &dyn Fn(&str)) -> Resu
         let _ = std::fs::remove_file(lnk);
     }
 
-    say("正在删除文件…");
+    say(t!("正在删除文件…"));
     let files = previous_files(dest);
     // 正在运行的卸载程序自己删不掉，退出后再删（见 main）。
     let me = std::env::current_exe().ok();
@@ -69,14 +70,14 @@ pub fn uninstall(dest: &Path, delete_settings: bool, say: &dyn Fn(&str)) -> Resu
     let _ = std::fs::remove_dir(dest);
 
     if delete_settings {
-        say("正在删除设置…");
+        say(t!("正在删除设置…"));
         let _ = onezip_settings::delete_all();
         if let Some(d) = std::env::var_os("LOCALAPPDATA") {
             let _ = std::fs::remove_dir_all(PathBuf::from(d).join("OneZip"));
         }
     }
     if !still.is_empty() {
-        anyhow::bail!("这些文件删不掉（可能正在被使用），可以稍后手动删除：\n{}", still.join("\n"));
+        anyhow::bail!(t!("这些文件删不掉（可能正在被使用），可以稍后手动删除：\n{}", still.join("\n")));
     }
     Ok(())
 }

@@ -6,6 +6,7 @@
 //!
 //! 加密的压缩包先试保存的密码，都不对再弹密码框。
 
+use onezip_i18n::t;
 use std::cell::{Cell, RefCell};
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
@@ -199,7 +200,7 @@ fn wire(b: &Rc<Browser>) {
 
 /// 在后台列出压缩包内容。
 fn load(b: &Rc<Browser>) {
-    b.window.set_message("正在打开…".into());
+    b.window.set_message(t!("正在打开…").into());
     b.window.set_needs_password(false);
     b.window.set_busy(true);
     let archive = b.archive.clone();
@@ -216,13 +217,13 @@ fn load(b: &Rc<Browser>) {
                     enter(b, String::new());
                 }
                 Err(e) if onezip_core::needs_password(&e) => {
-                    b.window.set_message("这个压缩包加密了，要输入密码才能看到里面的内容。".into());
+                    b.window.set_message(t!("这个压缩包加密了，要输入密码才能看到里面的内容。").into());
                     b.window.set_needs_password(true);
                     b.window.set_status(SharedString::new());
                 }
                 Err(e) => {
-                    crate::log::error(&format!("打开 {} 失败：{e:#}", b.archive.display()));
-                    b.window.set_message(format!("打不开这个压缩包：{e:#}").into());
+                    crate::log::error(&t!("打开 {} 失败：{}", b.archive.display(), format!("{:#}", e)));
+                    b.window.set_message(t!("打不开这个压缩包：{}", format!("{:#}", e)).into());
                     b.window.set_status(SharedString::new());
                 }
             }
@@ -363,10 +364,10 @@ fn show(b: &Browser) {
     let (dirs, files) = (list.iter().filter(|n| n.is_dir).count(), list.iter().filter(|n| !n.is_dir).count());
     let status = if sel.is_empty() {
         let size: u64 = list.iter().map(|n| total(&tree, n)).sum();
-        format!("{dirs} 个文件夹，{files} 个文件（共 {}）", human(size))
+        t!("{} 个文件夹，{} 个文件（共 {}）", dirs, files, human(size))
     } else {
         let size: u64 = sel.iter().filter_map(|&i| list.get(i)).map(|n| total(&tree, n)).sum();
-        format!("已选中 {} 项（{}）· 可以直接拖到资源管理器", sel.len(), human(size))
+        t!("已选中 {} 项（{}）· 可以直接拖到资源管理器", sel.len(), human(size))
     };
     w.set_status(status.into());
 }
@@ -396,7 +397,7 @@ fn extract_selected(b: &Rc<Browser>) {
         return;
     }
     let start = b.archive.parent().map(Path::to_path_buf).unwrap_or_default();
-    let Some(output) = file_dialog(b.window.window()).set_title("解压到哪个文件夹").set_directory(start).pick_folder()
+    let Some(output) = file_dialog(b.window.window()).set_title(t!("解压到哪个文件夹")).set_directory(start).pick_folder()
     else {
         return;
     };
@@ -408,7 +409,7 @@ fn extract_selected(b: &Rc<Browser>) {
         conflict: requests::conflict(&app.settings.borrow()),
         picks,
     };
-    let title = format!("解压 {} 里的 {} 项", file_name(&b.archive), req.picks.len());
+    let title = t!("解压 {} 里的 {} 项", file_name(&b.archive), req.picks.len());
     let id = app.tasks.add(title, Kind::Pick(req));
     progress::open_progress(&app, id);
 }
@@ -417,7 +418,7 @@ fn extract_selected(b: &Rc<Browser>) {
 fn extract_all(b: &Rc<Browser>) {
     let Some(app) = b.app.upgrade() else { return };
     let start = b.archive.parent().map(Path::to_path_buf).unwrap_or_default();
-    let Some(root) = file_dialog(b.window.window()).set_title("解压到哪个文件夹").set_directory(start).pick_folder()
+    let Some(root) = file_dialog(b.window.window()).set_title(t!("解压到哪个文件夹")).set_directory(start).pick_folder()
     else {
         return;
     };
@@ -433,7 +434,7 @@ fn extract_all(b: &Rc<Browser>) {
         conflict: requests::conflict(&s),
         ..Default::default()
     };
-    let id = app.tasks.add(format!("解压 {}", file_name(&b.archive)), Kind::Extract(req, None));
+    let id = app.tasks.add(t!("解压 {}", file_name(&b.archive)), Kind::Extract(req, None));
     progress::open_progress(&app, id);
 }
 
@@ -481,7 +482,7 @@ fn pick_to(b: &Browser, picks: Vec<String>, output: PathBuf) -> PickRequest {
 /// 双击文件：解到临时文件夹，用默认程序打开。
 fn open_file(b: &Rc<Browser>, node: Node) {
     let req = pick_to(b, vec![node.path.clone()], temp_dir("open"));
-    b.window.set_status(format!("正在打开 {}…", node.name).into());
+    b.window.set_status(t!("正在打开 {}…", node.name).into());
     b.window.set_busy(true);
     attempt(
         b,
@@ -496,7 +497,7 @@ fn open_file(b: &Rc<Browser>, node: Node) {
             match r {
                 Ok(dir) => win::shell_open(&dir.join(&node.name).display().to_string()),
                 Err(e) if onezip_core::needs_password(&e) => {}
-                Err(e) => error(b.window.window(), &format!("打开 {} 失败：{e:#}", node.name)),
+                Err(e) => error(b.window.window(), &t!("打开 {} 失败：{}", node.name, format!("{:#}", e))),
             }
         }),
     );
@@ -522,7 +523,7 @@ fn drag_out(b: &Rc<Browser>) {
             }
             let paths: Vec<PathBuf> = names.iter().map(|n| dir.join(n)).collect();
             if let Err(e) = win::drag_files(&paths) {
-                error(b.window.window(), &format!("拖放失败：{e:#}"));
+                error(b.window.window(), &t!("拖放失败：{}", format!("{:#}", e)));
             }
         }
         Err(e) if onezip_core::needs_password(&e) => {
@@ -537,13 +538,13 @@ fn drag_out(b: &Rc<Browser>) {
                     browse::extract(&r, Arc::new(|_| {}), &Arc::new(AtomicBool::new(false)))
                 }),
                 Rc::new(|b: &Rc<Browser>, r: Result<PathBuf>| match r {
-                    Ok(_) => b.window.set_status("密码正确，请再拖一次".into()),
+                    Ok(_) => b.window.set_status(t!("密码正确，请再拖一次").into()),
                     Err(e) if onezip_core::needs_password(&e) => {}
-                    Err(e) => error(b.window.window(), &format!("解压失败：{e:#}")),
+                    Err(e) => error(b.window.window(), &t!("解压失败：{}", format!("{:#}", e))),
                 }),
             );
         }
-        Err(e) => error(b.window.window(), &format!("解压失败：{e:#}")),
+        Err(e) => error(b.window.window(), &t!("解压失败：{}", format!("{:#}", e))),
     }
 }
 

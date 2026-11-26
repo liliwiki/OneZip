@@ -119,7 +119,8 @@ impl IExplorerCommand_Impl for Root_Impl {
     }
 
     fn EnumSubCommands(&self) -> Result<IEnumExplorerCommand> {
-        // 每次弹出菜单都重新读设置，改了设置不用重启资源管理器。
+        // 每次弹出菜单都重新读设置（包括语言），改了设置不用重启资源管理器。
+        onezip_settings::apply_language();
         let (_, hidden) = onezip_settings::menu_filter();
         let subs: Vec<IExplorerCommand> =
             onezip_menu::without_hidden(&hidden).into_iter().map(|entry| Sub { entry }.into()).collect();

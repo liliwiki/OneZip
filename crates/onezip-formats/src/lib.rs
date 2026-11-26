@@ -7,6 +7,9 @@
 //!
 //! 只看名字，不读文件，也不依赖任何别的模块，所以 DLL 里用也很轻。
 
+
+use onezip_i18n::t;
+
 /// 由 hatchzip-core / Peel 处理的扩展名（小写，不带点）。`001` 是分卷的第一卷。
 pub const NATIVE_EXTENSIONS: &[&str] = &[
     "zip", "7z", "rar", "r00", "tar", "tgz", "gz", "tbz2", "tbz", "bz2", "txz", "xz", "zst", "tzst",
@@ -147,7 +150,7 @@ pub fn compress_stem(paths: &[&str], is_dir: impl Fn(&str) -> bool) -> String {
     };
     // 盘符根目录（如 D:）没有文件夹名。
     if name.is_empty() || name.ends_with(':') {
-        "压缩包".into()
+        t!("压缩包").into()
     } else {
         name
     }

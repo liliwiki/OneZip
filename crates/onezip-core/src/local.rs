@@ -4,6 +4,7 @@
 //! 只是去掉了交互：密码由请求带入，确认交给前端的回调。
 //! 在它之上加了智能放置（[`Placement`]）和嵌套压缩包自动拆开。
 
+use onezip_i18n::t;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
@@ -38,7 +39,7 @@ pub fn list(archive: &Path, password: Option<String>) -> Result<Vec<Entry>> {
     }
     let job = match open(archive, None, false, password)?.0 {
         State::Fresh(job, _) | State::Resume(job, _) => job,
-        State::Orphan(_) => bail!("这个压缩包里已经没有剩余内容"),
+        State::Orphan(_) => bail!(t!("这个压缩包里已经没有剩余内容")),
     };
     let mut entries: Vec<Entry> = job
         .units
@@ -62,7 +63,7 @@ pub fn test(archive: &Path, password: Option<String>, observer: Observer) -> Res
     }
     let job = match open(archive, None, false, password)?.0 {
         State::Fresh(job, _) => job,
-        _ => bail!("这个压缩包正解到一半，不能测试；继续解压即可完成"),
+        _ => bail!(t!("这个压缩包正解到一半，不能测试；继续解压即可完成")),
     };
     observer(Event::Started {
         total: job.remaining_size(),
@@ -70,7 +71,7 @@ pub fn test(archive: &Path, password: Option<String>, observer: Observer) -> Res
     });
     let o = observer.clone();
     job.verify(&move |n| o(Event::Progressed(n)))
-        .context("压缩包已损坏")
+        .context(t!("压缩包已损坏"))
 }
 
 fn open(
@@ -91,7 +92,7 @@ fn open(
         // 不交互：密码错了或缺了就直接报错，由前端带上密码再来。
         |_wrong| None,
     )
-    .with_context(|| format!("打开 {} 失败", archive.display()))?;
+    .with_context(|| t!("打开 {} 失败", archive.display()))?;
     Ok((state, paths))
 }
 
@@ -119,13 +120,10 @@ pub(crate) fn extract(
     while let Some(next) = inner.take() {
         depth += 1;
         if depth > MAX_NESTED {
-            observer(Event::Note(format!("嵌套超过 {MAX_NESTED} 层，停止继续拆包")));
+            observer(Event::Note(t!("嵌套超过 {} 层，停止继续拆包", MAX_NESTED)));
             break;
         }
-        observer(Event::Note(format!(
-            "解出的是压缩包 {}，继续解开",
-            next.file_name().unwrap_or_default().to_string_lossy()
-        )));
+        observer(Event::Note(t!("解出的是压缩包 {}，继续解开", next.file_name().unwrap_or_default().to_string_lossy())));
         let sub = ExtractRequest {
             source: Source::Local(next.clone()),
             output: None,
@@ -140,7 +138,7 @@ pub(crate) fn extract(
             Ok((Outcome::Paused, _)) => return Ok(Outcome::Paused),
             // 看着像压缩包但打不开：保留它，不算失败。
             Err(e) => {
-                observer(Event::Note(format!("没有继续拆开：{e:#}")));
+                observer(Event::Note(t!("没有继续拆开：{}", format!("{:#}", e))));
                 break;
             }
         }
@@ -210,7 +208,7 @@ fn extract_one(
             if !req.keep_source
                 && let Some(why) = job.in_place_refusal()
             {
-                bail!("{why}。可以改用保留原压缩包的方式解压");
+                bail!(t!("{}。可以改用保留原压缩包的方式解压", why));
             }
             let out = if req.output.is_some() {
                 default_out
@@ -226,9 +224,9 @@ fn extract_one(
             }
             check_space(&job, &out, false, req.keep_free, req.keep_source)?;
             if req.verify_first {
-                observer(Event::Note("正在预先校验整个压缩包…".into()));
+                observer(Event::Note(t!("正在预先校验整个压缩包…").into()));
                 job.verify(&|_n| {})
-                    .context("压缩包已损坏，没有解压任何文件")?;
+                    .context(t!("压缩包已损坏，没有解压任何文件"))?;
             }
             if !req.keep_source {
                 let name = session::display_name(&job);
@@ -236,7 +234,7 @@ fn extract_one(
                     archive: &name,
                     output: &out,
                 }) {
-                    bail!("已取消，压缩包没有任何改动");
+                    bail!(t!("已取消，压缩包没有任何改动"));
                 }
             }
             let choices = match req.conflict {
@@ -321,22 +319,17 @@ fn check_space(job: &Job, out: &Path, resuming: bool, keep_free: u64, keep: bool
     if plan.fits {
         return Ok(());
     }
-    let mut msg = format!(
-        "空间不够：最忙时需要 {} 空闲（另留 {}），现在只有 {}",
-        human(plan.needed),
-        human(plan.keep_free),
-        human(plan.free)
-    );
+    let mut msg = t!("空间不够：最忙时需要 {} 空闲（另留 {}），现在只有 {}", human(plan.needed), human(plan.keep_free), human(plan.free));
     if plan.solid_block_bound {
-        msg.push_str("。瓶颈是一个固实块，它只能整块解完才能释放");
+        msg.push_str(t!("。瓶颈是一个固实块，它只能整块解完才能释放"));
     }
     if plan.archive_kept_whole {
-        msg.push_str("。这个文件系统不支持在文件中间释放空间（如 FAT32/exFAT），压缩包要到最后才能删");
+        msg.push_str(t!("。这个文件系统不支持在文件中间释放空间（如 FAT32/exFAT），压缩包要到最后才能删"));
     }
     if !plan.reclaims {
-        msg.push_str("。输出和压缩包不在同一个磁盘上，释放压缩包帮不上输出");
+        msg.push_str(t!("。输出和压缩包不在同一个磁盘上，释放压缩包帮不上输出"));
     }
-    bail!("{msg}。什么都没改动")
+    bail!(t!("{}。什么都没改动", msg))
 }
 
 fn run(

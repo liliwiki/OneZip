@@ -6,6 +6,10 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and
 
 ## [Unreleased]
 
+### Added
+
+- English interface. The main window, settings, dialogs, context menu, file association names, installer, command line, and error messages are all translated. By default OneZip follows the Windows display language: Chinese (Simplified or Traditional) shows Chinese, every other language shows English. Settings → General → Language picks Follow Windows, 简体中文, or English, and the change applies at once.
+
 ## [0.2.0] - 2026-11-26
 
 ### Added

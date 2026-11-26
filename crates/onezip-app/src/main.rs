@@ -33,6 +33,7 @@ fn main() {
 
 fn run() -> anyhow::Result<()> {
     log::install_panic_hook();
+    onezip_settings::apply_language();
     let req = Request::from_args(std::env::args().skip(1))?;
 
     // 安装/卸载程序调用：不开窗口。

@@ -4,6 +4,7 @@
 //! 都从这里生成，两边不会对不上。参照 7-Zip / NanaZip：解压一组、删除与测试一组、
 //! 压缩一组，组之间用分隔线隔开；"解压到 / 添加到"直接写出目标名字。
 
+use onezip_i18n::t;
 use onezip_formats::{archive_stem, compress_stem, file_name, in_place, is_archive};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -43,7 +44,8 @@ pub enum Command {
 }
 
 /// 校验值各项：（菜单文字，传给 `--hash` 的参数）。只列最常用的三种，
-/// 其余（CRC-64、SHA-1、SHA-512）在"全部算法"里一起算。
+/// 其余（CRC-64、SHA-1、SHA-512）在"全部算法"里一起算。菜单文字要经过
+/// [`Command::label`] 翻译（常量里不能翻译）。
 pub const HASH_ITEMS: &[(&str, [&str; 2])] = &[
     ("CRC-32", ["--hash", "crc32"]),
     ("MD5", ["--hash", "md5"]),
@@ -129,16 +131,17 @@ impl Command {
     /// 不知道选中了什么时的文字（注册表菜单、设置页用）。
     pub fn label(self) -> &'static str {
         match self {
-            Command::SmartExtract => "智能解压",
-            Command::ExtractToFolder => "解压到同名文件夹",
-            Command::ExtractHere => "解压到当前位置",
-            Command::ExtractTo => "解压文件…",
-            Command::ExtractThenDelete => "解压后删除压缩包",
-            Command::ExtractAndDelete => "边解压边删除压缩包",
-            Command::Test => "测试压缩包",
-            Command::AddTo => "添加到压缩包…",
-            Command::Add7z => "添加到 7z 压缩包",
-            Command::AddZip => "添加到 zip 压缩包",
+            Command::SmartExtract => t!("智能解压"),
+            Command::ExtractToFolder => t!("解压到同名文件夹"),
+            Command::ExtractHere => t!("解压到当前位置"),
+            Command::ExtractTo => t!("解压文件…"),
+            Command::ExtractThenDelete => t!("解压后删除压缩包"),
+            Command::ExtractAndDelete => t!("边解压边删除压缩包"),
+            Command::Test => t!("测试压缩包"),
+            Command::AddTo => t!("添加到压缩包…"),
+            Command::Add7z => t!("添加到 7z 压缩包"),
+            Command::AddZip => t!("添加到 zip 压缩包"),
+            Command::Hash(i) if HASH_ITEMS[i].1[1] == "*" => t!("校验值（全部算法）"),
             Command::Hash(i) => HASH_ITEMS[i].0,
         }
     }
@@ -148,11 +151,11 @@ impl Command {
         let refs: Vec<&str> = paths.iter().map(String::as_str).collect();
         match self {
             Command::ExtractToFolder => match paths {
-                [one] => format!("解压到 \"{}\\\"", archive_stem(file_name(one))),
-                _ => "解压到各自的同名文件夹".into(),
+                [one] => t!("解压到 \"{}\\\"", archive_stem(file_name(one))),
+                _ => t!("解压到各自的同名文件夹").into(),
             },
-            Command::Add7z => format!("添加到 \"{}.7z\"", compress_stem(&refs, is_dir)),
-            Command::AddZip => format!("添加到 \"{}.zip\"", compress_stem(&refs, is_dir)),
+            Command::Add7z => t!("添加到 \"{}.7z\"", compress_stem(&refs, is_dir)),
+            Command::AddZip => t!("添加到 \"{}.zip\"", compress_stem(&refs, is_dir)),
             c => c.label().into(),
         }
     }

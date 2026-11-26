@@ -11,6 +11,7 @@ use slint::ComponentHandle;
 
 #[cfg(windows)]
 mod imp {
+    use onezip_i18n::t;
     use std::ffi::c_void;
 
     use raw_window_handle::{HasWindowHandle, RawWindowHandle};
@@ -127,10 +128,10 @@ mod imp {
         };
         let code = unsafe { SHFileOperationW(&mut op) };
         if code != 0 {
-            return Err(std::io::Error::other(format!("移到回收站失败（错误 {code:#x}）")));
+            return Err(std::io::Error::other(t!("移到回收站失败（错误 {}）", format!("{:#x}", code))));
         }
         if op.fAnyOperationsAborted.as_bool() {
-            return Err(std::io::Error::other("移到回收站被中止"));
+            return Err(std::io::Error::other(t!("移到回收站被中止")));
         }
         Ok(())
     }
@@ -140,12 +141,12 @@ mod imp {
         use winreg::RegKey;
         use winreg::enums::HKEY_LOCAL_MACHINE;
         let Ok(k) = RegKey::predef(HKEY_LOCAL_MACHINE).open_subkey(r"SOFTWARE\Microsoft\Windows NT\CurrentVersion") else {
-            return "未知".into();
+            return t!("未知").into();
         };
         let build: String = k.get_value("CurrentBuild").unwrap_or_default();
         let display: String = k.get_value("DisplayVersion").unwrap_or_default();
         let major = if build.parse::<u32>().unwrap_or(0) >= 22000 { "Windows 11" } else { "Windows 10" };
-        format!("{major} {display}（{build}）")
+        t!("{} {}（{}）", major, display, build)
     }
 
     /// 把文本放进剪贴板。
@@ -264,11 +265,12 @@ pub fn local_time(_t: std::time::SystemTime) -> String {
 
 #[cfg(not(windows))]
 pub fn drag_files(_paths: &[std::path::PathBuf]) -> anyhow::Result<()> {
-    anyhow::bail!("只支持 Windows")
+    anyhow::bail!(onezip_i18n::t!("只支持 Windows"))
 }
 
 #[cfg(not(windows))]
 mod imp {
+    use onezip_i18n::t;
     pub fn bring_to_front(_window: &slint::Window) {}
     pub fn set_owner(_child: &slint::Window, _owner: &slint::Window) {}
     pub fn center_on(_child: &slint::Window, _owner: &slint::Window) {}
@@ -281,7 +283,7 @@ mod imp {
         paths.iter().try_for_each(std::fs::remove_file)
     }
     pub fn windows_version() -> String {
-        "未知".into()
+        t!("未知").into()
     }
 }
 

@@ -7,6 +7,7 @@
 //! 每种格式解析完都和 7z.dll 列出的条目逐一核对（路径、大小），对不上就拒绝边解边删，
 //! 宁可不释放，也不能释放错。
 
+use onezip_i18n::t;
 use std::collections::{HashMap, VecDeque};
 use std::io::{Read, Seek, SeekFrom};
 use std::path::Path;
@@ -34,7 +35,7 @@ pub fn units(path: &Path, arc: &Archive) -> Result<Vec<Unit>> {
         "wim" => wim(&mut f, arc)?,
         "Arj" => sequential(arc, arj(&mut f, len)?)?,
         "Lzh" => sequential(arc, lzh(&mut f, len)?)?,
-        other => bail!("{other} 格式不支持边解边删"),
+        other => bail!(t!("{} 格式不支持边解边删", other)),
     };
     check(&units, len)?;
     Ok(units)
@@ -45,15 +46,15 @@ fn check(units: &[Unit], len: u64) -> Result<()> {
     let mut all: Vec<(u64, u64)> = units.iter().flat_map(|u| u.ranges.iter().copied()).collect();
     all.sort_unstable();
     for w in all.windows(2) {
-        ensure!(w[0].1 <= w[1].0, "数据区间重叠");
+        ensure!(w[0].1 <= w[1].0, t!("数据区间重叠"));
     }
     for &(s, e) in &all {
-        ensure!(s <= e && e <= len, "数据区间超出文件");
+        ensure!(s <= e && e <= len, t!("数据区间超出文件"));
     }
     let mut seen = std::collections::HashSet::new();
     for u in units {
         for i in &u.items {
-            ensure!(seen.insert(*i), "条目 {i} 出现在两个单元里");
+            ensure!(seen.insert(*i), t!("条目 {} 出现在两个单元里", i));
         }
     }
     Ok(())
@@ -98,12 +99,12 @@ fn leftovers(arc: &Archive, used: &std::collections::HashSet<u32>) -> Option<Uni
 fn cab(f: &mut Src, arc: &Archive) -> Result<Vec<Unit>> {
     let mut h = [0u8; 36];
     read_at(f, 0, &mut h)?;
-    ensure!(&h[0..4] == b"MSCF", "不是 CAB");
+    ensure!(&h[0..4] == b"MSCF", t!("不是 CAB"));
     let coff_files = u32le(&h, 16) as u64;
     let folders = u16le(&h, 26) as usize;
     let nfiles = u16le(&h, 28) as usize;
     let flags = u16le(&h, 30);
-    ensure!(flags & 0x3 == 0, "分卷的 CAB 不能边解边删");
+    ensure!(flags & 0x3 == 0, t!("分卷的 CAB 不能边解边删"));
     let mut pos = 36u64;
     let (mut res_folder, mut res_data) = (0u64, 0u64);
     if flags & 0x4 != 0 {
@@ -141,7 +142,7 @@ fn cab(f: &mut Src, arc: &Archive) -> Result<Vec<Unit>> {
         let size = u32le(&e, 0) as u64;
         let offset = u32le(&e, 4) as u64;
         let folder = u16le(&e, 8) as usize;
-        ensure!(folder < folders, "文件跨卷或属于不存在的文件夹");
+        ensure!(folder < folders, t!("文件跨卷或属于不存在的文件夹"));
         // 跳过以 0 结尾的文件名
         let mut q = p + 16;
         loop {
@@ -159,7 +160,7 @@ fn cab(f: &mut Src, arc: &Archive) -> Result<Vec<Unit>> {
     // 只公开文件夹号。所以每个文件夹里两边都按（偏移，大小）排好，逐个对应、核对大小。
     let mut by_block: HashMap<u64, VecDeque<&Item>> = HashMap::new();
     for it in files(arc) {
-        let block = it.block.with_context(|| format!("7z.dll 没有给出 {} 所在的文件夹", it.path))?;
+        let block = it.block.with_context(|| t!("7z.dll 没有给出 {} 所在的文件夹", it.path))?;
         by_block.entry(block).or_default().push_back(it);
     }
     let mut used = std::collections::HashSet::new();
@@ -169,20 +170,17 @@ fn cab(f: &mut Src, arc: &Archive) -> Result<Vec<Unit>> {
         let mut theirs = by_block.remove(&(i as u64)).unwrap_or_default();
         ensure!(
             theirs.len() == entries.len(),
-            "CAB 文件夹 {i} 有 {} 个文件，7z.dll 列出 {} 个",
-            entries.len(),
-            theirs.len()
-        );
+            t!("CAB 文件夹 {} 有 {} 个文件，7z.dll 列出 {} 个", i, entries.len(), theirs.len()));
         let mut items = Vec::new();
         for (offset, size) in entries {
             let it = theirs.pop_front().unwrap();
-            ensure!(it.size == size, "CAB 文件夹 {i} 偏移 {offset} 的文件大小和 7z.dll 列出的不一样");
+            ensure!(it.size == size, t!("CAB 文件夹 {} 偏移 {} 的文件大小和 7z.dll 列出的不一样", i, offset));
             used.insert(it.index);
             items.push(it.index);
         }
         units.push(Unit { items, ranges: vec![folder_ranges[i]] });
     }
-    ensure!(by_block.is_empty(), "7z.dll 列出了 CAB 文件表里没有的文件夹");
+    ensure!(by_block.is_empty(), t!("7z.dll 列出了 CAB 文件表里没有的文件夹"));
     let mut all: Vec<Unit> = leftovers(arc, &used).into_iter().collect();
     all.extend(units);
     Ok(all)
@@ -198,13 +196,13 @@ const SOLID_MAGIC_SIZE: u64 = 0x1_0000_0000;
 fn wim(f: &mut Src, arc: &Archive) -> Result<Vec<Unit>> {
     let mut h = [0u8; 208];
     read_at(f, 0, &mut h)?;
-    ensure!(&h[0..8] == b"MSWIM\0\0\0", "不是 WIM");
+    ensure!(&h[0..8] == b"MSWIM\0\0\0", t!("不是 WIM"));
     let total_parts = u16le(&h, 42);
-    ensure!(total_parts <= 1, "分卷的 WIM（.swm）不能边解边删");
+    ensure!(total_parts <= 1, t!("分卷的 WIM（.swm）不能边解边删"));
     let table_size = u64le(&h, 48) & 0x00FF_FFFF_FFFF_FFFF;
     let table_flags = h[55];
     let table_offset = u64le(&h, 56);
-    ensure!(table_flags & 0x04 == 0, "压缩过的查找表暂不支持边解边删");
+    ensure!(table_flags & 0x04 == 0, t!("压缩过的查找表暂不支持边解边删"));
     let mut table = vec![0u8; table_size as usize];
     read_at(f, table_offset, &mut table)?;
 
@@ -230,7 +228,7 @@ fn wim(f: &mut Src, arc: &Archive) -> Result<Vec<Unit>> {
             continue;
         }
         let r = if solid {
-            current_solid.context("固实流出现在固实资源之前")?
+            current_solid.context(t!("固实流出现在固实资源之前"))?
         } else {
             current_solid = None;
             ranges.push((offset, offset + size));
@@ -245,9 +243,9 @@ fn wim(f: &mut Src, arc: &Archive) -> Result<Vec<Unit>> {
         if it.size == 0 {
             continue;
         }
-        let sha = arc.raw_prop(it.index, kpid::SHA1).context("7z.dll 没有给出 SHA-1")?;
-        let sha: [u8; 20] = sha.as_slice().try_into().context("SHA-1 长度不对")?;
-        let r = *by_hash.get(&sha).with_context(|| format!("{} 的数据不在查找表里", it.path))?;
+        let sha = arc.raw_prop(it.index, kpid::SHA1).context(t!("7z.dll 没有给出 SHA-1"))?;
+        let sha: [u8; 20] = sha.as_slice().try_into().context(t!("SHA-1 长度不对"))?;
+        let r = *by_hash.get(&sha).with_context(|| t!("{} 的数据不在查找表里", it.path))?;
         groups.entry(r).or_default().push(it.index);
         used.insert(it.index);
     }
@@ -275,7 +273,7 @@ struct Seq {
 /// 按顺序和 7z.dll 的条目一一对应（两边都是按存放顺序列的），逐个核对。
 fn sequential(arc: &Archive, entries: Vec<Seq>) -> Result<Vec<Unit>> {
     let items: Vec<&Item> = arc.items.iter().collect();
-    ensure!(items.len() == entries.len(), "条目数和 7z.dll 列出的不一样（{} 对 {}）", entries.len(), items.len());
+    ensure!(items.len() == entries.len(), t!("条目数和 7z.dll 列出的不一样（{} 对 {}）", entries.len(), items.len()));
     let mut units = Vec::new();
     let mut dirs = Vec::new();
     for (it, e) in items.iter().zip(&entries) {
@@ -283,11 +281,7 @@ fn sequential(arc: &Archive, entries: Vec<Seq>) -> Result<Vec<Unit>> {
         // 只核对大小和是不是目录。
         ensure!(
             it.size == e.size && it.is_dir == e.is_dir,
-            "第 {} 个条目（{}）和 7z.dll 列出的 {} 对不上",
-            it.index,
-            e.path,
-            it.path
-        );
+            t!("第 {} 个条目（{}）和 7z.dll 列出的 {} 对不上", it.index, e.path, it.path));
         if it.skip {
             continue;
         }
@@ -311,10 +305,10 @@ fn arj(f: &mut Src, len: u64) -> Result<Vec<Seq>> {
     let mut out = Vec::new();
     let mut first = true;
     loop {
-        ensure!(pos + 4 <= len, "ARJ 头被截断");
+        ensure!(pos + 4 <= len, t!("ARJ 头被截断"));
         let mut h = [0u8; 4];
         read_at(f, pos, &mut h)?;
-        ensure!(h[0] == 0x60 && h[1] == 0xEA, "ARJ 头标记不对");
+        ensure!(h[0] == 0x60 && h[1] == 0xEA, t!("ARJ 头标记不对"));
         let size = u16le(&h, 2) as u64;
         if size == 0 {
             break; // 结束
@@ -335,7 +329,7 @@ fn arj(f: &mut Src, len: u64) -> Result<Vec<Seq>> {
         }
         if first {
             first = false;
-            ensure!(b[4] & 0x04 == 0, "分卷的 ARJ 不能边解边删");
+            ensure!(b[4] & 0x04 == 0, t!("分卷的 ARJ 不能边解边删"));
             pos = p;
             continue;
         }
@@ -344,8 +338,8 @@ fn arj(f: &mut Src, len: u64) -> Result<Vec<Seq>> {
         let file_type = b[6];
         let packed = u32le(&b, 12) as u64;
         let original = u32le(&b, 16) as u64;
-        ensure!(flags & 0x04 == 0 && flags & 0x08 == 0, "分卷的 ARJ 不能边解边删");
-        let name_end = b[first_size..].iter().position(|&c| c == 0).context("ARJ 文件名没有结尾")?;
+        ensure!(flags & 0x04 == 0 && flags & 0x08 == 0, t!("分卷的 ARJ 不能边解边删"));
+        let name_end = b[first_size..].iter().position(|&c| c == 0).context(t!("ARJ 文件名没有结尾"))?;
         let raw: String = b[first_size..first_size + name_end].iter().map(|&c| c as char).collect();
         let is_dir = file_type == 3;
         out.push(Seq {
@@ -370,7 +364,7 @@ fn lzh(f: &mut Src, len: u64) -> Result<Vec<Seq>> {
         if b[0] == 0 {
             break; // 结束标记
         }
-        ensure!(n == 22 && &b[2..4] == b"-l" && b[6] == b'-', "LZH 头不对");
+        ensure!(n == 22 && &b[2..4] == b"-l" && b[6] == b'-', t!("LZH 头不对"));
         let level = b[20];
         let packed = u32le(&b, 7) as u64;
         let original = u32le(&b, 11) as u64;
@@ -383,7 +377,7 @@ fn lzh(f: &mut Src, len: u64) -> Result<Vec<Seq>> {
                 let mut hb = vec![0u8; hsize as usize + 2];
                 read_at(f, pos, &mut hb)?;
                 let nlen = hb[21] as usize;
-                ensure!(22 + nlen <= hb.len(), "LZH 文件名超出头");
+                ensure!(22 + nlen <= hb.len(), t!("LZH 文件名超出头"));
                 name = hb[22..22 + nlen].iter().map(|&c| c as char).collect::<String>();
                 let mut p = pos + hsize + 2;
                 let mut ext_total = 0;
@@ -415,12 +409,12 @@ fn lzh(f: &mut Src, len: u64) -> Result<Vec<Seq>> {
                 let mut fname = String::new();
                 let mut dir = String::new();
                 loop {
-                    ensure!(p + 2 <= hb.len(), "LZH 扩展头越界");
+                    ensure!(p + 2 <= hb.len(), t!("LZH 扩展头越界"));
                     let n = u16le(&hb, p) as usize;
                     if n == 0 {
                         break;
                     }
-                    ensure!(p + n <= hb.len(), "LZH 扩展头越界");
+                    ensure!(p + n <= hb.len(), t!("LZH 扩展头越界"));
                     let kind = hb[p + 2];
                     let body = &hb[p + 3..p + n];
                     match kind {
@@ -435,7 +429,7 @@ fn lzh(f: &mut Src, len: u64) -> Result<Vec<Seq>> {
                 data_start = pos + total;
                 data_len = packed;
             }
-            _ => bail!("不支持的 LZH 头级别 {level}"),
+            _ => bail!(t!("不支持的 LZH 头级别 {}", level)),
         }
         let full = if dir_from_ext.is_empty() {
             name

@@ -173,9 +173,10 @@ mod imp {
 
 #[cfg(not(windows))]
 mod imp {
+    use onezip_i18n::t;
     use super::*;
     pub fn register(_exe: &Path, _settings: &Settings) -> Result<()> {
-        anyhow::bail!("右键菜单只支持 Windows")
+        anyhow::bail!(t!("右键菜单只支持 Windows"))
     }
     pub fn unregister() {}
     pub fn is_registered() -> bool {

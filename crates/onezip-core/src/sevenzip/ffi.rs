@@ -7,6 +7,7 @@
 
 #![allow(non_snake_case, clippy::missing_safety_doc, dead_code)]
 
+use onezip_i18n::t;
 use std::ffi::c_void;
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
@@ -372,7 +373,7 @@ fn load() -> Result<Library> {
     let path = dll_candidates()
         .into_iter()
         .find(|p| p.is_file())
-        .context("找不到 7z.dll（应在 OneZip.exe 旁边）")?;
+        .context(t!("找不到 7z.dll（应在 OneZip.exe 旁边）"))?;
     let wide: Vec<u16> = path
         .as_os_str()
         .to_string_lossy()
@@ -381,20 +382,20 @@ fn load() -> Result<Library> {
         .collect();
     let module = unsafe { LoadLibraryW(wide.as_ptr()) };
     if module.is_null() {
-        bail!("加载 {} 失败", path.display());
+        bail!(t!("加载 {} 失败", path.display()));
     }
     let sym = |name: &[u8]| {
         let p = unsafe { GetProcAddress(module, name.as_ptr()) };
         (!p.is_null()).then_some(p)
     };
     let create_object: CreateObjectFn = unsafe {
-        std::mem::transmute(sym(b"CreateObject\0").context("7z.dll 缺少 CreateObject")?)
+        std::mem::transmute(sym(b"CreateObject\0").context(t!("7z.dll 缺少 CreateObject"))?)
     };
     let get_count: GetNumberOfFormatsFn = unsafe {
-        std::mem::transmute(sym(b"GetNumberOfFormats\0").context("7z.dll 缺少 GetNumberOfFormats")?)
+        std::mem::transmute(sym(b"GetNumberOfFormats\0").context(t!("7z.dll 缺少 GetNumberOfFormats"))?)
     };
     let get_prop: GetHandlerProperty2Fn = unsafe {
-        std::mem::transmute(sym(b"GetHandlerProperty2\0").context("7z.dll 缺少 GetHandlerProperty2")?)
+        std::mem::transmute(sym(b"GetHandlerProperty2\0").context(t!("7z.dll 缺少 GetHandlerProperty2"))?)
     };
 
     let mut n = 0u32;
@@ -447,7 +448,7 @@ impl Library {
         let mut obj: *mut c_void = std::ptr::null_mut();
         unsafe { (self.create_object)(&handler.class_id, &<IOutArchive as windows_core::Interface>::IID, &mut obj) }.ok()?;
         if obj.is_null() {
-            bail!("7z.dll 不能写 {} 格式", handler.name);
+            bail!(t!("7z.dll 不能写 {} 格式", handler.name));
         }
         Ok(unsafe { <IOutArchive as windows_core::Interface>::from_raw(obj) })
     }
@@ -457,7 +458,7 @@ impl Library {
         let mut obj: *mut c_void = std::ptr::null_mut();
         unsafe { (self.create_object)(&handler.class_id, &<IInArchive as windows_core::Interface>::IID, &mut obj) }.ok()?;
         if obj.is_null() {
-            bail!("7z.dll 没有创建 {} 处理器", handler.name);
+            bail!(t!("7z.dll 没有创建 {} 处理器", handler.name));
         }
         Ok(unsafe { <IInArchive as windows_core::Interface>::from_raw(obj) })
     }

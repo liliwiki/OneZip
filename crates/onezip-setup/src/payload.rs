@@ -4,6 +4,7 @@
 //! zip 里是要装到安装目录的文件；其中 `setup\` 文件夹只给安装程序自己用（右键菜单的稀疏包、
 //! 签名证书），不复制过去。卸载程序 `uninstall.exe` 就是本程序去掉后面这一截。
 
+use onezip_i18n::t;
 use std::fs::File;
 use std::io::{self, Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
@@ -19,17 +20,17 @@ pub const SETUP_DIR: &str = "setup";
 pub fn locate(exe: &mut File) -> Result<(u64, u64)> {
     let total = exe.seek(SeekFrom::End(0))?;
     if total < 16 {
-        bail!("安装程序不完整");
+        bail!(t!("安装程序不完整"));
     }
     exe.seek(SeekFrom::End(-16))?;
     let mut tail = [0u8; 16];
     exe.read_exact(&mut tail)?;
     if &tail[8..] != MAGIC {
-        bail!("安装程序里没有找到要安装的文件（安装程序不完整，请重新下载）");
+        bail!(t!("安装程序里没有找到要安装的文件（安装程序不完整，请重新下载）"));
     }
     let len = u64::from_le_bytes(tail[..8].try_into().expect("8 字节"));
     if len > total - 16 {
-        bail!("安装程序已损坏，请重新下载");
+        bail!(t!("安装程序已损坏，请重新下载"));
     }
     Ok((total - 16 - len, len))
 }
@@ -63,17 +64,17 @@ impl Seek for Slice {
             SeekFrom::End(d) => self.len.checked_add_signed(d),
             SeekFrom::Current(d) => self.pos.checked_add_signed(d),
         };
-        self.pos = pos.ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "位置越界"))?;
+        self.pos = pos.ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, t!("位置越界")))?;
         Ok(self.pos)
     }
 }
 
 /// 把 `exe` 后面接的 zip 解到 `to`。
 pub fn unpack(exe: &Path, to: &Path) -> Result<()> {
-    let mut file = File::open(exe).with_context(|| format!("读取 {}", exe.display()))?;
+    let mut file = File::open(exe).with_context(|| t!("读取 {}", exe.display()))?;
     let (start, len) = locate(&mut file)?;
-    let mut zip = zip::ZipArchive::new(Slice { file, start, len, pos: 0 }).context("安装程序已损坏，请重新下载")?;
-    zip.extract(to).context("解出安装文件失败")?;
+    let mut zip = zip::ZipArchive::new(Slice { file, start, len, pos: 0 }).context(t!("安装程序已损坏，请重新下载"))?;
+    zip.extract(to).context(t!("解出安装文件失败"))?;
     Ok(())
 }
 
@@ -82,7 +83,7 @@ pub fn write_stub(exe: &Path, to: &Path) -> Result<()> {
     let mut file = File::open(exe)?;
     let (start, _) = locate(&mut file)?;
     file.seek(SeekFrom::Start(0))?;
-    let mut out = File::create(to).with_context(|| format!("写入 {}", to.display()))?;
+    let mut out = File::create(to).with_context(|| t!("写入 {}", to.display()))?;
     io::copy(&mut file.take(start), &mut out)?;
     Ok(())
 }
@@ -108,7 +109,7 @@ pub fn program_files(unpacked: &Path) -> Result<Vec<String>> {
     walk(unpacked, unpacked, &mut out)?;
     out.sort();
     if !out.iter().any(|f| f.eq_ignore_ascii_case("OneZip.exe")) {
-        bail!("安装文件里缺少 OneZip.exe");
+        bail!(t!("安装文件里缺少 OneZip.exe"));
     }
     Ok(out)
 }

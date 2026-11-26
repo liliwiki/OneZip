@@ -1,5 +1,6 @@
 //! 安装 / 卸载要用到的 Windows 功能，都直接调系统接口，不经过 PowerShell。
 
+use onezip_i18n::t;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::{Duration, Instant};
@@ -136,7 +137,7 @@ pub fn run_hidden(exe: &Path, args: &[&str]) -> Result<i32> {
         .args(args)
         .creation_flags(CREATE_NO_WINDOW)
         .status()
-        .with_context(|| format!("运行 {}", exe.display()))?;
+        .with_context(|| t!("运行 {}", exe.display()))?;
     Ok(status.code().unwrap_or(-1))
 }
 
@@ -158,16 +159,16 @@ pub fn run_elevated(args: &[String]) -> Result<()> {
         ..Default::default()
     };
     unsafe {
-        ShellExecuteExW(&mut info).map_err(|_| anyhow!("没有得到管理员确认"))?;
+        ShellExecuteExW(&mut info).map_err(|_| anyhow!(t!("没有得到管理员确认")))?;
         if info.hProcess.is_invalid() {
-            bail!("没有得到管理员确认");
+            bail!(t!("没有得到管理员确认"));
         }
         WaitForSingleObject(info.hProcess, INFINITE);
         let mut code = 1u32;
         let _ = GetExitCodeProcess(info.hProcess, &mut code);
         let _ = CloseHandle(info.hProcess);
         if code != 0 {
-            bail!("管理员操作没有成功（{code}）");
+            bail!(t!("管理员操作没有成功（{}）", code));
         }
     }
     Ok(())
@@ -206,7 +207,7 @@ pub fn grant(dir: &Path, sid: &str) -> Result<()> {
     let icacls = system32("icacls.exe");
     let code = run_hidden(&icacls, &[&dir.display().to_string(), "/grant", &format!("*{sid}:(OI)(CI)M")])?;
     if code != 0 {
-        bail!("icacls 失败（{code}）");
+        bail!(t!("icacls 失败（{}）", code));
     }
     Ok(())
 }
@@ -219,6 +220,7 @@ fn system32(name: &str) -> PathBuf {
 // ---------------------------------------------------------------- 证书
 
 mod cert {
+    use onezip_i18n::t;
     use std::ffi::c_void;
 
     use anyhow::{Result, bail};
@@ -254,7 +256,7 @@ mod cert {
     fn context(der: &[u8]) -> Result<*mut CERT_CONTEXT> {
         let ctx = unsafe { CertCreateCertificateContext(encoding(), der) };
         if ctx.is_null() {
-            bail!("证书文件看不懂");
+            bail!(t!("证书文件看不懂"));
         }
         Ok(ctx)
     }
@@ -304,7 +306,7 @@ pub fn add_shell_package(msix: &Path, external: &Path) -> Result<()> {
     let result = pm.AddPackageByUriAsync(&Uri::CreateUri(&HSTRING::from(file_uri(msix)))?, &options)?.join()?;
     let code = result.ExtendedErrorCode()?;
     if code.is_err() {
-        bail!("注册右键菜单失败：{}（{code}）", result.ErrorText()?);
+        bail!(t!("注册右键菜单失败：{}（{}）", result.ErrorText()?, code));
     }
     Ok(())
 }
@@ -324,7 +326,7 @@ pub fn remove_shell_package() -> Result<()> {
         let result = pm.RemovePackageAsync(&full)?.join()?;
         let code = result.ExtendedErrorCode()?;
         if code.is_err() {
-            bail!("卸载旧的右键菜单失败：{}（{code}）", result.ErrorText()?);
+            bail!(t!("卸载旧的右键菜单失败：{}（{}）", result.ErrorText()?, code));
         }
     }
     Ok(())

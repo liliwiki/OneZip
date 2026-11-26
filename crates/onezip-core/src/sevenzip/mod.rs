@@ -15,6 +15,7 @@ mod iso;
 mod layout;
 mod update;
 
+use onezip_i18n::t;
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::fs::{self, File, OpenOptions};
 use std::io::{BufRead, BufReader, Write};
@@ -110,7 +111,7 @@ impl Journal {
         let mut lines = BufReader::new(f).lines();
         let magic = lines.next().transpose()?.unwrap_or_default();
         if magic != JOURNAL_MAGIC {
-            bail!("进度文件 {} 不是本版本写的，删掉它可以从头解压", path.display());
+            bail!(t!("进度文件 {} 不是本版本写的，删掉它可以从头解压", path.display()));
         }
         let mode = lines.next().transpose()?.unwrap_or_default();
         let output = PathBuf::from(lines.next().transpose()?.unwrap_or_default());
@@ -145,7 +146,7 @@ impl Journal {
 
     fn create(archive: &Path, output: &Path, in_place: bool, plan: Clashes) -> Result<Journal> {
         let path = Self::path_for(archive);
-        let mut f = File::create(&path).with_context(|| format!("创建 {}", path.display()))?;
+        let mut f = File::create(&path).with_context(|| t!("创建 {}", path.display()))?;
         writeln!(f, "{JOURNAL_MAGIC}")?;
         writeln!(f, "{}", if in_place { "inplace" } else { "keep" })?;
         writeln!(f, "{}", output.display())?;
@@ -324,7 +325,7 @@ fn flush_all(paths: &[PathBuf]) -> Result<()> {
             })
             .collect();
         for h in handles {
-            h.join().map_err(|_| anyhow!("刷盘线程出错"))??;
+            h.join().map_err(|_| anyhow!(t!("刷盘线程出错")))??;
         }
         Ok(())
     })
@@ -440,7 +441,7 @@ pub(crate) fn extract(
         None => !req.keep_source,
     };
     if in_place && !onezip_formats::in_place(&archive_path.to_string_lossy()) {
-        bail!("这种格式不能边解压边删除；请用保留原压缩包的方式解压");
+        bail!(t!("这种格式不能边解压边删除；请用保留原压缩包的方式解压"));
     }
     // ISO/UDF 边解边删：数据不压缩，自己读目录、自己拷数据，不经过 7z.dll。
     if in_place && matches!(ext(archive_path).as_str(), "iso" | "udf") {
@@ -454,7 +455,7 @@ pub(crate) fn extract(
 
     // 单元：边解边删时来自对格式头的解析，否则每个条目自成一个单元。
     let units: Vec<layout::Unit> = if in_place {
-        layout::units(archive_path, &arc).context("读不懂这个压缩包的结构，不能边解边删；请用保留原压缩包的方式解压")?
+        layout::units(archive_path, &arc).context(t!("读不懂这个压缩包的结构，不能边解边删；请用保留原压缩包的方式解压"))?
     } else {
         items.iter().map(|i| layout::Unit { items: vec![i.index], ranges: Vec::new() }).collect()
     };
@@ -471,13 +472,13 @@ pub(crate) fn extract(
                     output: &output,
                 })
             {
-                bail!("已取消，压缩包没有任何改动");
+                bail!(t!("已取消，压缩包没有任何改动"));
             }
             Journal::create(archive_path, &output, in_place, plan)?
         }
     };
     let output = journal.output.clone();
-    fs::create_dir_all(&output).with_context(|| format!("创建 {}", output.display()))?;
+    fs::create_dir_all(&output).with_context(|| t!("创建 {}", output.display()))?;
     for i in items.iter().filter(|i| i.is_dir) {
         fs::create_dir_all(target_of(&output, &i.path))?;
     }
@@ -562,7 +563,7 @@ pub(crate) fn extract(
     drop(arc);
     let reported = reported_output(archive_path, &output, &paths);
     if in_place {
-        fs::remove_file(archive_path).with_context(|| format!("删除 {}", archive_path.display()))?;
+        fs::remove_file(archive_path).with_context(|| t!("删除 {}", archive_path.display()))?;
     }
     journal.remove();
     Ok((
@@ -646,7 +647,7 @@ fn run_in_place(
             for (s, e) in merged(batch.iter().flat_map(|(_, u)| u.ranges.iter())) {
                 if !punch::punch(&file, s, e)? {
                     can_punch = false;
-                    observer(Event::Note("这个磁盘不支持释放部分空间，原压缩包会在解压完成后删除".into()));
+                    observer(Event::Note(t!("这个磁盘不支持释放部分空间，原压缩包会在解压完成后删除").into()));
                     break;
                 }
             }

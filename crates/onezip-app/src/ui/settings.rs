@@ -1,5 +1,6 @@
 //! 设置窗口：主窗口点"设置"弹出。每改一项就整体保存并立即生效（主题、右键菜单）。
 
+use onezip_i18n::t;
 use std::cell::RefCell;
 use std::path::PathBuf;
 use std::rc::Rc;
@@ -8,7 +9,7 @@ use onezip_core::Format;
 use onezip_menu::{Command, Show};
 use onezip_settings::assoc;
 use onezip_settings::passwords::{self, Saved};
-use onezip_settings::{Conflict, DeleteMode, ExtractMode, Settings, Theme};
+use onezip_settings::{Conflict, DeleteMode, ExtractMode, Language, Settings, Theme};
 use slint::{ComponentHandle, ModelRc, SharedString, VecModel};
 
 use super::common::{error, file_dialog, open_url};
@@ -40,7 +41,7 @@ fn thread_choices() -> (Vec<String>, Vec<u32>) {
     values.push(cores);
     let labels = values
         .iter()
-        .map(|&v| if v == 0 { format!("自动（{cores}）") } else { v.to_string() })
+        .map(|&v| if v == 0 { t!("自动（{}）", cores) } else { v.to_string() })
         .collect();
     (labels, values)
 }
@@ -79,7 +80,7 @@ fn fill_passwords(d: &SettingsWindow, list: &RefCell<Vec<Saved>>, shown: bool) {
         .iter()
         .map(|s| SavedPassword {
             text: if shown { s.password.as_str().into() } else { SharedString::new() },
-            note: if s.note.is_empty() { "手动添加".into() } else { format!("上次用于 {}", s.note).into() },
+            note: if s.note.is_empty() { t!("手动添加").into() } else { t!("上次用于 {}", s.note).into() },
         })
         .collect();
     d.set_saved_passwords(ModelRc::new(VecModel::from(rows)));
@@ -91,7 +92,7 @@ fn fill_passwords(d: &SettingsWindow, list: &RefCell<Vec<Saved>>, shown: bool) {
 fn wire_passwords(d: &SettingsWindow) {
     let list = Rc::new(RefCell::new(Vec::new()));
     fill_passwords(d, &list, false);
-    let failed = |d: &SettingsWindow, e: std::io::Error| error(d.window(), &format!("保存密码失败：{e}"));
+    let failed = |d: &SettingsWindow, e: std::io::Error| error(d.window(), &t!("保存密码失败：{}", e));
     d.on_add_password({
         let (w, list) = (d.as_weak(), list.clone());
         move || {
@@ -125,7 +126,7 @@ fn wire_passwords(d: &SettingsWindow) {
         move || {
             let Some(d) = w.upgrade() else { return };
             let r = super::common::message(d.window())
-                .set_description("删除全部保存的密码？删除后不能恢复。")
+                .set_description(t!("删除全部保存的密码？删除后不能恢复。"))
                 .set_buttons(rfd::MessageButtons::OkCancel)
                 .show();
             if r != rfd::MessageDialogResult::Ok {
@@ -147,7 +148,7 @@ fn wire_passwords(d: &SettingsWindow) {
             }
             d.set_verifying(true);
             let w = w.clone();
-            crate::verify::verify_user(d.window(), "验证你的身份以显示 OneZip 保存的密码", move |ok| {
+            crate::verify::verify_user(d.window(), t!("验证你的身份以显示 OneZip 保存的密码"), move |ok| {
                 let Some(d) = w.upgrade() else { return };
                 d.set_verifying(false);
                 if ok {
@@ -189,22 +190,36 @@ fn fill_assoc(d: &SettingsWindow) {
         .filter(|e| assoc::overridden(e))
         .map(|e| format!(".{e}"))
         .collect();
-    d.set_assoc_overridden(overridden.join("、").into());
+    d.set_assoc_overridden(overridden.join(t!("、")).into());
+}
+
+/// 换了语言后，已关联的格式在注册表里的名字（"ZIP 压缩包"、"用 OneZip 打开"）跟着换。
+pub(super) fn refresh_assoc_labels() {
+    let Ok(exe) = std::env::current_exe() else { return };
+    let mut changed = false;
+    for e in assoc::ARCHIVES.iter().chain(assoc::IMAGES) {
+        if assoc::associated(e) {
+            changed |= assoc::set(&exe, e, true).is_ok();
+        }
+    }
+    if changed {
+        assoc::notify();
+    }
 }
 
 /// 关联或取消一批扩展名，然后刷新页面。
 fn set_assoc(d: &SettingsWindow, exts: &[&str], on: bool) {
     let exe = match std::env::current_exe() {
         Ok(e) => e,
-        Err(e) => return error(d.window(), &format!("找不到 OneZip.exe：{e}")),
+        Err(e) => return error(d.window(), &t!("找不到 OneZip.exe：{}", e)),
     };
     let failed: Vec<String> = exts
         .iter()
-        .filter_map(|e| assoc::set(&exe, e, on).err().map(|err| format!(".{e}：{err}")))
+        .filter_map(|e| assoc::set(&exe, e, on).err().map(|err| t!(".{}：{}", e, err)))
         .collect();
     assoc::notify();
     if !failed.is_empty() {
-        error(d.window(), &format!("设置文件关联失败：\n{}", failed.join("\n")));
+        error(d.window(), &t!("设置文件关联失败：\n{}", failed.join("\n")));
     }
     fill_assoc(d);
 }
@@ -243,6 +258,11 @@ fn wire_assoc(d: &SettingsWindow) {
 fn fill(d: &SettingsWindow, s: &Settings) {
     d.set_theme_index(theme_index(s.theme));
     super::Themed::apply(d, theme_index(s.theme));
+    d.set_language_index(match s.language {
+        Language::System => 0,
+        Language::Chinese => 1,
+        Language::English => 2,
+    });
 
     d.set_extract_mode(match s.extract_mode {
         ExtractMode::Smart => 0,
@@ -283,7 +303,7 @@ fn fill(d: &SettingsWindow, s: &Settings) {
 
     d.set_version(env!("CARGO_PKG_VERSION").into());
     d.set_auto_update(s.auto_update);
-    d.set_skipped(s.skipped.join("、").into());
+    d.set_skipped(s.skipped.join(t!("、")).into());
 }
 
 /// 窗口 → 设置（只覆盖窗口里有的项）。
@@ -292,6 +312,11 @@ fn read(d: &SettingsWindow, s: &mut Settings) {
         1 => Theme::Light,
         2 => Theme::Dark,
         _ => Theme::System,
+    };
+    s.language = match d.get_language_index() {
+        1 => Language::Chinese,
+        2 => Language::English,
+        _ => Language::System,
     };
     s.extract_mode = match d.get_extract_mode() {
         1 => ExtractMode::NewFolder,
@@ -326,14 +351,22 @@ fn read(d: &SettingsWindow, s: &mut Settings) {
 pub(super) fn commit(app: &Rc<App>, new: Settings) {
     let old = app.settings.replace(new.clone());
     if let Err(e) = new.save() {
-        crate::log::error(&format!("保存设置失败：{e}"));
+        crate::log::error(&t!("保存设置失败：{}", e));
     }
     if old.theme != new.theme {
         app.apply_theme();
     }
+    if old.language != new.language {
+        app.apply_language();
+        // 设置窗口里由代码填的文字（菜单项名字、线程数等）按新语言重填。
+        if let Some(d) = app.settings_window.borrow().as_ref() {
+            fill(d, &new);
+            d.invoke_assoc_refresh();
+        }
+    }
     if old.menu_enabled != new.menu_enabled || old.menu_hidden != new.menu_hidden {
         if let Err(e) = menu::apply(&new) {
-            error(app.window.window(), &format!("设置右键菜单失败：{e:#}"));
+            error(app.window.window(), &t!("设置右键菜单失败：{}", format!("{:#}", e)));
         }
         app.window.set_status(super::main_window::status_text(&new).into());
     }
@@ -384,7 +417,7 @@ pub(super) fn open(app: &Rc<App>, page: Option<i32>) {
         move || {
             let (Some(app), Some(d)) = (app.upgrade(), w.upgrade()) else { return };
             let r = super::common::message(d.window())
-                .set_description("所有设置都恢复成刚安装时的样子？")
+                .set_description(t!("所有设置都恢复成刚安装时的样子？"))
                 .set_buttons(rfd::MessageButtons::OkCancel)
                 .show();
             if r != rfd::MessageDialogResult::Ok {
@@ -418,7 +451,7 @@ pub(super) fn open(app: &Rc<App>, page: Option<i32>) {
         let w = d.as_weak();
         move || {
             let Some(d) = w.upgrade() else { return };
-            let mut fd = file_dialog(d.window()).set_title("边下载边解压：默认保存位置");
+            let mut fd = file_dialog(d.window()).set_title(t!("边下载边解压：默认保存位置"));
             let current = d.get_download_dir().to_string();
             fd = fd.set_directory(if current.is_empty() { download_placeholder() } else { current });
             if let Some(dir) = fd.pick_folder() {

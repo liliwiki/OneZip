@@ -6,7 +6,7 @@
 
 [English](README.md) | **简体中文**
 
-Windows 一体化压缩工具：常规压缩、智能解压、本地边解压边释放原压缩包空间、边下载边解压。解压引擎来自 [HatchZip](https://github.com/xevrion/hatchzip) 和 [Peel](https://github.com/agouin/peel)，菜单直接出现在 Windows 11 右键菜单的第一层。
+Windows 一体化压缩工具：常规压缩、智能解压、本地边解压边释放原压缩包空间、边下载边解压。解压引擎来自 [HatchZip](https://github.com/xevrion/hatchzip) 和 [Peel](https://github.com/agouin/peel)，菜单直接出现在 Windows 11 右键菜单的第一层。界面有简体中文和英文：默认跟随 Windows 的显示语言（中文显示中文，其他语言显示英文），也可以在设置 → 常规 → 语言里改。
 
 > OneZip 是独立项目，与 NanaZip、7-Zip、HatchZip、Peel 没有隶属关系。
 

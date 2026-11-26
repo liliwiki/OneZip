@@ -1,5 +1,6 @@
 //! 校验值结果窗口。
 
+use onezip_i18n::t;
 use std::rc::Rc;
 
 use slint::ComponentHandle;
@@ -19,9 +20,9 @@ pub(super) fn show_hash(app: &Rc<App>, id: u64) {
         move || {
             let Some(d) = d.upgrade() else { return };
             let msg = if win::set_clipboard(&text) {
-                "已复制到剪贴板"
+                t!("已复制到剪贴板")
             } else {
-                "复制失败，可以在上面选中文字后按 Ctrl+C"
+                t!("复制失败，可以在上面选中文字后按 Ctrl+C")
             };
             d.set_copied(msg.into());
         }

@@ -14,6 +14,7 @@ mod payload;
 mod sys;
 mod uninstall;
 
+use onezip_i18n::t;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::rc::Rc;
@@ -26,6 +27,8 @@ use install::{Plan, same_dir};
 slint::include_modules!();
 
 fn main() -> Result<()> {
+    // 装过 OneZip 的按它的语言设置，没装过的跟随 Windows（中文用中文，其他用英文）。
+    onezip_settings::apply_language();
     let args: Vec<String> = std::env::args().skip(1).collect();
     let arg = |i: usize| args.get(i).cloned().unwrap_or_default();
     let is_uninstaller = std::env::current_exe()
@@ -57,6 +60,7 @@ fn reporter<W: ComponentHandle + 'static>(weak: slint::Weak<W>, set: fn(&W, &str
 
 fn run_setup(update: bool) -> Result<()> {
     let w = SetupWindow::new()?;
+    let _ = slint::select_bundled_translation(onezip_i18n::lang().slint_name());
     w.set_version(env!("CARGO_PKG_VERSION").into());
     let old = Rc::new(installed_location());
     let start = old.as_ref().clone().unwrap_or_else(default_dir);
@@ -89,7 +93,7 @@ fn run_setup(update: bool) -> Result<()> {
         move || {
             let Some(w) = weak.upgrade() else { return };
             let current = PathBuf::from(w.get_location().as_str());
-            let mut d = rfd::FileDialog::new().set_title("选择安装位置");
+            let mut d = rfd::FileDialog::new().set_title(t!("选择安装位置"));
             if let Some(dir) = current.ancestors().find(|p| p.is_dir()) {
                 d = d.set_directory(dir);
             }
@@ -110,8 +114,8 @@ fn run_setup(update: bool) -> Result<()> {
             dirs.extend(old.as_ref().clone());
             if !update && !sys::onezip_running(&dirs).is_empty() {
                 let ok = rfd::MessageDialog::new()
-                    .set_title("安装 OneZip")
-                    .set_description("OneZip 正在运行，安装时会把它关掉（没做完的边解压边删除任务以后可以接着做）。继续吗？")
+                    .set_title(t!("安装 OneZip"))
+                    .set_description(t!("OneZip 正在运行，安装时会把它关掉（没做完的边解压边删除任务以后可以接着做）。继续吗？"))
                     .set_buttons(rfd::MessageButtons::OkCancel)
                     .show();
                 if ok != rfd::MessageDialogResult::Ok {
@@ -184,12 +188,13 @@ fn launch(dir: &Path) {
 fn run_uninstall() -> Result<()> {
     let Some(dest) = uninstall::target() else {
         rfd::MessageDialog::new()
-            .set_title("卸载 OneZip")
-            .set_description("没有找到已安装的 OneZip。")
+            .set_title(t!("卸载 OneZip"))
+            .set_description(t!("没有找到已安装的 OneZip。"))
             .show();
         return Ok(());
     };
     let w = UninstallWindow::new()?;
+    let _ = slint::select_bundled_translation(onezip_i18n::lang().slint_name());
     let version = sys::uninstall_key()
         .and_then(|k| k.get_value::<String, _>("DisplayVersion").ok())
         .unwrap_or_else(|| env!("CARGO_PKG_VERSION").into());
@@ -260,14 +265,14 @@ fn installed_location() -> Option<PathBuf> {
 fn resolve(chosen: &str, old: Option<&Path>) -> Result<PathBuf> {
     let chosen = chosen.trim().trim_matches('"');
     if chosen.is_empty() {
-        bail!("请选择安装位置");
+        bail!(t!("请选择安装位置"));
     }
     let p = PathBuf::from(chosen);
     if !p.is_absolute() || !p.has_root() {
-        bail!("请填写完整的路径，例如 D:\\Programs\\OneZip");
+        bail!(t!("请填写完整的路径，例如 D:\\Programs\\OneZip"));
     }
     if chosen.contains(['*', '?', '<', '>', '|', '"']) {
-        bail!("路径里有不能用的字符");
+        bail!(t!("路径里有不能用的字符"));
     }
     let p = PathBuf::from(chosen.trim_end_matches('\\'));
     let p = if p.as_os_str().len() <= 2 { PathBuf::from(format!("{}\\", p.display())) } else { p };
@@ -285,7 +290,7 @@ fn resolve(chosen: &str, old: Option<&Path>) -> Result<PathBuf> {
     if is_install(&sub) || is_empty(&sub) {
         return Ok(sub);
     }
-    bail!("{} 已经存在并且有别的文件，请换一个位置", sub.display());
+    bail!(t!("{} 已经存在并且有别的文件，请换一个位置", sub.display()));
 }
 
 #[cfg(test)]
