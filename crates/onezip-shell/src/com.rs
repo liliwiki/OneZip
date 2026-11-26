@@ -31,7 +31,7 @@ use windows::Win32::UI::Shell::{
 };
 use windows_core::{BOOL, GUID, HRESULT, HSTRING, Interface, PWSTR, Ref, Result, implement};
 
-use crate::{CLSID_TEXT, Entry, MENU, visible};
+use crate::{CLSID_TEXT, Entry, visible};
 
 static MODULE: OnceLock<usize> = OnceLock::new();
 
@@ -102,8 +102,8 @@ impl IExplorerCommand_Impl for Root_Impl {
     }
 
     fn GetState(&self, items: Ref<IShellItemArray>, _slow: BOOL) -> Result<u32> {
-        // 没有可用路径（例如虚拟文件夹里的项）时不显示。
-        if paths(items.as_ref()).is_empty() {
+        // 设置里关掉了右键菜单，或没有可用路径（例如虚拟文件夹里的项）时不显示。
+        if !onezip_settings::menu_filter().0 || paths(items.as_ref()).is_empty() {
             Ok(ECS_HIDDEN.0 as u32)
         } else {
             Ok(ECS_ENABLED.0 as u32)
@@ -119,7 +119,10 @@ impl IExplorerCommand_Impl for Root_Impl {
     }
 
     fn EnumSubCommands(&self) -> Result<IEnumExplorerCommand> {
-        let subs: Vec<IExplorerCommand> = MENU.iter().map(|&entry| Sub { entry }.into()).collect();
+        // 每次弹出菜单都重新读设置，改了设置不用重启资源管理器。
+        let (_, hidden) = onezip_settings::menu_filter();
+        let subs: Vec<IExplorerCommand> =
+            onezip_menu::without_hidden(&hidden).into_iter().map(|entry| Sub { entry }.into()).collect();
         Ok(Enum {
             subs,
             pos: AtomicUsize::new(0),

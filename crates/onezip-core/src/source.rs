@@ -25,6 +25,15 @@ impl Source {
     }
 }
 
+/// 链接里的文件名（去掉查询参数），如 `https://h/a/data.tar.zst?x=1` → `data.tar.zst`。
+pub(crate) fn url_file_name(url: &str) -> Option<String> {
+    let rest = url.split_once("://").map_or(url, |(_, r)| r);
+    let path = rest.split(['?', '#']).next()?;
+    let (_, path) = path.split_once('/')?;
+    let last = path.rsplit('/').next()?;
+    (!last.is_empty()).then(|| last.to_string())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -39,5 +48,7 @@ mod tests {
             Source::parse(r"D:\a.zip"),
             Source::Local(PathBuf::from(r"D:\a.zip"))
         );
+        assert_eq!(url_file_name("https://h.example/a/b/data.tar.zst?x=1").as_deref(), Some("data.tar.zst"));
+        assert_eq!(url_file_name("https://h.example/"), None);
     }
 }

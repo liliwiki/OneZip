@@ -14,7 +14,7 @@ mod ffi;
 mod iso;
 mod layout;
 
-use std::collections::{BTreeSet, HashMap};
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::fs::{self, File, OpenOptions};
 use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
@@ -24,20 +24,10 @@ use std::sync::{Arc, Mutex};
 use anyhow::{Context, Result, anyhow, bail};
 
 pub(crate) use archive::{BadPassword, NeedPassword};
-pub(crate) use fetch::{extract_url, handles_url};
+pub(crate) use fetch::extract_url;
 use archive::{Sink, Stopped, Target};
 
-use crate::{Confirm, Entry, Event, ExtractRequest, Observer, Outcome, Placement};
-
-/// 交给 7z.dll 的扩展名（小写，不带点）。
-pub(crate) const EXTENSIONS: &[&str] = &[
-    "iso", "img", "udf", "wim", "swm", "esd", "cab", "dmg", "vhd", "vhdx", "vmdk", "vdi", "qcow",
-    "qcow2", "msi", "msp", "msu", "arj", "lzh", "lha", "chm", "chi", "chw", "cpio", "rpm", "deb",
-    "xar", "pkg", "squashfs", "cramfs", "hfs", "hfsx", "apfs", "z", "taz", "lzma",
-];
-
-/// 能边解边删的扩展名。
-pub(crate) const IN_PLACE_EXTENSIONS: &[&str] = &["iso", "udf", "wim", "esd", "cab", "arj", "lzh", "lha"];
+use crate::{Confirm, Conflict, Entry, Event, ExtractRequest, Observer, Outcome, Placement};
 
 fn ext(path: &Path) -> String {
     path.extension()
@@ -45,9 +35,11 @@ fn ext(path: &Path) -> String {
         .unwrap_or_default()
 }
 
-pub(crate) fn handles(path: &Path) -> bool {
-    EXTENSIONS.contains(&ext(path).as_str())
+/// 有没有没做完的解压进度。
+pub(crate) fn has_progress(archive: &Path) -> bool {
+    Journal::path_for(archive).exists()
 }
+
 
 pub(crate) fn list(path: &Path, password: Option<String>) -> Result<Vec<Entry>> {
     let arc = archive::open(path, password)?;
@@ -85,11 +77,15 @@ pub(crate) fn test(path: &Path, password: Option<String>, observer: Observer) ->
 
 /// `<压缩包>.onezip-progress`：第一行版本，第二行模式（keep / inplace），第三行输出目录，
 /// 之后每行一个已完成的单元（keep 模式下是条目序号）。追加后立即刷盘。
+/// 开始时就决定好的同名文件处理也记在里面：`s <条目>` 不解出，`n <条目>\t<新路径>` 改名解出，
+/// 这样中断后继续时不会把自己上次解出的文件当成别人的。
 struct Journal {
     path: PathBuf,
     output: PathBuf,
     in_place: bool,
     done: BTreeSet<u64>,
+    skip: HashSet<u32>,
+    rename: HashMap<u32, String>,
 }
 
 const JOURNAL_MAGIC: &str = "onezip-progress 1";
@@ -112,8 +108,21 @@ impl Journal {
         let mode = lines.next().transpose()?.unwrap_or_default();
         let output = PathBuf::from(lines.next().transpose()?.unwrap_or_default());
         let mut done = BTreeSet::new();
+        let mut skip = HashSet::new();
+        let mut rename = HashMap::new();
         for line in lines {
-            if let Ok(n) = line?.trim().parse() {
+            let line = line?;
+            if let Some(n) = line.strip_prefix("s ") {
+                if let Ok(n) = n.trim().parse() {
+                    skip.insert(n);
+                }
+            } else if let Some(rest) = line.strip_prefix("n ") {
+                if let Some((n, rel)) = rest.split_once('\t')
+                    && let Ok(n) = n.parse()
+                {
+                    rename.insert(n, rel.to_string());
+                }
+            } else if let Ok(n) = line.trim().parse() {
                 done.insert(n);
             }
         }
@@ -122,22 +131,40 @@ impl Journal {
             output,
             in_place: mode == "inplace",
             done,
+            skip,
+            rename,
         }))
     }
 
-    fn create(archive: &Path, output: &Path, in_place: bool) -> Result<Journal> {
+    fn create(archive: &Path, output: &Path, in_place: bool, plan: Clashes) -> Result<Journal> {
         let path = Self::path_for(archive);
         let mut f = File::create(&path).with_context(|| format!("创建 {}", path.display()))?;
         writeln!(f, "{JOURNAL_MAGIC}")?;
         writeln!(f, "{}", if in_place { "inplace" } else { "keep" })?;
         writeln!(f, "{}", output.display())?;
+        for n in &plan.skip {
+            writeln!(f, "s {n}")?;
+        }
+        for (n, rel) in &plan.rename {
+            writeln!(f, "n {n}\t{rel}")?;
+        }
         f.sync_all()?;
         Ok(Journal {
             path,
             output: output.to_path_buf(),
             in_place,
             done: BTreeSet::new(),
+            skip: plan.skip,
+            rename: plan.rename,
         })
+    }
+
+    /// 条目解到哪里；不解出时 `None`。
+    fn target(&self, index: u32, rel: &str) -> Option<PathBuf> {
+        if self.skip.contains(&index) {
+            return None;
+        }
+        Some(target_of(&self.output, self.rename.get(&index).map_or(rel, String::as_str)))
     }
 
     fn record(&mut self, ids: &[u64]) -> Result<()> {
@@ -167,11 +194,7 @@ fn top_names<'a>(paths: impl Iterator<Item = &'a str>) -> BTreeSet<String> {
 }
 
 fn stem(archive: &Path) -> String {
-    let name = archive.file_name().unwrap_or_default().to_string_lossy().into_owned();
-    match name.rsplit_once('.') {
-        Some((s, _)) if !s.is_empty() => s.to_string(),
-        _ => format!("{name}-extracted"),
-    }
+    onezip_formats::archive_stem(&archive.to_string_lossy())
 }
 
 fn choose_output(archive: &Path, req: &ExtractRequest, paths: &[&str]) -> PathBuf {
@@ -193,6 +216,56 @@ fn target_of(output: &Path, rel: &str) -> PathBuf {
         p.push(part);
     }
     p
+}
+
+/// 开始前对已有同名文件的处理决定。
+#[derive(Default)]
+struct Clashes {
+    skip: HashSet<u32>,
+    rename: HashMap<u32, String>,
+}
+
+/// 按 `conflict` 决定已经存在的文件怎么办。`files` 是（条目序号，相对路径）。
+/// 选"不动"时有同名文件就报错，什么都不改。
+fn plan_clashes(output: &Path, files: &[(u32, &str)], conflict: Conflict) -> Result<Clashes> {
+    let mut plan = Clashes::default();
+    if !output.exists() {
+        return Ok(plan);
+    }
+    let clash: Vec<(u32, &str)> =
+        files.iter().copied().filter(|(_, rel)| fs::symlink_metadata(target_of(output, rel)).is_ok()).collect();
+    let Some(first) = clash.first() else { return Ok(plan) };
+    match conflict {
+        Conflict::Refuse => bail!(
+            "{} 里已有 {} 个同名文件（例如 {}）。什么都没改动；如要替换请选择替换",
+            output.display(),
+            clash.len(),
+            target_of(output, first.1).display()
+        ),
+        Conflict::Replace => {}
+        Conflict::Skip => plan.skip = clash.iter().map(|c| c.0).collect(),
+        Conflict::Rename => {
+            // 新名字不能和压缩包里别的条目、也不能和已经分出去的新名字撞上。
+            let mut taken: HashSet<String> = files.iter().map(|(_, r)| r.to_lowercase()).collect();
+            for (n, rel) in clash {
+                let (dir, name) = match rel.rsplit_once('/') {
+                    Some((d, n)) => (format!("{d}/"), n),
+                    None => (String::new(), rel),
+                };
+                let (base, ext) = match name.rsplit_once('.') {
+                    Some((b, e)) if !b.is_empty() => (b, format!(".{e}")),
+                    _ => (name, String::new()),
+                };
+                let new = (2..)
+                    .map(|i| format!("{dir}{base} ({i}){ext}"))
+                    .find(|r| !taken.contains(&r.to_lowercase()) && fs::symlink_metadata(target_of(output, r)).is_err())
+                    .unwrap();
+                taken.insert(new.to_lowercase());
+                plan.rename.insert(n, new);
+            }
+        }
+    }
+    Ok(plan)
 }
 
 /// 完成时报告的位置：直接放在压缩包旁边且只有一个顶层项时报告那一项。
@@ -344,25 +417,27 @@ impl Sink for Collect {
 const BATCH_UNITS: usize = 512;
 const BATCH_BYTES: u64 = 2 << 30;
 
+/// 解一个 7z.dll 能打开的包。完成时另外返回"解出来唯一的那个文件，如果它是压缩包"
+/// （给嵌套拆包用）。
 pub(crate) fn extract(
     archive_path: &Path,
     req: &ExtractRequest,
     observer: Observer,
     stop: &Arc<AtomicBool>,
     confirm: &mut dyn FnMut(&Confirm) -> bool,
-) -> Result<Outcome> {
+) -> Result<(Outcome, Option<PathBuf>)> {
     let journal = Journal::load(archive_path)?;
     let resuming = journal.is_some();
     let in_place = match &journal {
         Some(j) => j.in_place,
         None => !req.keep_source,
     };
-    if in_place && !IN_PLACE_EXTENSIONS.contains(&ext(archive_path).as_str()) {
+    if in_place && !onezip_formats::in_place(&archive_path.to_string_lossy()) {
         bail!("这种格式不能边解压边删除；请用保留原压缩包的方式解压");
     }
     // ISO/UDF 边解边删：数据不压缩，自己读目录、自己拷数据，不经过 7z.dll。
     if in_place && matches!(ext(archive_path).as_str(), "iso" | "udf") {
-        return iso::extract_in_place(archive_path, req, journal, observer, stop, confirm);
+        return iso::extract_in_place(archive_path, req, journal, observer, stop, confirm).map(|o| (o, None));
     }
 
     let arc = archive::open(archive_path, req.password.clone())?;
@@ -381,22 +456,8 @@ pub(crate) fn extract(
         Some(j) => j,
         None => {
             let output = choose_output(archive_path, req, &paths);
-            if !req.replace {
-                let clash: Vec<_> = items
-                    .iter()
-                    .filter(|i| !i.is_dir)
-                    .map(|i| target_of(&output, &i.path))
-                    .filter(|p| p.exists())
-                    .collect();
-                if let Some(first) = clash.first() {
-                    bail!(
-                        "{} 里已有 {} 个同名文件（例如 {}）。什么都没改动；如要替换请选择替换",
-                        output.display(),
-                        clash.len(),
-                        first.display()
-                    );
-                }
-            }
+            let files: Vec<(u32, &str)> = items.iter().filter(|i| !i.is_dir).map(|i| (i.index, i.path.as_str())).collect();
+            let plan = plan_clashes(&output, &files, req.conflict)?;
             if in_place
                 && !confirm(&Confirm {
                     archive: &archive_path.file_name().unwrap_or_default().to_string_lossy(),
@@ -405,7 +466,7 @@ pub(crate) fn extract(
             {
                 bail!("已取消，压缩包没有任何改动");
             }
-            Journal::create(archive_path, &output, in_place)?
+            Journal::create(archive_path, &output, in_place, plan)?
         }
     };
     let output = journal.output.clone();
@@ -423,26 +484,123 @@ pub(crate) fn extract(
         .collect();
     // 按数据在文件里的先后处理：边下载边解压时读取是顺序的，下载可以一直走在前面。
     todo.sort_by_key(|(_, u)| u.ranges.first().map_or(0, |r| r.0));
+    let skipped = journal.skip.clone();
     let unit_bytes = |u: &layout::Unit| -> u64 {
-        u.items.iter().filter_map(|i| by_index.get(i)).filter(|i| !i.is_dir).map(|i| i.size).sum()
+        u.items
+            .iter()
+            .filter(|i| !skipped.contains(i))
+            .filter_map(|i| by_index.get(i))
+            .filter(|i| !i.is_dir)
+            .map(|i| i.size)
+            .sum()
     };
     let total: u64 = todo.iter().map(|(_, u)| unit_bytes(u)).sum();
     observer(Event::Started { total, resuming });
 
-    let file = if in_place {
-        Some(OpenOptions::new().read(true).write(true).open(archive_path)?)
-    } else {
-        None
+    // 解出来只有一个文件并且像压缩包：嵌套拆包用。
+    let sole = {
+        let mut files = items.iter().filter(|i| !i.is_dir);
+        match (files.next(), files.next()) {
+            (Some(only), None) if onezip_formats::is_nested_candidate(&only.path) => {
+                journal.target(only.index, &only.path)
+            }
+            _ => None,
+        }
     };
-    let mut can_punch = true;
 
+    if in_place {
+        run_in_place(archive_path, &arc, &journal_targets(&journal, &by_index), &mut journal, &todo, &unit_bytes, req, &observer, stop)?;
+        if stop.load(Ordering::Relaxed) && !journal_complete(&journal, units.len()) {
+            return Ok((Outcome::Paused, None));
+        }
+    } else {
+        // 保留原包：一次交给 7z.dll，固实压缩包只需从头解一遍。做完的条目在停下或出错时记进进度。
+        let unit_of: HashMap<u32, u64> = units.iter().enumerate().map(|(n, u)| (u.items[0], n as u64)).collect();
+        let mut targets = HashMap::new();
+        let mut nothing = Vec::new();
+        for (n, u) in &todo {
+            let idx = u.items[0];
+            match by_index.get(&idx).filter(|it| !it.is_dir).and_then(|it| journal.target(idx, &it.path)) {
+                Some(t) => {
+                    targets.insert(idx, t);
+                }
+                None => nothing.push(*n),
+            }
+        }
+        let indices: Vec<u32> = targets.keys().copied().collect();
+        let written = Arc::new(Mutex::new(Vec::new()));
+        let result = if indices.is_empty() {
+            Ok(())
+        } else {
+            let sink = Collect {
+                targets,
+                written: written.clone(),
+                observer: observer.clone(),
+            };
+            arc.extract(&indices, false, req.password.clone(), stop, Box::new(sink))
+        };
+        if let Err(e) = result {
+            let ids: Vec<u64> = written.lock().unwrap().iter().filter_map(|(i, _)| unit_of.get(i).copied()).collect();
+            if ids.is_empty() && journal.done.is_empty() {
+                // 什么都没解出（如需要密码）：不留进度文件，下次从头来。
+                drop(arc);
+                journal.remove();
+            } else {
+                journal.record(&ids.into_iter().chain(nothing).collect::<Vec<_>>())?;
+            }
+            return if e.is::<Stopped>() { Ok((Outcome::Paused, None)) } else { Err(e) };
+        }
+    }
+
+    drop(arc);
+    let reported = reported_output(archive_path, &output, &paths);
+    if in_place {
+        fs::remove_file(archive_path).with_context(|| format!("删除 {}", archive_path.display()))?;
+    }
+    journal.remove();
+    Ok((
+        Outcome::Finished {
+            output: reported,
+            warning: None,
+        },
+        sole,
+    ))
+}
+
+fn journal_targets(journal: &Journal, by_index: &HashMap<u32, &archive::Item>) -> HashMap<u32, PathBuf> {
+    by_index
+        .iter()
+        .filter(|(_, it)| !it.is_dir)
+        .filter_map(|(&idx, it)| journal.target(idx, &it.path).map(|t| (idx, t)))
+        .collect()
+}
+
+fn journal_complete(journal: &Journal, units: usize) -> bool {
+    journal.done.len() >= units
+}
+
+/// 边解边删：按批解出 → 刷盘 → 记进度 → 打洞。
+#[allow(clippy::too_many_arguments)]
+fn run_in_place(
+    archive_path: &Path,
+    arc: &archive::Archive,
+    all_targets: &HashMap<u32, PathBuf>,
+    journal: &mut Journal,
+    todo: &[(u64, &layout::Unit)],
+    unit_bytes: &dyn Fn(&layout::Unit) -> u64,
+    req: &ExtractRequest,
+    observer: &Observer,
+    stop: &Arc<AtomicBool>,
+) -> Result<()> {
+    let file = OpenOptions::new().read(true).write(true).open(archive_path)?;
+    let mut can_punch = true;
     let mut start = 0;
     while start < todo.len() {
         // 组一批
         let mut end = start;
         let mut bytes = 0;
         while end < todo.len()
-            && end - start < if in_place { BATCH_UNITS } else { 4096 }
+            && end - start < BATCH_UNITS
             && (end == start || bytes + unit_bytes(todo[end].1) <= BATCH_BYTES)
         {
             bytes += unit_bytes(todo[end].1);
@@ -451,16 +609,11 @@ pub(crate) fn extract(
         let batch = &todo[start..end];
         start = end;
 
-        let mut targets = HashMap::new();
-        for (_, u) in batch {
-            for idx in &u.items {
-                if let Some(it) = by_index.get(idx)
-                    && !it.is_dir
-                {
-                    targets.insert(*idx, target_of(&output, &it.path));
-                }
-            }
-        }
+        let targets: HashMap<u32, PathBuf> = batch
+            .iter()
+            .flat_map(|(_, u)| u.items.iter())
+            .filter_map(|idx| all_targets.get(idx).map(|t| (*idx, t.clone())))
+            .collect();
         let indices: Vec<u32> = targets.keys().copied().collect();
         let written = Arc::new(Mutex::new(Vec::new()));
         if !indices.is_empty() {
@@ -471,26 +624,20 @@ pub(crate) fn extract(
             };
             match arc.extract(&indices, false, req.password.clone(), stop, Box::new(sink)) {
                 Ok(()) => {}
-                Err(e) if e.is::<Stopped>() => {
-                    // 已经写好的文件留着；这一批没记进度，下次整批重来（覆盖它们）。
-                    return Ok(Outcome::Paused);
-                }
+                // 已经写好的文件留着；这一批没记进度，下次整批重来（覆盖它们）。
+                Err(e) if e.is::<Stopped>() => return Ok(()),
                 Err(e) => return Err(e),
             }
         }
         let written: Vec<PathBuf> = written.lock().unwrap().iter().map(|(_, p)| p.clone()).collect();
-        if in_place {
-            flush_all(&written)?;
-        }
+        flush_all(&written)?;
         let ids: Vec<u64> = batch.iter().map(|(n, _)| *n).collect();
         journal.record(&ids)?;
 
         #[cfg(windows)]
-        if let Some(f) = &file
-            && can_punch
-        {
+        if can_punch {
             for (s, e) in merged(batch.iter().flat_map(|(_, u)| u.ranges.iter())) {
-                if !punch::punch(f, s, e)? {
+                if !punch::punch(&file, s, e)? {
                     can_punch = false;
                     observer(Event::Note("这个磁盘不支持释放部分空间，原压缩包会在解压完成后删除".into()));
                     break;
@@ -501,20 +648,9 @@ pub(crate) fn extract(
             }
         }
         if stop.load(Ordering::Relaxed) && start < todo.len() {
-            return Ok(Outcome::Paused);
+            return Ok(());
         }
     }
     let _ = can_punch;
-
-    drop(file);
-    drop(arc);
-    let reported = reported_output(archive_path, &output, &paths);
-    if in_place {
-        fs::remove_file(archive_path).with_context(|| format!("删除 {}", archive_path.display()))?;
-    }
-    journal.remove();
-    Ok(Outcome::Finished {
-        output: reported,
-        warning: None,
-    })
+    Ok(())
 }

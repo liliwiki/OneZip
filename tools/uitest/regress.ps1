@@ -11,6 +11,8 @@ function UI { & powershell -NoProfile -ExecutionPolicy Bypass -File "$here\ui.ps
 function T($p) { & powershell -NoProfile -ExecutionPolicy Bypass -File "$here\tree.ps1" -Path $p }
 function WaitFor($cond, $sec = 20) { for ($i = 0; $i -lt $sec * 4; $i++) { if (& $cond) { return $true }; Start-Sleep -Milliseconds 250 }; $false }
 $results = @()
+# 边解压边删除先弹说明窗口（设置里关掉了就不弹）：弹了就点"开始"。
+function StartInPlace { if (WaitFor { (UI -Do windows | Select-String 'foreground: 边解压边删除压缩包') } 10) { UI -Do click -Window '边解压边删除压缩包' -Name '开始' | Out-Null } }
 function Check($name, $ok, $detail = '') { $script:results += [pscustomobject]@{ 项 = $name; 结果 = $(if ($ok) { '通过' } else { '失败' }); 说明 = $detail } }
 
 # ---- 准备 ----
@@ -23,7 +25,7 @@ Set-Content "$Dir\src\甲\a.txt" ("甲" * 9000); Set-Content "$Dir\src\乙\b.txt
 & $cli a "$Dir\资料.zip" "$Dir\src\资料" -t zip | Out-Null
 & $cli a "$Dir\多根.7z" "$Dir\src\甲" "$Dir\src\乙" | Out-Null
 & $cli a "$Dir\加密.7z" "$Dir\src\资料" -p 1234 | Out-Null
-foreach ($n in '到这', '删包', '带 空格 (1)', '测试') { Copy-Item "$Dir\资料.zip" "$Dir\$n.zip" }
+foreach ($n in '到这', '删包', '边删', '带 空格 (1)', '测试') { Copy-Item "$Dir\资料.zip" "$Dir\$n.zip" }
 Set-Content "$Dir\笔记.txt" ("note " * 2000)
 Copy-Item "$Dir\src\资料" "$Dir\照片" -Recurse
 $ref = T "$Dir\src\资料"
@@ -48,8 +50,14 @@ MN -Folder $Dir -Items '到这.zip' -Command '解压到当前位置'
 Check '解压到当前位置' (WaitFor { (T "$Dir\资料") -eq $ref })
 Remove-Item "$Dir\资料" -Recurse -Force
 
-MN -Folder $Dir -Items '删包.zip' -Command '解压后删除压缩包*'
-Check '解压后删除压缩包' ((WaitFor { (T "$Dir\资料") -eq $ref -and -not (Test-Path "$Dir\删包.zip") }))
+MN -Folder $Dir -Items '删包.zip' -Command '解压后删除压缩包'
+Check '解压后删除压缩包（解完再删）' ((WaitFor { (T "$Dir\资料") -eq $ref -and -not (Test-Path "$Dir\删包.zip") }))
+Remove-Item "$Dir\资料" -Recurse -Force
+
+MN -Folder $Dir -Items '边删.zip' -Command '边解压边删除压缩包'
+StartInPlace
+Check '边解压边删除压缩包（先确认）' ((WaitFor { (T "$Dir\资料") -eq $ref -and -not (Test-Path "$Dir\边删.zip") -and -not (Test-Path "$Dir\边删.zip.onezip-progress") } 30))
+WaitFor { -not (Get-Process OneZip -EA SilentlyContinue) } 20 | Out-Null
 Remove-Item "$Dir\资料" -Recurse -Force
 
 MN -Folder $Dir -Items '带 空格 (1).zip' -Command '解压到*带 空格*'
@@ -113,18 +121,19 @@ Check '加密包：密码框在最前，输对后解出' ($pw -and (WaitFor { (T
 WaitFor { -not (Get-Process OneZip -EA SilentlyContinue) } 20 | Out-Null
 Remove-Item "$Dir\资料" -Recurse -Force -EA SilentlyContinue
 
-# ---- 先开对话框再点“右键菜单…”（以前会卡死）----
+# ---- 先开对话框再点“设置”（以前点“右键菜单…”会卡死）----
 # 从右键菜单来的操作不再弹主窗口，这里先单独打开主窗口。
 Start-Process "$installed\OneZip.exe"
 WaitFor { (UI -Do windows | Select-String '^OneZip \|') } 10 | Out-Null
 MN -Folder $Dir -Items '笔记.txt' -Command '添加到压缩包…'
 WaitFor { (UI -Do windows | Select-String 'foreground: 添加到压缩包') } 10 | Out-Null
-UI -Do click -Window OneZip -Name '右键菜单…' | Out-Null
-$box = WaitFor { (UI -Do windows | Select-String 'foreground: 右键菜单') } 10
-UI -Do click -Window '右键菜单' -Name '确定' | Out-Null; Start-Sleep 1
-UI -Do click -Window '添加到压缩包' -Name '取消' | Out-Null; Start-Sleep 1
+UI -Do click -Window OneZip -Name '设置' | Out-Null
+$box = WaitFor { (UI -Do windows | Select-String 'OneZip 设置') } 10
+UI -Do close -Window 'OneZip 设置' | Out-Null; Start-Sleep 1
+UI -Do invoke -Window '添加到压缩包' -Name '取消' | Out-Null; Start-Sleep 1
 $alive = (Get-Process OneZip).Responding -notcontains $false
-Check '对话框开着时点“右键菜单…”不卡死' ($box -and $alive)
+$shut = -not (UI -Do windows | Select-String '^(OneZip 设置|添加到压缩包) \|')
+Check '对话框开着时点“设置”不卡死' ($box -and $alive -and $shut)
 UI -Do click -Window OneZip -Name '清除已完成' | Out-Null
 (Get-Process OneZip -EA SilentlyContinue).CloseMainWindow() | Out-Null
 WaitFor { -not (Get-Process OneZip -EA SilentlyContinue) } 10 | Out-Null
@@ -179,16 +188,17 @@ Copy-Item "$fx\sevenzip\cab\lzx.cab" "$Dir\驱动.cab"
 Copy-Item "$fx\sevenzip\iso\joliet.iso" "$Dir\磁盘.vhd"
 Copy-Item "$fx\rar\rar5-hp\set.rar" "$Dir\加密名.rar"
 $m = & powershell -NoProfile -ExecutionPolicy Bypass -File "$here\menu.ps1" -Folder $Dir -Items '光盘.iso'
-Check 'iso 菜单有“解压后删除压缩包”' (($m -match '智能解压') -and ($m -match '解压后删除压缩包'))
+Check 'iso 菜单两种删除都有' (($m -match '智能解压') -and ($m -match '解压后删除压缩包') -and ($m -match '边解压边删除压缩包'))
 $m = & powershell -NoProfile -ExecutionPolicy Bypass -File "$here\menu.ps1" -Folder $Dir -Items '磁盘.vhd'
-Check 'vhd 菜单能解压、没有“解压后删除压缩包”' (($m -match '智能解压') -and -not ($m -match '解压后删除压缩包'))
+Check 'vhd 菜单能解压后删除、不能边解压边删除' (($m -match '智能解压') -and ($m -match '解压后删除压缩包') -and -not ($m -match '边解压边删除压缩包'))
 
 MN -Folder $Dir -Items '光盘.iso' -Command '智能解压'
 Check 'iso 智能解压' ((WaitFor { (Test-Path "$Dir\光盘\docs\readme.txt") -and (Get-Item "$Dir\光盘\big file.bin" -EA SilentlyContinue).Length -eq 400000 }) -and (Test-Path "$Dir\光盘.iso"))
 MN -Folder $Dir -Items '驱动.cab' -Command '智能解压'
 Check 'cab 智能解压' (WaitFor { (Test-Path "$Dir\驱动\docs\readme.txt") -and (Get-Item "$Dir\驱动\sub\deep\data.bin" -EA SilentlyContinue).Length -eq 100000 })
 WaitFor { -not (Get-Process OneZip -EA SilentlyContinue) } 20 | Out-Null
-MN -Folder $Dir -Items '光盘删.iso' -Command '解压后删除压缩包*'
+MN -Folder $Dir -Items '光盘删.iso' -Command '边解压边删除压缩包'
+StartInPlace
 Check 'iso 边解边删（UDF）' (WaitFor { (Test-Path "$Dir\光盘删\docs\readme.txt") -and -not (Test-Path "$Dir\光盘删.iso") -and -not (Test-Path "$Dir\光盘删.iso.onezip-progress") } 30)
 WaitFor { -not (Get-Process OneZip -EA SilentlyContinue) } 20 | Out-Null
 

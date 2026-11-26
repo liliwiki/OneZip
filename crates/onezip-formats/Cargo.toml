@@ -1,0 +1,10 @@
+[package]
+name = "onezip-formats"
+description = "What OneZip knows about archive file names: which extensions are archives, which engine opens them, whether they can be extracted in place, and what folder they extract to."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish = false
+
+[dependencies]

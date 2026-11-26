@@ -16,7 +16,8 @@ use hatchzip_core::journal::{Journal, Paths};
 use hatchzip_core::replace::Choices;
 use hatchzip_core::session::{self, State};
 
-use crate::{Confirm, Event, ExtractRequest, Observer, Outcome, Placement, Source, human};
+use crate::route::Local;
+use crate::{Confirm, Conflict, Event, ExtractRequest, Observer, Outcome, Placement, Source, human};
 
 /// 嵌套压缩包最多连续拆几层，防止"压缩包套压缩包"的炸弹。
 const MAX_NESTED: usize = 4;
@@ -32,7 +33,7 @@ pub struct Entry {
 /// 列出压缩包内容，不做任何改动。
 pub fn list(archive: &Path, password: Option<String>) -> Result<Vec<Entry>> {
     #[cfg(windows)]
-    if crate::sevenzip::handles(archive) {
+    if onezip_formats::engine(&archive.to_string_lossy()) == onezip_formats::Engine::SevenZip {
         return crate::sevenzip::list(archive, password);
     }
     let job = match open(archive, None, false, password)?.0 {
@@ -56,7 +57,7 @@ pub fn list(archive: &Path, password: Option<String>) -> Result<Vec<Entry>> {
 /// 完整校验压缩包（解码一遍、核对校验和），不写出任何文件。
 pub fn test(archive: &Path, password: Option<String>, observer: Observer) -> Result<()> {
     #[cfg(windows)]
-    if crate::sevenzip::handles(archive) {
+    if onezip_formats::engine(&archive.to_string_lossy()) == onezip_formats::Engine::SevenZip {
         return crate::sevenzip::test(archive, password, observer);
     }
     let job = match open(archive, None, false, password)?.0 {
@@ -101,14 +102,10 @@ pub(crate) fn extract(
     stop: &Arc<AtomicBool>,
     confirm: &mut dyn FnMut(&Confirm) -> bool,
 ) -> Result<Outcome> {
-    if crate::remote::handles_local(archive) {
+    if crate::route::local(archive, req) == Local::Peel {
         return crate::remote::extract_file(archive, req, observer, stop, confirm);
     }
-    #[cfg(windows)]
-    if crate::sevenzip::handles(archive) {
-        return crate::sevenzip::extract(archive, req, observer, stop, confirm);
-    }
-    let (outcome, nested) = extract_one(archive, req, observer.clone(), stop, confirm)?;
+    let (outcome, nested) = extract_any(archive, req, observer.clone(), stop, confirm)?;
     let Outcome::Finished { output, warning } = outcome else {
         return Ok(outcome);
     };
@@ -134,10 +131,11 @@ pub(crate) fn extract(
             output: None,
             placement: Placement::Smart,
             keep_source: false,
+            verify_first: false,
             nested: false,
             ..req.clone()
         };
-        match extract_one(&next, &sub, observer.clone(), stop, &mut |_| true) {
+        match extract_any(&next, &sub, observer.clone(), stop, &mut |_| true) {
             Ok((Outcome::Finished { .. }, more)) => inner = more,
             Ok((Outcome::Paused, _)) => return Ok(Outcome::Paused),
             // 看着像压缩包但打不开：保留它，不算失败。
@@ -148,6 +146,29 @@ pub(crate) fn extract(
         }
     }
     Ok(Outcome::Finished { output, warning })
+}
+
+/// 解一个包（引擎见 [`crate::route`]）。完成时另外返回"解出来唯一的那个文件，如果它是压缩包"。
+fn extract_any(
+    archive: &Path,
+    req: &ExtractRequest,
+    observer: Observer,
+    stop: &Arc<AtomicBool>,
+    confirm: &mut dyn FnMut(&Confirm) -> bool,
+) -> Result<(Outcome, Option<PathBuf>)> {
+    #[cfg(windows)]
+    if let Local::SevenZip(primary) = crate::route::local(archive, req) {
+        let r = crate::sevenzip::extract(&primary, req, observer.clone(), stop, confirm);
+        match r {
+            // 7z.dll 什么都没解出时不留进度文件，这时换 hatchzip-core 再试是干净的。
+            Err(e)
+                if crate::needs_password(&e)
+                    && crate::route::retry_zip_password_with_hatchzip(&primary, req)
+                    && !crate::sevenzip::has_progress(&primary) => {}
+            r => return r,
+        }
+    }
+    extract_one(archive, req, observer, stop, confirm)
 }
 
 /// 解一个包。完成时另外返回"解出来唯一的那个文件，如果它是压缩包"。
@@ -197,7 +218,7 @@ fn extract_one(
                 place(&job, &primary, default_out, req.placement)?
             };
             let found = session::existing(&job, &out)?;
-            if !found.is_empty() && !req.replace {
+            if !found.is_empty() && req.conflict == Conflict::Refuse {
                 bail!(
                     "{} 里已有 {} 个同名文件（例如 {}）。什么都没改动；如要替换请选择替换",
                     out.display(),
@@ -220,16 +241,17 @@ fn extract_one(
                     bail!("已取消，压缩包没有任何改动");
                 }
             }
-            let choices = Choices {
-                keep: Vec::new(),
-                both: Vec::new(),
+            let choices = match req.conflict {
+                Conflict::Skip => Choices { keep: found, both: Vec::new() },
+                Conflict::Rename => Choices { keep: Vec::new(), both: found },
+                Conflict::Refuse | Conflict::Replace => Choices::default(),
             };
             let journal = session::begin(
                 &job,
                 &paths,
                 out,
                 req.keep_source,
-                req.replace.then_some(&choices),
+                (req.conflict != Conflict::Refuse).then_some(&choices),
             )?;
             (job, journal, false)
         }
@@ -293,20 +315,7 @@ fn sole_archive(job: &Job, out: &Path) -> Option<PathBuf> {
     if files.next().is_some() || !matches!(only.kind, Kind::File) {
         return None;
     }
-    looks_like_archive(&only.path).then(|| out.join(&only.path))
-}
-
-fn looks_like_archive(path: &Path) -> bool {
-    let name = path
-        .file_name()
-        .map(|n| n.to_string_lossy().to_ascii_lowercase())
-        .unwrap_or_default();
-    [
-        ".zip", ".7z", ".tar", ".tgz", ".tar.gz", ".tar.xz", ".txz", ".tar.bz2", ".tbz2",
-        ".tar.zst", ".tzst",
-    ]
-    .iter()
-    .any(|ext| name.ends_with(ext))
+    onezip_formats::is_nested_candidate(&only.path.to_string_lossy()).then(|| out.join(&only.path))
 }
 
 fn check_space(job: &Job, out: &Path, resuming: bool, keep_free: u64, keep: bool) -> Result<()> {

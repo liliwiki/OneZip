@@ -166,6 +166,7 @@ impl Format for Zip {
         Ok(Box::new(ZipWorker {
             zip,
             password: self.password.as_deref(),
+            known: None,
         }))
     }
 
@@ -201,24 +202,51 @@ impl Format for Zip {
     }
 }
 
+/// The bytes a ZIP password may have been encrypted with, most likely first.
+/// The format never said which encoding to use: 7-Zip (and most Windows
+/// tools) use the ANSI code page, so `密码` is GBK on Chinese Windows, while
+/// others use UTF-8. A writer should use the first.
+pub fn zip_password_bytes(password: &str) -> Vec<Vec<u8>> {
+    let mut out = Vec::with_capacity(2);
+    if let Some(ansi) = crate::platform::ansi_bytes(password) {
+        out.push(ansi);
+    }
+    out.push(password.as_bytes().to_vec());
+    out
+}
+
 struct ZipWorker<'a> {
     zip: ZipArchive<Reader>,
     password: Option<&'a str>,
+    /// The encoding of the password that opened an entry, tried first from then on.
+    known: Option<Vec<u8>>,
 }
 
 impl Worker for ZipWorker<'_> {
     fn extract(&mut self, unit: &Unit, sink: &mut dyn Sink) -> Result<()> {
         // The zip crate checks the CRC as the stream ends, so corruption
         // surfaces as a read error inside the sink.
-        let opened = match (unit.encrypted, self.password) {
-            (false, _) => self.zip.by_index(unit.key),
-            (true, Some(pw)) => self.zip.by_index_decrypt(unit.key, pw.as_bytes()),
-            (true, None) => return Err(PasswordNeeded.into()),
+        if !unit.encrypted {
+            let mut data = self.zip.by_index(unit.key)?;
+            return sink.item(&unit.items[0], &mut data);
+        }
+        let Some(pw) = self.password else {
+            return Err(PasswordNeeded.into());
         };
-        let mut data = opened.map_err(|e| match e {
-            ZipError::InvalidPassword => anyhow::Error::new(WrongPassword),
-            e => anyhow::Error::new(e),
-        })?;
+        let mut tries = zip_password_bytes(pw);
+        if let Some(known) = &self.known {
+            tries.retain(|t| t != known);
+            tries.insert(0, known.clone());
+        }
+        // The check value in each entry's header settles which bytes are
+        // right before anything is written.
+        let Some(found) = tries.into_iter().find(|t| {
+            !matches!(self.zip.by_index_decrypt(unit.key, t), Err(ZipError::InvalidPassword))
+        }) else {
+            return Err(WrongPassword.into());
+        };
+        self.known = Some(found.clone());
+        let mut data = self.zip.by_index_decrypt(unit.key, &found)?;
         sink.item(&unit.items[0], &mut data)
     }
 }

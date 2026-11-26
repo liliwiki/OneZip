@@ -1,0 +1,11 @@
+[package]
+name = "onezip-settings"
+description = "OneZip settings: every option with its default, stored per user under HKCU\\Software\\OneZip. Shared by the app, the menu DLL and the uninstaller."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish = false
+
+[target."cfg(windows)".dependencies]
+winreg = "0.56"

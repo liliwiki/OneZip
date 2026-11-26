@@ -1,0 +1,7 @@
+// 所有窗口的底子：统一背景和图标。浅色 / 深色由 Rust 设置各窗口的 Palette.color-scheme。
+import { Palette } from "std-widgets.slint";
+
+export component ThemedWindow inherits Window {
+    background: Palette.background;
+    icon: @image-url("../../../assets/onezip-256.png");
+}

@@ -30,6 +30,7 @@ fn chunk_size(len: u64) -> u64 {
 }
 /// 读取位置之后提前下载多少。
 const WINDOW: u64 = 256 << 20;
+/// 默认同时下载的连接数。
 const WORKERS: usize = 8;
 const MAGIC: &str = "onezip-download 1";
 
@@ -311,18 +312,10 @@ fn probe(client: &Client, url: &Url) -> Result<(u64, String)> {
     Ok((total, tag))
 }
 
+/// 链接里的文件名，清理成能在磁盘上用的名字。
 fn url_file_name(url: &str) -> Option<String> {
-    let rest = url.split_once("://").map_or(url, |(_, r)| r);
-    let path = rest.split(['?', '#']).next()?;
-    let (_, path) = path.split_once('/')?;
-    let last = path.rsplit('/').next()?;
-    let last = super::archive::clean_path(last);
+    let last = super::archive::clean_path(&crate::source::url_file_name(url)?);
     (!last.is_empty() && !last.contains('/')).then_some(last)
-}
-
-/// URL 是不是交给这里（7z.dll 的格式）。
-pub(crate) fn handles_url(url: &str) -> bool {
-    url_file_name(url).is_some_and(|n| super::handles(Path::new(&n)))
 }
 
 /// 边下载边解压。输出目录是 `req.output`（没给就用当前目录下以文件名命名的文件夹）。
@@ -408,7 +401,8 @@ pub(crate) fn extract_url(url: &str, req: &ExtractRequest, observer: Observer, s
     mirror.downloaded.store(already, Ordering::Relaxed);
     registry().lock().unwrap().push((std::path::absolute(&mirror_path)?, Arc::downgrade(&mirror)));
 
-    let workers: Vec<_> = (0..WORKERS).map(|_| {
+    let n_workers = if req.connections > 0 { req.connections as usize } else { WORKERS };
+    let workers: Vec<_> = (0..n_workers).map(|_| {
         let m = mirror.clone();
         thread::spawn(move || m.worker())
     }).collect();
@@ -449,15 +443,15 @@ pub(crate) fn extract_url(url: &str, req: &ExtractRequest, observer: Observer, s
     };
 
     // 能边解边删的格式就边解边删（下载的数据用完即放），否则解完再删镜像。
-    let in_place = super::IN_PLACE_EXTENSIONS.contains(&super::ext(&mirror_path).as_str());
+    let in_place = onezip_formats::in_place(&name);
     let local = ExtractRequest {
         source: crate::Source::Local(mirror_path.clone()),
         output: Some(output.clone()),
         keep_source: !in_place,
-        replace: req.replace || resuming,
+        conflict: if resuming { crate::Conflict::Replace } else { req.conflict },
         ..req.clone()
     };
-    let result = super::extract(&mirror_path, &local, inner, stop, &mut |_| true);
+    let result = super::extract(&mirror_path, &local, inner, stop, &mut |_| true).map(|(o, _)| o);
 
     {
         let mut st = mirror.state.lock().unwrap();

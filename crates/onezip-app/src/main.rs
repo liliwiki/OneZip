@@ -5,10 +5,12 @@
 
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
+mod log;
 mod menu;
 mod request;
 mod tasks;
 mod ui;
+mod update;
 mod win;
 
 use std::sync::mpsc;
@@ -29,12 +31,14 @@ fn main() {
 }
 
 fn run() -> anyhow::Result<()> {
+    log::install_panic_hook();
     let req = Request::from_args(std::env::args().skip(1))?;
 
     // 安装/卸载程序调用：不开窗口。
     match req.action {
         Action::RegisterMenu if req.paths.first().is_some_and(|p| p.as_os_str() == "/quiet") => {
-            return menu::register(&std::env::current_exe()?);
+            // 按设置来：装了 Windows 11 第一层菜单或关掉了右键菜单时不写传统菜单。
+            return menu::apply(&onezip_settings::Settings::load());
         }
         Action::UnregisterMenu => {
             menu::unregister();

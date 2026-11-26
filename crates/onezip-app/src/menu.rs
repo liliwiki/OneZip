@@ -9,81 +9,48 @@ use std::path::Path;
 
 use anyhow::Result;
 
-/// 出现在压缩包上的扩展名。`.001` 是分卷的第一卷。
-/// 与 onezip-shell 的同名列表一致。
-pub const ARCHIVE_EXTENSIONS: &[&str] = &[
-    "zip", "7z", "rar", "r00", "tar", "tgz", "gz", "tbz2", "tbz", "bz2", "txz", "xz", "zst", "tzst",
-    "lz4", "001",
-    // 以下由 7z.dll 解压
-    "iso", "img", "udf", "wim", "swm", "esd", "cab", "dmg", "vhd", "vhdx", "vmdk", "vdi", "qcow",
-    "qcow2", "msi", "msp", "msu", "arj", "lzh", "lha", "chm", "chi", "chw", "cpio", "rpm", "deb",
-    "xar", "pkg", "squashfs", "cramfs", "hfs", "hfsx", "apfs", "z", "taz", "lzma",
-];
+use onezip_menu::{Command, Entry, MENU, Show};
+use onezip_settings::Settings;
 
-/// 只能普通解压、不能边解边删的扩展名（磁盘镜像、安装包等，见 onezip-core 的 sevenzip 模块）。
-pub const NO_IN_PLACE_EXTENSIONS: &[&str] = &[
-    "img", "swm", "dmg", "vhd", "vhdx", "vmdk", "vdi", "qcow", "qcow2", "msi", "msp", "msu", "chm",
-    "chi", "chw", "cpio", "rpm", "deb", "xar", "pkg", "squashfs", "cramfs", "hfs", "hfsx", "apfs",
-    "z", "taz", "lzma",
-];
-
-pub struct Item {
-    pub id: &'static str,
-    pub label: &'static str,
-    pub args: &'static str,
+/// 注册表菜单里的一项（静态文字：注册表写不出具体文件名）。
+struct Item {
+    /// 键名：序号在前，资源管理器按键名排序。
+    key: String,
+    label: &'static str,
+    args: String,
     /// 在这一项上方画分隔线。
-    pub separator_before: bool,
+    separator_before: bool,
 }
 
-const fn item(id: &'static str, label: &'static str, args: &'static str, sep: bool) -> Item {
-    Item {
-        id,
-        label,
-        args,
-        separator_before: sep,
+/// 某类文件上的菜单项，按 onezip-menu 的顺序和分组。校验值另外放进 "CRC SHA" 二级菜单。
+/// `archive`：右键的是压缩包；`in_place`：它能边解边删。
+fn items(archive: bool, in_place: bool, hash: bool, settings: &Settings) -> Vec<Item> {
+    let mut out = Vec::new();
+    let mut separator = false;
+    for (n, entry) in MENU.iter().enumerate() {
+        let shown = match entry.show() {
+            Show::Always => true,
+            Show::Archives => archive,
+            Show::InPlace => archive && in_place,
+        } && match entry {
+            Entry::Command(c) => settings.menu_shows(c.id()),
+            Entry::Separator(_) => true,
+        };
+        match *entry {
+            Entry::Separator(_) => separator |= shown && !out.is_empty(),
+            Entry::Command(c) if shown && matches!(c, Command::Hash(_)) == hash => {
+                out.push(Item {
+                    key: format!("{n:02}{}", c.id()),
+                    label: c.label(),
+                    args: c.args().join(" "),
+                    separator_before: std::mem::take(&mut separator),
+                });
+            }
+            Entry::Command(_) => {}
+        }
     }
+    out
 }
-
-/// 压缩包上的菜单：和 Windows 11 第一层菜单（onezip-shell）同样的分组和顺序。
-/// 注册表菜单是静态的，写不出具体文件名，所以用通用说法。
-pub const EXTRACT_ITEMS: &[Item] = &[
-    item("01smart", "智能解压", "--extract-smart", false),
-    item("02folder", "解压到同名文件夹", "--extract-folder", false),
-    item("03here", "解压到当前位置", "--extract-here", false),
-    item("04to", "解压文件…", "--extract-to", false),
-    item("05reclaim", "解压后删除压缩包（边解压边释放空间）", "--reclaim --extract-smart", true),
-    item("06test", "测试压缩包", "--test", false),
-    item("07add", "添加到压缩包…", "--compress", true),
-    item("08add7z", "添加到 7z 压缩包", "--compress-7z", false),
-    item("09addzip", "添加到 zip 压缩包", "--compress-zip", false),
-];
-
-/// "CRC SHA" 二级菜单：（键名，菜单文字，算法）。与 onezip-shell 的 HASH_ITEMS 一致。
-pub const HASH_ITEMS: &[(&str, &str, &str)] = &[
-    ("1crc32", "CRC-32", "crc32"),
-    ("2md5", "MD5", "md5"),
-    ("3sha256", "SHA-256", "sha256"),
-    ("4all", "全部算法", "*"),
-];
-
-/// 不能边解边删的格式（磁盘镜像、安装包等）：去掉"解压后删除压缩包"。
-pub const EXTRACT_ITEMS_KEEP_ONLY: &[Item] = &[
-    item("01smart", "智能解压", "--extract-smart", false),
-    item("02folder", "解压到同名文件夹", "--extract-folder", false),
-    item("03here", "解压到当前位置", "--extract-here", false),
-    item("04to", "解压文件…", "--extract-to", false),
-    item("06test", "测试压缩包", "--test", true),
-    item("07add", "添加到压缩包…", "--compress", true),
-    item("08add7z", "添加到 7z 压缩包", "--compress-7z", false),
-    item("09addzip", "添加到 zip 压缩包", "--compress-zip", false),
-];
-
-/// 其它文件和文件夹上的菜单。
-pub const COMPRESS_ITEMS: &[Item] = &[
-    item("07add", "添加到压缩包…", "--compress", false),
-    item("08add7z", "添加到 7z 压缩包", "--compress-7z", false),
-    item("09addzip", "添加到 zip 压缩包", "--compress-zip", false),
-];
 
 #[cfg(windows)]
 mod imp {
@@ -97,13 +64,16 @@ mod imp {
     const VERB_HASH: &str = "OneZipHash";
 
     fn add(base: &str, exe: &Path, items: &[Item]) -> Result<()> {
+        if items.is_empty() {
+            return Ok(());
+        }
         let hkcu = RegKey::predef(HKEY_CURRENT_USER);
         let (verb, _) = hkcu.create_subkey(format!(r"{ROOT}\{base}\shell\{VERB}"))?;
         verb.set_value("MUIVerb", &"OneZip")?;
         verb.set_value("SubCommands", &"")?;
         verb.set_value("Icon", &format!("\"{}\",0", exe.display()))?;
         for item in items {
-            let (k, _) = verb.create_subkey(format!(r"shell\{}", item.id))?;
+            let (k, _) = verb.create_subkey(format!(r"shell\{}", item.key))?;
             k.set_value("MUIVerb", &item.label)?;
             if item.separator_before {
                 // ECF_SEPARATORBEFORE
@@ -115,8 +85,12 @@ mod imp {
         Ok(())
     }
 
-    /// OneZip 子菜单最后的 "CRC SHA" 二级菜单（与 Win11 第一层菜单一致）。
-    fn add_hash(base: &str, exe: &Path) -> Result<()> {
+    /// OneZip 子菜单最后的 "CRC SHA" 二级菜单（Win11 第一层菜单里是平铺的）。
+    fn add_hash(base: &str, exe: &Path, settings: &Settings) -> Result<()> {
+        let hash_items = items(false, false, true, settings);
+        if hash_items.is_empty() {
+            return Ok(());
+        }
         let hkcu = RegKey::predef(HKEY_CURRENT_USER);
         let (hash, _) =
             hkcu.create_subkey(format!(r"{ROOT}\{base}\shell\{VERB}\shell\99hash"))?;
@@ -124,11 +98,11 @@ mod imp {
         hash.set_value("SubCommands", &"")?;
         // ECF_SEPARATORBEFORE
         hash.set_value("CommandFlags", &0x20u32)?;
-        for (id, label, algo) in HASH_ITEMS {
-            let (k, _) = hash.create_subkey(format!(r"shell\{id}"))?;
-            k.set_value("MUIVerb", label)?;
+        for item in hash_items {
+            let (k, _) = hash.create_subkey(format!(r"shell\{}", item.key))?;
+            k.set_value("MUIVerb", &item.label)?;
             let (cmd, _) = k.create_subkey("command")?;
-            cmd.set_value("", &format!("\"{}\" --hash {algo} \"%1\"", exe.display()))?;
+            cmd.set_value("", &format!("\"{}\" {} \"%1\"", exe.display(), item.args))?;
         }
         Ok(())
     }
@@ -139,34 +113,29 @@ mod imp {
         let _ = hkcu.delete_subkey_all(format!(r"{ROOT}\{base}\shell\{VERB_HASH}"));
     }
 
-    fn bases() -> Vec<(String, bool)> {
-        let mut v: Vec<(String, bool)> = ARCHIVE_EXTENSIONS
-            .iter()
-            .map(|e| (format!(r"SystemFileAssociations\.{e}"), true))
+    /// （注册表位置，是否压缩包，能否边解边删）
+    fn bases() -> Vec<(String, bool, bool)> {
+        let mut v: Vec<(String, bool, bool)> = onezip_formats::archive_extensions()
+            .map(|e| (format!(r"SystemFileAssociations\.{e}"), true, onezip_formats::in_place(&format!("x.{e}"))))
             .collect();
-        v.push(("*".into(), false));
-        v.push(("Directory".into(), false));
+        v.push(("*".into(), false, false));
+        v.push(("Directory".into(), false, false));
         v
     }
 
-    pub fn register(exe: &Path) -> Result<()> {
+    /// 按设置写传统菜单（隐藏的项不写）。
+    pub fn register(exe: &Path, settings: &Settings) -> Result<()> {
         unregister();
-        for (base, archive) in bases() {
-            if archive && NO_IN_PLACE_EXTENSIONS.iter().any(|e| base.ends_with(&format!(".{e}"))) {
-                add(&base, exe, EXTRACT_ITEMS_KEEP_ONLY)?;
-            } else if archive {
-                add(&base, exe, EXTRACT_ITEMS)?;
-            } else {
-                add(&base, exe, COMPRESS_ITEMS)?;
-            }
-            add_hash(&base, exe)?;
+        for (base, archive, in_place) in bases() {
+            add(&base, exe, &items(archive, in_place, false, settings))?;
+            add_hash(&base, exe, settings)?;
         }
         notify();
         Ok(())
     }
 
     pub fn unregister() {
-        for (base, _) in bases() {
+        for (base, _, _) in bases() {
             remove(&base);
         }
         notify();
@@ -205,7 +174,7 @@ mod imp {
 #[cfg(not(windows))]
 mod imp {
     use super::*;
-    pub fn register(_exe: &Path) -> Result<()> {
+    pub fn register(_exe: &Path, _settings: &Settings) -> Result<()> {
         anyhow::bail!("右键菜单只支持 Windows")
     }
     pub fn unregister() {}
@@ -218,3 +187,48 @@ mod imp {
 }
 
 pub use imp::{is_registered, register, shell_package_installed, unregister};
+
+/// 让右键菜单符合设置。Windows 11 的第一层菜单由 DLL 每次弹出时自己读设置，这里只管传统菜单：
+/// 装了第一层菜单时不写传统菜单（免得"显示更多选项"里重复一份）。
+pub fn apply(settings: &Settings) -> Result<()> {
+    if shell_package_installed() || !settings.menu_enabled {
+        unregister();
+        Ok(())
+    } else {
+        register(&std::env::current_exe()?, settings)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn registry_menu_follows_the_model() {
+        // 都显示时
+        let d = Settings { menu_hidden: Vec::new(), ..Settings::default() };
+        let zip: Vec<String> = items(true, true, false, &d).iter().map(|i| i.key.clone()).collect();
+        assert_eq!(
+            zip,
+            ["00smart", "01folder", "02here", "03to", "05deleteafter", "06inplace", "07test", "09add", "10add7z", "11addzip"]
+        );
+        let sep: Vec<bool> = items(true, true, false, &d).iter().map(|i| i.separator_before).collect();
+        assert_eq!(sep, [false, false, false, false, true, false, false, true, false, false]);
+        let dmg: Vec<String> = items(true, false, false, &d).iter().map(|i| i.key.clone()).collect();
+        assert!(!dmg.iter().any(|k| k.ends_with("inplace")));
+        assert!(dmg.iter().any(|k| k.ends_with("deleteafter")));
+        let file: Vec<String> = items(false, false, false, &d).iter().map(|i| i.key.clone()).collect();
+        assert_eq!(file, ["09add", "10add7z", "11addzip"]);
+        assert!(!items(false, false, false, &d)[0].separator_before);
+        let hash: Vec<String> = items(false, false, true, &d).iter().map(|i| i.args.clone()).collect();
+        assert_eq!(hash, ["--hash crc32", "--hash md5", "--hash sha256", "--hash *"]);
+
+        // 隐藏一些：分隔线不会落在开头或连着
+        let d = Settings { menu_hidden: vec!["inplace".into(), "test".into(), "md5".into()], ..Settings::default() };
+        let keys: Vec<String> = items(true, true, false, &d).iter().map(|i| i.key.clone()).collect();
+        assert_eq!(keys, ["00smart", "01folder", "02here", "03to", "05deleteafter", "09add", "10add7z", "11addzip"]);
+        let sep: Vec<bool> = items(true, true, false, &d).iter().map(|i| i.separator_before).collect();
+        assert_eq!(sep, [false, false, false, false, true, true, false, false]);
+        assert_eq!(items(false, false, true, &d).len(), 3);
+    }
+}

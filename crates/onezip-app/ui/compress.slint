@@ -1,0 +1,96 @@
+// “添加到压缩包”对话框。
+import { Button, CheckBox, ComboBox, LineEdit, Slider, VerticalBox, GroupBox } from "std-widgets.slint";
+import { ThemedWindow } from "theme.slint";
+
+export component CompressDialog inherits ThemedWindow {
+    title: "添加到压缩包";
+    preferred-width: 520px;
+
+    in property <string> inputs-label;
+    in property <[string]> formats;
+    in-out property <string> output;
+    in-out property <int> format-index: 0;
+    in-out property <float> level: 5;
+    in-out property <string> password;
+    in-out property <bool> solid: true;
+    in property <bool> password-allowed: true;
+
+    callback format-changed(int);
+    callback browse();
+    callback accept();
+    callback reject();
+
+    VerticalBox {
+        Text {
+            text: root.inputs-label;
+            overflow: elide;
+            opacity: 0.8;
+        }
+        GroupBox {
+            title: "压缩包";
+            HorizontalLayout {
+                spacing: 8px;
+                LineEdit {
+                    text <=> root.output;
+                }
+                Button {
+                    text: "浏览…";
+                    clicked => { root.browse(); }
+                }
+            }
+        }
+        HorizontalLayout {
+            spacing: 12px;
+            VerticalLayout {
+                spacing: 4px;
+                Text { text: "格式"; }
+                ComboBox {
+                    model: root.formats;
+                    current-index <=> root.format-index;
+                    selected => { root.format-changed(self.current-index); }
+                }
+            }
+            VerticalLayout {
+                spacing: 4px;
+                horizontal-stretch: 1;
+                Text {
+                    text: "压缩级别：" + (root.level < 0.5 ? "仅存储" : root.level < 3.5 ? "快速" : root.level < 6.5 ? "标准" : "最强") + "（" + round(root.level) + "）";
+                }
+                Slider {
+                    minimum: 0;
+                    maximum: 9;
+                    value <=> root.level;
+                }
+            }
+        }
+        VerticalLayout {
+            spacing: 4px;
+            Text {
+                text: root.password-allowed ? "密码（留空不加密）" : "这种格式不支持密码";
+            }
+            LineEdit {
+                input-type: InputType.password;
+                enabled: root.password-allowed;
+                text <=> root.password;
+            }
+        }
+        if root.format-index == 0: CheckBox {
+            text: "固实压缩（压缩率更高）";
+            checked <=> root.solid;
+        }
+        HorizontalLayout {
+            alignment: end;
+            spacing: 8px;
+            Button {
+                text: "取消";
+                clicked => { root.reject(); }
+            }
+            Button {
+                text: "开始压缩";
+                primary: true;
+                enabled: root.output != "";
+                clicked => { root.accept(); }
+            }
+        }
+    }
+}

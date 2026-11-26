@@ -19,7 +19,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use anyhow::{Context, Result, bail, ensure};
 
 use super::fetch::Src;
-use super::{Journal, choose_output, flush_all, reported_output, target_of};
+use super::{Journal, choose_output, flush_all, plan_clashes, reported_output, target_of};
 use crate::{Confirm, Event, ExtractRequest, Observer, Outcome};
 
 const SECTOR: u64 = 2048;
@@ -529,15 +529,12 @@ pub(super) fn extract_in_place(
         Some(j) => j,
         None => {
             let output = choose_output(archive, req, &paths);
-            if !req.replace
-                && let Some(f) = img.files.iter().find(|f| target_of(&output, &f.path).exists())
-            {
-                bail!("{} 里已有同名文件（例如 {}）。什么都没改动；如要替换请选择替换", output.display(), f.path);
-            }
+            let files: Vec<(u32, &str)> = img.files.iter().enumerate().map(|(n, f)| (n as u32, f.path.as_str())).collect();
+            let plan = plan_clashes(&output, &files, req.conflict)?;
             if !confirm(&Confirm { archive: &archive.file_name().unwrap_or_default().to_string_lossy(), output: &output }) {
                 bail!("已取消，镜像没有任何改动");
             }
-            Journal::create(archive, &output, true)?
+            Journal::create(archive, &output, true, plan)?
         }
     };
     let output = journal.output.clone();
@@ -572,7 +569,7 @@ pub(super) fn extract_in_place(
         for (_, u) in batch {
             for &i in &u.files {
                 let f = &img.files[i];
-                let dest = target_of(&output, &f.path);
+                let Some(dest) = journal.target(i as u32, &f.path) else { continue };
                 if !copy_file(&mut src, f, &dest, &observer, stop)? {
                     return Ok(Outcome::Paused);
                 }

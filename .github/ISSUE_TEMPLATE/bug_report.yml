@@ -13,7 +13,9 @@ body:
       label: Affected area
       options:
         - Extraction
-        - Extract and delete the archive (in place)
+        - Extract while deleting the archive (in place)
+        - Extract, then delete the archive
+        - Settings or updates
         - Extract while downloading
         - Compression
         - Checksums

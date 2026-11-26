@@ -9,6 +9,7 @@ use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 
+use onezip_settings::DeleteMode;
 use onezip_core::{
     CompressRequest, Event, ExtractRequest, HashKind, Observer, Outcome, Source, human,
 };
@@ -17,7 +18,8 @@ const MAX_RUNNING: usize = 2;
 
 #[derive(Debug, Clone)]
 pub enum Kind {
-    Extract(ExtractRequest),
+    /// 第二项：全部解压成功后要删除压缩包时，怎么删。
+    Extract(ExtractRequest, Option<DeleteMode>),
     Compress(CompressRequest),
     Test {
         path: PathBuf,
@@ -158,7 +160,7 @@ impl Task {
     }
 
     pub fn can_pause(&self) -> bool {
-        self.is_running() && matches!(self.kind, Kind::Extract(_))
+        self.is_running() && matches!(self.kind, Kind::Extract(..))
     }
 
     pub fn can_resume(&self) -> bool {
@@ -168,7 +170,7 @@ impl Task {
     pub fn can_cancel(&self) -> bool {
         match self.status {
             Status::Queued => true,
-            Status::Running => !matches!(self.kind, Kind::Extract(_)),
+            Status::Running => !matches!(self.kind, Kind::Extract(..)),
             _ => false,
         }
     }
@@ -179,7 +181,7 @@ impl Task {
 
     pub fn archive_name(&self) -> String {
         match &self.kind {
-            Kind::Extract(r) => match &r.source {
+            Kind::Extract(r, _) => match &r.source {
                 Source::Local(p) => file_name(p),
                 Source::Url(u) => u.clone(),
             },
@@ -304,7 +306,7 @@ impl Manager {
     pub fn set_password(&self, id: u64, password: String) {
         self.with(id, |t| {
             match &mut t.kind {
-                Kind::Extract(r) => r.password = Some(password),
+                Kind::Extract(r, _) => r.password = Some(password),
                 Kind::Test { password: p, .. } => *p = Some(password),
                 Kind::Compress(_) | Kind::Hash { .. } => return,
             }
@@ -385,11 +387,18 @@ impl Manager {
         let observer = self.observer(id);
         let result: anyhow::Result<(Status, Option<PathBuf>)> = match &kind {
             // 右键菜单里选"释放空间"、或窗口里勾选后确认过，到这里已经是确认过的。
-            Kind::Extract(req) => {
+            Kind::Extract(req, after) => {
                 onezip_core::extract(req, observer, &stop, &mut |_| true).map(|o| match o {
                     Outcome::Finished { output, warning } => {
-                        if let Some(w) = warning {
-                            self.with(id, |t| t.note = w);
+                        let note = match (warning, after, &req.source) {
+                            // 有需要转告的问题时不删，让用户先看看。
+                            (Some(w), Some(_), _) => Some(format!("{w}；压缩包没有删除")),
+                            (Some(w), None, _) => Some(w),
+                            (None, Some(mode), Source::Local(path)) => delete_archive(path, *mode).err(),
+                            (None, _, _) => None,
+                        };
+                        if let Some(n) = note {
+                            self.with(id, |t| t.note = n);
                         }
                         (Status::Done, Some(output))
                     }
@@ -430,13 +439,29 @@ impl Manager {
             }
             Err(e) if onezip_core::needs_password(&e) => {
                 let had = match &t.kind {
-                    Kind::Extract(r) => r.password.is_some(),
+                    Kind::Extract(r, _) => r.password.is_some(),
                     Kind::Test { password, .. } => password.is_some(),
                     Kind::Compress(_) | Kind::Hash { .. } => false,
                 };
                 t.status = Status::NeedsPassword { retry: had };
             }
-            Err(e) => t.status = Status::Failed(format!("{e:#}")),
+            Err(e) => {
+                crate::log::error(&format!("{}：{e:#}", t.title));
+                t.status = Status::Failed(format!("{e:#}"));
+            }
         });
     }
+}
+
+/// 解压成功后删除压缩包（分卷的每一卷都删）。失败时返回给用户看的说明。
+fn delete_archive(path: &std::path::Path, mode: DeleteMode) -> Result<(), String> {
+    let volumes = onezip_core::archive_volumes(path);
+    let r = match mode {
+        DeleteMode::RecycleBin => crate::win::recycle(&volumes),
+        DeleteMode::Permanent => volumes.iter().try_for_each(std::fs::remove_file),
+    };
+    r.map_err(|e| {
+        crate::log::error(&format!("删除 {} 失败：{e}", path.display()));
+        format!("解压完成，但删除压缩包失败：{e}")
+    })
 }

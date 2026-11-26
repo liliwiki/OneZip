@@ -11,6 +11,17 @@ use anyhow::{Result, bail};
 use interprocess::local_socket::{GenericNamespaced, ListenerOptions, Stream, prelude::*};
 use onezip_core::{Format, HashKind, Placement};
 
+/// 解压后怎么处理原压缩包。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Delete {
+    #[default]
+    Keep,
+    /// 边解边删，释放空间。右键菜单里选这一项本身就是确认。
+    InPlace,
+    /// 全部解压成功后再删（回收站或直接删除，看设置）。
+    After,
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub enum Action {
     /// 只是打开（或唤起）窗口。
@@ -19,8 +30,7 @@ pub enum Action {
         placement: Placement,
         /// 先让用户选输出文件夹。
         ask_folder: bool,
-        /// 边解边删原压缩包。右键菜单里选这一项本身就是确认。
-        reclaim: bool,
+        delete: Delete,
     },
     Test,
     /// `None`：弹出压缩对话框；`Some`：直接压成该格式。
@@ -42,7 +52,7 @@ impl Request {
     /// 解析命令行（不含程序名）。
     pub fn from_args(args: impl IntoIterator<Item = String>) -> Result<Self> {
         let mut action = None;
-        let mut reclaim = false;
+        let mut delete = Delete::Keep;
         let mut paths = Vec::new();
         let mut args = args.into_iter();
         while let Some(a) = args.next() {
@@ -51,7 +61,8 @@ impl Request {
                 "--extract-here" => action = Some(extract(Placement::Here, false)),
                 "--extract-folder" => action = Some(extract(Placement::NewFolder, false)),
                 "--extract-to" => action = Some(extract(Placement::Smart, true)),
-                "--reclaim" => reclaim = true,
+                "--reclaim" => delete = Delete::InPlace,
+                "--delete-after" => delete = Delete::After,
                 "--test" => action = Some(Action::Test),
                 "--compress" => action = Some(Action::Compress(None)),
                 "--compress-7z" => action = Some(Action::Compress(Some(Format::SevenZ))),
@@ -79,7 +90,7 @@ impl Request {
             }) => Action::Extract {
                 placement,
                 ask_folder,
-                reclaim,
+                delete,
             },
             Some(a) => a,
             // 直接把压缩包拖到 OneZip.exe 上 / 双击关联文件：智能解压并保留原包。
@@ -95,7 +106,7 @@ impl Request {
             Action::Extract {
                 placement,
                 ask_folder,
-                reclaim,
+                delete,
             } => format!(
                 "extract {} {} {}",
                 match placement {
@@ -104,7 +115,11 @@ impl Request {
                     Placement::NewFolder => "folder",
                 },
                 u8::from(*ask_folder),
-                u8::from(*reclaim)
+                match delete {
+                    Delete::Keep => 0,
+                    Delete::InPlace => 1,
+                    Delete::After => 2,
+                }
             ),
             Action::Test => "test".into(),
             Action::Compress(f) => format!("compress {}", f.map_or("ask", |f| f.extension())),
@@ -140,7 +155,11 @@ impl Request {
                         _ => Placement::Smart,
                     },
                     ask_folder: w.get(1) == Some(&"1"),
-                    reclaim: w.get(2) == Some(&"1"),
+                    delete: match w.get(2) {
+                        Some(&"1") => Delete::InPlace,
+                        Some(&"2") => Delete::After,
+                        _ => Delete::Keep,
+                    },
                 }
             }
             ("test", _) => Action::Test,
@@ -163,7 +182,7 @@ fn extract(placement: Placement, ask_folder: bool) -> Action {
     Action::Extract {
         placement,
         ask_folder,
-        reclaim: false,
+        delete: Delete::Keep,
     }
 }
 
@@ -264,12 +283,16 @@ mod tests {
             Action::Extract {
                 placement: Placement::Smart,
                 ask_folder: false,
-                reclaim: true
+                delete: Delete::InPlace
             }
         );
         assert_eq!(r.paths.len(), 2);
         let lines: Vec<String> = r.encode().lines().map(str::to_string).collect();
         assert_eq!(Request::decode(&lines[..lines.len() - 1]), Some(r));
+        let a = args(&["--delete-after", "--extract-smart", r"D:\x.zip"]);
+        assert!(matches!(a.action, Action::Extract { delete: Delete::After, .. }));
+        let lines: Vec<String> = a.encode().lines().map(str::to_string).collect();
+        assert_eq!(Request::decode(&lines[..lines.len() - 1]), Some(a));
 
         assert_eq!(args(&[]).action, Action::Show);
         assert_eq!(args(&["x.zip"]).action, extract(Placement::Smart, false));

@@ -1,0 +1,11 @@
+[package]
+name = "onezip-menu"
+description = "The OneZip right-click menu as data: items, order, separators, titles and the arguments passed to OneZip.exe. Both the Windows 11 menu DLL and the classic registry menu are built from it."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish = false
+
+[dependencies]
+onezip-formats.workspace = true

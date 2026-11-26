@@ -12,6 +12,7 @@ pub mod targz;
 pub mod tarxz;
 mod xz;
 mod zip;
+pub use zip::zip_password_bytes;
 
 use std::io::Read;
 use std::path::{Component, Path, PathBuf};

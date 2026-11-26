@@ -10,10 +10,12 @@
 
 pub mod compress;
 pub mod hash;
+pub mod http;
 mod local;
 #[cfg(windows)]
 mod sevenzip;
 mod remote;
+mod route;
 mod source;
 
 use std::path::{Path, PathBuf};
@@ -26,15 +28,24 @@ pub use compress::{Cancelled, CompressRequest, Format, compress};
 pub use hash::{HashKind, HashReport, hash};
 pub use local::{Entry, list, test};
 
-/// 能边解压边删除原压缩包的格式（按扩展名）。前端据此决定是否显示"解压后删除压缩包"。
-pub fn can_extract_in_place(path: &Path) -> bool {
-    #[cfg(windows)]
-    if sevenzip::handles(path) {
-        return sevenzip::IN_PLACE_EXTENSIONS.contains(
-            &path.extension().map(|e| e.to_string_lossy().to_ascii_lowercase()).unwrap_or_default().as_str(),
-        );
+/// 压缩包的全部分卷（`a.part1.rar`、`a.part2.rar`…，`a.7z.001`、`a.7z.002`…），
+/// 不分卷时就是它自己。`path` 可以是其中任何一卷；只列存在的。
+pub fn archive_volumes(path: &Path) -> Vec<PathBuf> {
+    use hatchzip_core::archive::storage::{first_volume, volume_path};
+    let first = first_volume(path);
+    let mut out = Vec::new();
+    while let Some(p) = volume_path(&first, out.len()).filter(|p| p.exists()) {
+        out.push(p);
     }
-    true
+    if out.is_empty() {
+        out.push(path.to_path_buf());
+    }
+    out
+}
+
+/// 能边解压边删除原压缩包的格式（按扩展名）。前端据此决定是否显示"边解压边删除压缩包"。
+pub fn can_extract_in_place(path: &Path) -> bool {
+    onezip_formats::in_place(&path.to_string_lossy())
 }
 pub use source::Source;
 
@@ -80,6 +91,49 @@ pub enum Placement {
     NewFolder,
 }
 
+/// 解压时目标位置已有同名文件怎么办。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Conflict {
+    /// 什么都不动，报错（让前端问用户）。
+    #[default]
+    Refuse,
+    /// 用压缩包里的替换。
+    Replace,
+    /// 保留已有的，压缩包里的这个不解出。
+    Skip,
+    /// 都保留：压缩包里的改名为 `名字 (2).扩展名`。
+    Rename,
+}
+
+impl Conflict {
+    pub fn id(self) -> &'static str {
+        match self {
+            Conflict::Refuse => "refuse",
+            Conflict::Replace => "replace",
+            Conflict::Skip => "skip",
+            Conflict::Rename => "rename",
+        }
+    }
+    pub fn parse(s: &str) -> Option<Self> {
+        [Conflict::Refuse, Conflict::Replace, Conflict::Skip, Conflict::Rename]
+            .into_iter()
+            .find(|c| c.id() == s)
+    }
+}
+
+/// `dir/name.ext` 已存在时找一个没人用的 `dir/name (2).ext`、`(3)`……
+pub fn free_name(path: &Path) -> PathBuf {
+    let name = path.file_name().unwrap_or_default().to_string_lossy().into_owned();
+    let (base, ext) = match name.rsplit_once('.') {
+        Some((b, e)) if !b.is_empty() => (b.to_string(), format!(".{e}")),
+        _ => (name.clone(), String::new()),
+    };
+    (2..)
+        .map(|i| path.with_file_name(format!("{base} ({i}){ext}")))
+        .find(|p| std::fs::symlink_metadata(p).is_err())
+        .unwrap()
+}
+
 /// 一次解压请求。
 #[derive(Debug, Clone, Default)]
 pub struct ExtractRequest {
@@ -94,10 +148,12 @@ pub struct ExtractRequest {
     pub verify_first: bool,
     /// 解压过程中磁盘至少保留的空闲字节数。
     pub keep_free: u64,
-    /// 目标位置已有同名文件时替换它们（默认拒绝）。
-    pub replace: bool,
+    /// 目标位置已有同名文件时怎么办（默认什么都不动、报错）。
+    pub conflict: Conflict,
     /// 解出来只有一个压缩包时继续把它解开（中间那个包随后删除）。
     pub nested: bool,
+    /// 边下载边解压同时用的连接数；0 用默认值（8）。
+    pub connections: u32,
 }
 
 /// 进度与提示，发给前端显示。
@@ -150,8 +206,29 @@ pub fn extract(
 ) -> Result<Outcome> {
     match &req.source {
         Source::Local(path) => local::extract(path, req, observer, stop, confirm),
-        #[cfg(windows)]
-        Source::Url(url) if sevenzip::handles_url(url) => sevenzip::extract_url(url, req, observer, stop),
-        Source::Url(url) => remote::extract(url, req, observer, stop),
+        Source::Url(url) => match route::url(url) {
+            #[cfg(windows)]
+            route::Url::SevenZip => sevenzip::extract_url(url, req, observer, stop),
+            _ => remote::extract(url, req, observer, stop),
+        },
+    }
+}
+
+#[cfg(test)]
+mod volume_tests {
+    #[test]
+    fn archive_volumes_lists_every_part() {
+        let dir = tempfile::tempdir().unwrap();
+        let touch = |n: &str| {
+            let p = dir.path().join(n);
+            std::fs::write(&p, b"x").unwrap();
+            p
+        };
+        let plain = touch("a.zip");
+        assert_eq!(super::archive_volumes(&plain), [plain]);
+        let parts: Vec<_> = ["b.7z.001", "b.7z.002", "b.7z.003"].iter().map(|n| touch(n)).collect();
+        assert_eq!(super::archive_volumes(&parts[1]), parts);
+        let rar: Vec<_> = ["c.part1.rar", "c.part2.rar"].iter().map(|n| touch(n)).collect();
+        assert_eq!(super::archive_volumes(&rar[0]), rar);
     }
 }

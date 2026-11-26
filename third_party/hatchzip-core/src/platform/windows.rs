@@ -394,3 +394,32 @@ impl RarName {
 #[cfg(feature = "rar")]
 #[link(name = "advapi32")]
 unsafe extern "C" {}
+
+/// `s` in the ANSI code page, or `None` when that is the same as UTF-8 or
+/// some character has no exact form there (no best-fit substitutes).
+pub fn ansi_bytes(s: &str) -> Option<Vec<u8>> {
+    use windows_sys::Win32::Globalization::{CP_ACP, WC_NO_BEST_FIT_CHARS, WideCharToMultiByte};
+
+    if s.is_ascii() {
+        return None;
+    }
+    let wide: Vec<u16> = s.encode_utf16().collect();
+    let len = i32::try_from(wide.len()).ok()?;
+    let mut lossy = 0;
+    // SAFETY: the buffers and their lengths match; a null output asks for the size.
+    let need = unsafe {
+        WideCharToMultiByte(CP_ACP, WC_NO_BEST_FIT_CHARS, wide.as_ptr(), len, std::ptr::null_mut(), 0, std::ptr::null(), &mut lossy)
+    };
+    if need <= 0 || lossy != 0 {
+        return None;
+    }
+    let mut out = vec![0u8; need as usize];
+    // SAFETY: as above, with `out` sized from the first call.
+    let n = unsafe {
+        WideCharToMultiByte(CP_ACP, WC_NO_BEST_FIT_CHARS, wide.as_ptr(), len, out.as_mut_ptr(), need, std::ptr::null(), &mut lossy)
+    };
+    if n != need || lossy != 0 || out == s.as_bytes() {
+        return None;
+    }
+    Some(out)
+}

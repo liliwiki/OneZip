@@ -62,7 +62,7 @@ switch ($Do) {
   }
   'windows' {
     $root.FindAll([System.Windows.Automation.TreeScope]::Children, [System.Windows.Automation.Condition]::TrueCondition) |
-      % { "{0} | pid {1} | {2} | hung={3}" -f $_.Current.Name, $_.Current.ProcessId, $_.Current.BoundingRectangle, [U]::IsHungAppWindow([IntPtr]$_.Current.NativeWindowHandle) }
+      % { "{0} | pid {1} | {2} | hung={3}" -f $_.Current.Name, $_.Current.ProcessId, $_.Current.BoundingRectangle, [U]::IsHungAppWindow([IntPtr][int]$_.Current.NativeWindowHandle) }
     $sb = New-Object System.Text.StringBuilder 256; [U]::GetWindowText([U]::GetForegroundWindow(), $sb, 256) | Out-Null; "foreground: " + $sb
   }
   'front' {
@@ -133,6 +133,12 @@ switch ($Do) {
     Start-Sleep -Milliseconds 200
     1..10 | % { [U]::mouse_event(0x800,0,0,[uint32]4294967176,[UIntPtr]::Zero); Start-Sleep -Milliseconds 50 }
     "wheel"
+  }
+  'close' {
+    # 像点标题栏的 × 一样关窗口（不动鼠标、不按键）
+    if (-not $Window) { "need -Window"; exit 2 }
+    $scope.GetCurrentPattern([System.Windows.Automation.WindowPattern]::Pattern).Close()
+    "closed '$Window'"
   }
   'hung' {
     Get-Process OneZip -ErrorAction SilentlyContinue | % { "pid {0} responding={1} title='{2}'" -f $_.Id, $_.Responding, $_.MainWindowTitle }

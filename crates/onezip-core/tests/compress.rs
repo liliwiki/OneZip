@@ -403,3 +403,38 @@ fn sevenz_cancel_is_prompt_and_clean() {
         .collect();
     assert!(!left.iter().any(|n| n.starts_with("大块.7z")), "{left:?}");
 }
+
+/// zip 的中文密码：7-Zip 和现在的 OneZip 用系统代码页（中文 Windows 上是 GBK），
+/// 旧版 OneZip 用 UTF-8。两种都要能解开：保留原包（7z.dll）和边解压边删（HatchZip）。
+#[test]
+fn zip_chinese_password_either_encoding() {
+    use std::io::Write;
+    let pw = "密码123";
+    let encodings = hatchzip_core::archive::zip_password_bytes(pw);
+    assert_eq!(encodings.last().unwrap(), pw.as_bytes());
+    for (i, bytes) in encodings.iter().enumerate() {
+        for keep in [true, false] {
+            let dir = tempfile::tempdir().unwrap();
+            let archive = dir.path().join(format!("pw{i}.zip"));
+            let mut z = zip::ZipWriter::new(fs::File::create(&archive).unwrap());
+            let opts = zip::write::SimpleFileOptions::default().with_aes_encryption_bytes(zip::AesMode::Aes256, bytes);
+            z.start_file("说明.txt", opts).unwrap();
+            z.write_all("你好".as_bytes()).unwrap();
+            z.finish().unwrap();
+
+            let out = dir.path().join("out");
+            let req = ExtractRequest {
+                source: Source::Local(archive.clone()),
+                output: Some(out.clone()),
+                keep_source: keep,
+                password: Some(pw.into()),
+                keep_free: 0,
+                ..Default::default()
+            };
+            let r = onezip_core::extract(&req, quiet(), &stop(), &mut |_| true)
+                .unwrap_or_else(|e| panic!("编码 {i}，保留原包 {keep}：{e:#}"));
+            assert!(matches!(r, Outcome::Finished { .. }));
+            assert_eq!(fs::read_to_string(out.join("说明.txt")).unwrap(), "你好");
+        }
+    }
+}

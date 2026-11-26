@@ -92,6 +92,62 @@ mod imp {
         }
     }
 
+    /// 用默认程序打开链接、文件夹或文件（浏览器、资源管理器）。
+    pub fn shell_open(target: &str) {
+        use windows::Win32::UI::Shell::ShellExecuteW;
+        use windows::Win32::UI::WindowsAndMessaging::SW_SHOWNORMAL;
+        use windows::core::{HSTRING, w};
+        unsafe {
+            ShellExecuteW(None, w!("open"), &HSTRING::from(target), None, None, SW_SHOWNORMAL);
+        }
+    }
+
+    /// 把文件移到回收站，不弹任何确认或进度框。
+    pub fn recycle(paths: &[std::path::PathBuf]) -> std::io::Result<()> {
+        use windows::Win32::UI::Shell::{
+            FO_DELETE, FOF_ALLOWUNDO, FOF_NOCONFIRMATION, FOF_NOERRORUI, FOF_SILENT, SHFILEOPSTRUCTW, SHFileOperationW,
+        };
+        use windows::core::PCWSTR;
+        if paths.is_empty() {
+            return Ok(());
+        }
+        // 多个路径用 \0 隔开，最后再多一个 \0。
+        let mut from: Vec<u16> = Vec::new();
+        for p in paths {
+            let abs = std::path::absolute(p)?;
+            from.extend(abs.as_os_str().to_string_lossy().encode_utf16());
+            from.push(0);
+        }
+        from.push(0);
+        let mut op = SHFILEOPSTRUCTW {
+            wFunc: FO_DELETE,
+            pFrom: PCWSTR(from.as_ptr()),
+            fFlags: (FOF_ALLOWUNDO | FOF_NOCONFIRMATION | FOF_SILENT | FOF_NOERRORUI).0 as u16,
+            ..Default::default()
+        };
+        let code = unsafe { SHFileOperationW(&mut op) };
+        if code != 0 {
+            return Err(std::io::Error::other(format!("移到回收站失败（错误 {code:#x}）")));
+        }
+        if op.fAnyOperationsAborted.as_bool() {
+            return Err(std::io::Error::other("移到回收站被中止"));
+        }
+        Ok(())
+    }
+
+    /// 如 `Windows 11 24H2（26100）`，报告问题时用。
+    pub fn windows_version() -> String {
+        use winreg::RegKey;
+        use winreg::enums::HKEY_LOCAL_MACHINE;
+        let Ok(k) = RegKey::predef(HKEY_LOCAL_MACHINE).open_subkey(r"SOFTWARE\Microsoft\Windows NT\CurrentVersion") else {
+            return "未知".into();
+        };
+        let build: String = k.get_value("CurrentBuild").unwrap_or_default();
+        let display: String = k.get_value("DisplayVersion").unwrap_or_default();
+        let major = if build.parse::<u32>().unwrap_or(0) >= 22000 { "Windows 11" } else { "Windows 10" };
+        format!("{major} {display}（{build}）")
+    }
+
     /// 把文本放进剪贴板。
     pub fn set_clipboard(text: &str) -> bool {
         use windows::Win32::Foundation::{HANDLE, HGLOBAL};
@@ -135,9 +191,18 @@ mod imp {
     pub fn set_clipboard(_text: &str) -> bool {
         false
     }
+    pub fn shell_open(_target: &str) {}
+    pub fn recycle(paths: &[std::path::PathBuf]) -> std::io::Result<()> {
+        paths.iter().try_for_each(std::fs::remove_file)
+    }
+    pub fn windows_version() -> String {
+        "未知".into()
+    }
 }
 
-pub use imp::{allow_any_foreground, bring_to_front, center_on, set_clipboard, set_owner};
+pub use imp::{
+    allow_any_foreground, bring_to_front, center_on, recycle, set_clipboard, set_owner, shell_open, windows_version,
+};
 
 /// 显示并提到最前。窗口可能要等事件循环跑一轮才真正创建，所以稍后再提一次。
 pub fn present<C: ComponentHandle + 'static>(component: &C) {

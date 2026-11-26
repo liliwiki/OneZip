@@ -8,6 +8,7 @@ license.workspace = true
 
 [dependencies]
 anyhow.workspace = true
+onezip-formats.workspace = true
 hatchzip-core.workspace = true
 peel-rs.workspace = true
 

@@ -67,6 +67,10 @@ pub struct CompressRequest {
     pub password: Option<String>,
     /// 7z：固实压缩（压缩率更高，但取单个文件要解前面的数据）。
     pub solid: bool,
+    /// 7z：设了密码时连文件名一起加密。
+    pub encrypt_names: bool,
+    /// 压缩用的线程数；0 表示按 CPU 核数。
+    pub threads: u32,
     /// 目标已存在时覆盖。
     pub overwrite: bool,
 }
@@ -80,6 +84,8 @@ impl CompressRequest {
             level: 5,
             password: None,
             solid: true,
+            encrypt_names: true,
+            threads: 0,
             overwrite: false,
         }
     }
@@ -98,20 +104,10 @@ struct Item {
 
 /// 默认输出名：单个输入用它自己的名字，多个输入用它们所在文件夹的名字。
 pub fn default_output(inputs: &[PathBuf], format: Format) -> Option<PathBuf> {
-    let first = inputs.first()?;
-    let parent = first.parent()?.to_path_buf();
-    let stem = if inputs.len() == 1 {
-        if first.is_dir() {
-            first.file_name()?.to_string_lossy().into_owned()
-        } else {
-            first.file_stem()?.to_string_lossy().into_owned()
-        }
-    } else {
-        parent
-            .file_name()
-            .map(|n| n.to_string_lossy().into_owned())
-            .unwrap_or_else(|| "压缩包".into())
-    };
+    let parent = inputs.first()?.parent()?.to_path_buf();
+    let names: Vec<String> = inputs.iter().map(|p| p.to_string_lossy().into_owned()).collect();
+    let refs: Vec<&str> = names.iter().map(String::as_str).collect();
+    let stem = onezip_formats::compress_stem(&refs, |p| Path::new(p).is_dir());
     Some(parent.join(format!("{stem}.{}", format.extension())))
 }
 
@@ -137,7 +133,8 @@ pub fn compress(req: &CompressRequest, observer: Observer, stop: &Arc<AtomicBool
     let result = (|| -> Result<()> {
         let file = File::create(&tmp).with_context(|| format!("创建 {}", tmp.display()))?;
         // 多线程 LZMA2/XZ：进度由编码器按块报告。
-        let encoder_reports = threads() >= 2
+        let threads = threads(req.threads);
+        let encoder_reports = threads >= 2
             && match req.format {
                 Format::SevenZ => req.level > 0,
                 Format::TarXz => true,
@@ -154,14 +151,14 @@ pub fn compress(req: &CompressRequest, observer: Observer, stop: &Arc<AtomicBool
             Format::SevenZ => write_7z(file, &items, req, &ctx)?,
             Format::TarZst => {
                 let mut enc = zstd::stream::Encoder::new(BufWriter::new(file), zstd_level(req.level))?;
-                let _ = enc.multithread(threads());
+                let _ = enc.multithread(threads);
                 let enc = write_tar(enc, &items, &ctx)?;
                 finish(enc.finish()?)?;
             }
             Format::TarXz => {
                 let mut opts = lzma_mt::XzOptions::with_preset(req.level.min(9));
                 opts.set_block_size(NonZeroU64::new(64 << 20));
-                let enc = lzma_mt::XzWriterMt::new(BufWriter::new(file), opts, threads())?;
+                let enc = lzma_mt::XzWriterMt::new(BufWriter::new(file), opts, threads)?;
                 let enc = write_tar(enc, &items, &ctx)?;
                 finish(enc.finish()?)?;
             }
@@ -291,8 +288,12 @@ fn temp_path(output: &Path) -> PathBuf {
     output.with_file_name(format!("{name}.onezip-tmp"))
 }
 
-fn threads() -> u32 {
-    std::thread::available_parallelism().map_or(1, |n| n.get() as u32)
+/// 实际用的线程数：`0` 按 CPU 核数，否则用给定的。
+fn threads(wanted: u32) -> u32 {
+    match wanted {
+        0 => std::thread::available_parallelism().map_or(1, |n| n.get() as u32),
+        n => n,
+    }
 }
 
 fn zstd_level(level: u32) -> i32 {
@@ -370,6 +371,7 @@ fn write_zip(file: File, items: &[Item], req: &CompressRequest, ctx: &Ctx) -> Re
     use zip::{AesMode, CompressionMethod, ZipWriter};
 
     let mut zw = ZipWriter::new(BufWriter::new(file));
+    let zip_pw = req.password.as_deref().map(hatchzip_core::archive::zip_password_bytes).unwrap_or_default();
     for item in items {
         let mut opts = SimpleFileOptions::default();
         if let Some(t) = item.modified.and_then(zip_time) {
@@ -386,8 +388,10 @@ fn write_zip(file: File, items: &[Item], req: &CompressRequest, ctx: &Ctx) -> Re
                 .compression_level(Some(req.level.min(9) as i64))
         };
         opts = opts.large_file(item.size >= 0xFFFF_FFFF);
-        if let Some(pw) = &req.password {
-            opts = opts.with_aes_encryption(AesMode::Aes256, pw);
+        if req.password.is_some() {
+            // 和 7-Zip 一样用系统的 ANSI 代码页（中文 Windows 上是 GBK），
+            // 否则含中文的密码在 7-Zip 里打不开；代码页里没有的字符才用 UTF-8。
+            opts = opts.with_aes_encryption_bytes(AesMode::Aes256, &zip_pw[0]);
         }
         zw.start_file(item.name.as_str(), opts)?;
         io::copy(&mut ctx.open(item)?, &mut zw)
@@ -408,12 +412,12 @@ fn write_7z(file: File, items: &[Item], req: &CompressRequest, ctx: &Ctx) -> Res
     let mut methods: Vec<EncoderConfiguration> = Vec::new();
     if let Some(pw) = &req.password {
         methods.push(AesEncoderOptions::new(Password::from(pw.as_str())).into());
-        w.set_encrypt_header(true);
+        w.set_encrypt_header(req.encrypt_names);
     }
     if req.level == 0 {
         methods.push(EncoderMethod::COPY.into());
     } else {
-        methods.push(Lzma2Options::from_level_mt(req.level.min(9), threads(), 16 << 20).into());
+        methods.push(Lzma2Options::from_level_mt(req.level.min(9), threads(req.threads), 16 << 20).into());
     }
     w.set_content_methods(methods);
 

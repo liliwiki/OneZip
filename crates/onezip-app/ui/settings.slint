@@ -1,0 +1,558 @@
+// 设置窗口：主窗口点"设置"弹出。改动立即保存、立即生效。
+// 排版按定稿的 Demo；文件关联、密码、语言三项在后面的版本里再显示。
+import { Button, CheckBox, ComboBox, LineEdit, Switch, SpinBox, ScrollView, Palette } from "std-widgets.slint";
+import { ThemedWindow } from "theme.slint";
+
+// ---- 小部件 ----
+
+component NavItem inherits Rectangle {
+    in property <string> icon;
+    in property <string> label;
+    in property <bool> selected;
+    callback clicked;
+    height: 38px;
+    border-radius: 5px;
+    background: selected ? Palette.alternate-background : ta.has-hover ? Palette.alternate-background.with-alpha(0.5) : transparent;
+    ta := TouchArea { clicked => { root.clicked(); } }
+    // 选中项左侧的强调色竖条（Windows 11 风格）
+    Rectangle {
+        x: 0;
+        width: 3px;
+        height: selected ? 16px : 0;
+        y: (parent.height - self.height) / 2;
+        border-radius: 1.5px;
+        background: Palette.accent-background;
+    }
+    HorizontalLayout {
+        padding-left: 14px;
+        spacing: 12px;
+        Text {
+            text: icon;
+            font-family: "Segoe Fluent Icons";
+            font-size: 16px;
+            vertical-alignment: center;
+            width: 18px;
+        }
+        Text {
+            text: label;
+            vertical-alignment: center;
+        }
+    }
+}
+
+// 一行设置：左边标题和说明，右边控件
+component Card inherits Rectangle {
+    in property <string> title;
+    in property <string> desc;
+    in property <string> icon;
+    background: Palette.alternate-background;
+    border-radius: 6px;
+    min-height: 64px;
+    HorizontalLayout {
+        padding-left: 16px;
+        padding-right: 16px;
+        padding-top: 10px;
+        padding-bottom: 10px;
+        spacing: 14px;
+        if icon != "": Text {
+            text: icon;
+            font-family: "Segoe Fluent Icons";
+            font-size: 18px;
+            vertical-alignment: center;
+            width: 20px;
+        }
+        VerticalLayout {
+            alignment: center;
+            horizontal-stretch: 1;
+            spacing: 2px;
+            Text {
+                text: title;
+            }
+            if desc != "": Text {
+                text: desc;
+                font-size: 12px;
+                opacity: 0.65;
+                wrap: word-wrap;
+            }
+        }
+        HorizontalLayout {
+            alignment: end;
+            spacing: 8px;
+            @children
+        }
+    }
+}
+
+// 装一块自定义内容（勾选列表）的卡片
+export component Panel inherits Rectangle {
+    background: Palette.alternate-background;
+    border-radius: 6px;
+    VerticalLayout {
+        padding: 16px;
+        spacing: 10px;
+        @children
+    }
+}
+
+component Section inherits Text {
+    font-size: 14px;
+    font-weight: 600;
+    height: 34px;
+    vertical-alignment: bottom;
+}
+
+component PageTitle inherits Text {
+    font-size: 26px;
+    font-weight: 600;
+    height: 48px;
+    vertical-alignment: top;
+}
+
+export component Note inherits Text {
+    font-size: 12px;
+    opacity: 0.65;
+    wrap: word-wrap;
+}
+
+// 页面外框：留白、从上往下排、能滚动
+component Page inherits ScrollView {
+    in property <string> title;
+    VerticalLayout {
+        padding: 28px;
+        padding-top: 20px;
+        spacing: 6px;
+        alignment: start;
+        PageTitle { text: root.title; }
+        @children
+    }
+}
+
+/// 右键菜单页的一行：两个勾选项（第二个可以没有）。
+export struct MenuToggle {
+    id: string,
+    label: string,
+    checked: bool,
+}
+
+export struct MenuRow {
+    a: MenuToggle,
+    b: MenuToggle,
+    has-b: bool,
+}
+
+component MenuGrid inherits Panel {
+    in property <[MenuRow]> rows;
+    in property <bool> enabled;
+    callback toggled(string, bool);
+    opacity: enabled ? 1 : 0.45;
+    for row in rows: HorizontalLayout {
+        spacing: 24px;
+        CheckBox {
+            width: 50%;
+            text: row.a.label;
+            checked: row.a.checked;
+            enabled: root.enabled;
+            toggled => { root.toggled(row.a.id, self.checked); }
+        }
+        if row.has-b: CheckBox {
+            text: row.b.label;
+            checked: row.b.checked;
+            enabled: root.enabled;
+            toggled => { root.toggled(row.b.id, self.checked); }
+        }
+    }
+}
+
+// ---- 窗口 ----
+
+export component SettingsWindow inherits ThemedWindow {
+    title: "OneZip 设置";
+    preferred-width: 880px;
+    preferred-height: 620px;
+    min-width: 720px;
+    min-height: 480px;
+
+    in-out property <int> page: 0;
+
+    // 常规
+    in-out property <int> theme-index: 0;
+    // 解压
+    in-out property <int> extract-mode;
+    in-out property <int> conflict;
+    in-out property <bool> nested;
+    in-out property <int> delete-mode;
+    in-out property <bool> confirm-in-place;
+    in-out property <string> download-dir;
+    in property <string> download-placeholder;
+    in-out property <int> connections: 8;
+    // 压缩
+    in property <[string]> formats;
+    in-out property <int> format-index;
+    in-out property <int> level-index;
+    in property <[string]> thread-choices;
+    in-out property <int> threads-index;
+    in-out property <bool> solid;
+    in-out property <bool> encrypt-names;
+    // 右键菜单
+    in-out property <bool> menu-enabled;
+    in property <[MenuRow]> archive-items;
+    in property <[MenuRow]> file-items;
+    // 更新
+    in property <string> version;
+    in property <string> update-status;
+    in property <bool> checking;
+    in-out property <bool> auto-update;
+    in property <string> skipped;
+
+    // 任何一项改了：Rust 读出全部属性并保存。
+    callback changed();
+    callback menu-toggled(string, bool);
+    callback reset-all();
+    callback reset-menu();
+    callback browse-download();
+    callback check-update();
+    callback clear-skipped();
+    callback open-releases();
+    callback open-github();
+    callback open-licenses();
+    callback report-issue();
+
+
+    HorizontalLayout {
+        // 左侧导航
+        VerticalLayout {
+            width: 220px;
+            padding: 12px;
+            padding-top: 16px;
+            spacing: 4px;
+            HorizontalLayout {
+                padding-left: 8px;
+                padding-bottom: 14px;
+                spacing: 10px;
+                Image {
+                    source: @image-url("../../../assets/onezip-256.png");
+                    width: 28px;
+                    height: 28px;
+                }
+                Text {
+                    text: "设置";
+                    font-size: 18px;
+                    font-weight: 600;
+                    vertical-alignment: center;
+                }
+            }
+            NavItem { icon: "\u{E713}"; label: "常规"; selected: page == 0; clicked => { page = 0; } }
+            NavItem { icon: "\u{E8B7}"; label: "解压"; selected: page == 1; clicked => { page = 1; } }
+            NavItem { icon: "\u{E7B8}"; label: "压缩"; selected: page == 2; clicked => { page = 2; } }
+            NavItem { icon: "\u{E700}"; label: "右键菜单"; selected: page == 3; clicked => { page = 3; } }
+            NavItem { icon: "\u{E895}"; label: "更新"; selected: page == 4; clicked => { page = 4; } }
+            NavItem { icon: "\u{E946}"; label: "关于"; selected: page == 5; clicked => { page = 5; } }
+            Rectangle { vertical-stretch: 1; }
+            Note {
+                text: "设置改动立即生效";
+                horizontal-alignment: center;
+            }
+        }
+
+        // 右侧内容
+        Rectangle {
+            horizontal-stretch: 1;
+
+            // ---- 常规 ----
+            if page == 0: Page {
+                title: "常规";
+                Section { text: "外观"; }
+                Card {
+                    icon: "\u{E790}";
+                    title: "主题";
+                    desc: "浅色、深色，或跟随 Windows 的设置";
+                    ComboBox {
+                        width: 160px;
+                        model: ["跟随系统", "浅色", "深色"];
+                        current-index <=> root.theme-index;
+                        selected => { root.changed(); }
+                    }
+                }
+                Section { text: "全部设置"; }
+                Card {
+                    icon: "\u{E777}";
+                    title: "恢复全部默认";
+                    desc: "所有页面的设置都回到刚安装时的样子";
+                    Button {
+                        text: "恢复默认";
+                        clicked => { root.reset-all(); }
+                    }
+                }
+            }
+
+            // ---- 解压 ----
+            if page == 1: Page {
+                title: "解压";
+                Section { text: "默认"; }
+                Card {
+                    title: "默认解压方式";
+                    desc: "主窗口的“解压…”使用";
+                    ComboBox {
+                        width: 190px;
+                        model: ["智能解压", "解压到同名文件夹", "解压到当前位置"];
+                        current-index <=> root.extract-mode;
+                        selected => { root.changed(); }
+                    }
+                }
+                Card {
+                    title: "遇到同名文件";
+                    desc: "目标位置已经有同名文件时怎么办";
+                    ComboBox {
+                        width: 190px;
+                        model: ["替换", "跳过", "自动改名（如 a (2).txt）"];
+                        current-index <=> root.conflict;
+                        selected => { root.changed(); }
+                    }
+                }
+                Card {
+                    title: "解开里面套着的压缩包";
+                    desc: "压缩包里只有一个压缩包（如 .tar）时接着解开";
+                    Switch {
+                        checked <=> root.nested;
+                        toggled => { root.changed(); }
+                    }
+                }
+                Section { text: "删除压缩包"; }
+                Card {
+                    title: "解压后删除的压缩包";
+                    desc: "全部解压成功后才删除；出错时压缩包原样保留";
+                    ComboBox {
+                        width: 190px;
+                        model: ["移到回收站", "直接删除"];
+                        current-index <=> root.delete-mode;
+                        selected => { root.changed(); }
+                    }
+                }
+                Card {
+                    title: "边解压边删除前确认";
+                    desc: "压缩包会在解压过程中逐步删除，开始前说明一次；关掉后不再提醒";
+                    Switch {
+                        checked <=> root.confirm-in-place;
+                        toggled => { root.changed(); }
+                    }
+                }
+                Section { text: "边下载边解压"; }
+                Card {
+                    title: "默认保存位置";
+                    desc: "从链接解压时，解出的文件放在这里";
+                    LineEdit {
+                        width: 230px;
+                        text <=> root.download-dir;
+                        placeholder-text: root.download-placeholder;
+                        edited => { root.changed(); }
+                    }
+                    Button {
+                        text: "浏览…";
+                        clicked => { root.browse-download(); }
+                    }
+                }
+                Card {
+                    title: "同时下载的连接数";
+                    desc: "越多通常越快，服务器限制连接时请调小";
+                    SpinBox {
+                        width: 110px;
+                        minimum: 1;
+                        maximum: 32;
+                        value <=> root.connections;
+                        edited => { root.changed(); }
+                    }
+                }
+            }
+
+            // ---- 压缩 ----
+            if page == 2: Page {
+                title: "压缩";
+                Note { text: "这里是默认值：“添加到压缩包…”对话框打开时用它们，右键“添加到 名字.7z / 名字.zip”直接按它们压缩。"; }
+                Section { text: "默认"; }
+                Card {
+                    title: "默认格式";
+                    desc: "“添加到压缩包…”对话框里预先选中的格式";
+                    ComboBox {
+                        width: 160px;
+                        model: root.formats;
+                        current-index <=> root.format-index;
+                        selected => { root.changed(); }
+                    }
+                }
+                Card {
+                    title: "压缩级别";
+                    desc: "越高压得越小，也越慢";
+                    ComboBox {
+                        width: 160px;
+                        model: ["仅存储", "最快", "快速", "标准", "最大", "极限"];
+                        current-index <=> root.level-index;
+                        selected => { root.changed(); }
+                    }
+                }
+                Card {
+                    title: "使用的线程数";
+                    desc: "7z、tar.xz、tar.zst 可以多线程压缩";
+                    ComboBox {
+                        width: 160px;
+                        model: root.thread-choices;
+                        current-index <=> root.threads-index;
+                        selected => { root.changed(); }
+                    }
+                }
+                Section { text: "7z"; }
+                Card {
+                    title: "固实压缩";
+                    desc: "压缩率更高，但取出单个文件要先解开前面的数据";
+                    Switch {
+                        checked <=> root.solid;
+                        toggled => { root.changed(); }
+                    }
+                }
+                Card {
+                    title: "设了密码时加密文件名";
+                    desc: "不输密码就看不到压缩包里有哪些文件";
+                    Switch {
+                        checked <=> root.encrypt-names;
+                        toggled => { root.changed(); }
+                    }
+                }
+            }
+
+            // ---- 右键菜单 ----
+            if page == 3: Page {
+                title: "右键菜单";
+                Card {
+                    icon: "\u{E700}";
+                    title: "在右键菜单里显示 OneZip";
+                    desc: "Windows 11 在第一层，Windows 10 在传统菜单里";
+                    Switch {
+                        checked <=> root.menu-enabled;
+                        toggled => { root.changed(); }
+                    }
+                }
+                Section { text: "右键压缩包时显示"; }
+                MenuGrid {
+                    rows: root.archive-items;
+                    enabled: root.menu-enabled;
+                    toggled(id, on) => { root.menu-toggled(id, on); }
+                }
+                Section { text: "右键任意文件、文件夹时显示"; }
+                MenuGrid {
+                    rows: root.file-items;
+                    enabled: root.menu-enabled;
+                    toggled(id, on) => { root.menu-toggled(id, on); }
+                }
+                HorizontalLayout {
+                    padding-top: 6px;
+                    spacing: 12px;
+                    Note {
+                        text: "Windows 11 只允许每个程序在第一层放一项，所以这些都在“OneZip”子菜单里。";
+                        vertical-alignment: center;
+                        horizontal-stretch: 1;
+                    }
+                    Button {
+                        text: "恢复默认";
+                        clicked => { root.reset-menu(); }
+                    }
+                }
+            }
+
+            // ---- 更新 ----
+            if page == 4: Page {
+                title: "更新";
+                Card {
+                    icon: "\u{E895}";
+                    title: "OneZip " + root.version;
+                    desc: root.update-status;
+                    Button {
+                        text: root.checking ? "正在检查…" : "检查更新";
+                        primary: true;
+                        enabled: !root.checking;
+                        clicked => { root.check-update(); }
+                    }
+                }
+                Card {
+                    title: "自动检查更新";
+                    desc: "打开 OneZip 主窗口时检查，每天最多一次，只连接 GitHub";
+                    Switch {
+                        checked <=> root.auto-update;
+                        toggled => { root.changed(); }
+                    }
+                }
+                Card {
+                    title: "已跳过的版本";
+                    desc: "在更新提示里选了“跳过这个版本”的版本不再提示";
+                    Text {
+                        text: root.skipped == "" ? "无" : root.skipped;
+                        vertical-alignment: center;
+                        opacity: 0.65;
+                    }
+                    Button {
+                        text: "清除";
+                        enabled: root.skipped != "";
+                        clicked => { root.clear-skipped(); }
+                    }
+                }
+                Card {
+                    title: "更新说明";
+                    desc: "在浏览器里查看各个版本的更新内容";
+                    Button {
+                        text: "打开发布页";
+                        clicked => { root.open-releases(); }
+                    }
+                }
+            }
+
+            // ---- 关于 ----
+            if page == 5: Page {
+                title: "关于";
+                Panel {
+                    HorizontalLayout {
+                        spacing: 18px;
+                        Image {
+                            source: @image-url("../../../assets/onezip-256.png");
+                            width: 72px;
+                            height: 72px;
+                        }
+                        VerticalLayout {
+                            alignment: center;
+                            spacing: 4px;
+                            Text {
+                                text: "OneZip " + root.version;
+                                font-size: 20px;
+                                font-weight: 600;
+                            }
+                            Note { text: "压缩、解压、边解压边释放空间、边下载边解压"; }
+                            Note { text: "MIT 许可证 · github.com/liliwiki/OneZip"; }
+                        }
+                    }
+                }
+                Section { text: "用到的开源项目"; }
+                Panel {
+                    Text { text: "HatchZip —— 边解压边删除、zip / 7z / tar / rar 解压（UnRAR）"; }
+                    Text { text: "Peel —— 边下载边解压"; }
+                    Text { text: "7-Zip（7z.dll）—— 保留原包解压，以及 iso、wim、cab、dmg、vhd、msi 等格式"; }
+                    Text { text: "Slint —— 界面"; }
+                }
+                HorizontalLayout {
+                    padding-top: 8px;
+                    spacing: 8px;
+                    alignment: start;
+                    Button {
+                        text: "GitHub 主页";
+                        clicked => { root.open-github(); }
+                    }
+                    Button {
+                        text: "许可证与第三方声明";
+                        clicked => { root.open-licenses(); }
+                    }
+                    Button {
+                        text: "报告问题";
+                        clicked => { root.report-issue(); }
+                    }
+                }
+                Note { text: "“报告问题”会在浏览器里打开 GitHub 的新问题页，自动填好版本号和最近的出错记录；提交前可以先看、可以删改。"; }
+            }
+        }
+    }
+}

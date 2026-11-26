@@ -20,7 +20,7 @@ use anyhow::{Result, anyhow, bail};
 use clap::{Parser, Subcommand};
 use indicatif::{ProgressBar, ProgressStyle};
 use onezip_core::{
-    CompressRequest, Confirm, Event, ExtractRequest, Format, Observer, Outcome, Placement, Source,
+    CompressRequest, Confirm, Conflict, Event, ExtractRequest, Format, Observer, Outcome, Placement, Source,
     human,
 };
 
@@ -64,8 +64,14 @@ enum Command {
         #[arg(long)]
         verify: bool,
         /// 替换输出目录里已存在的同名文件
-        #[arg(long)]
+        #[arg(long, conflicts_with_all = ["skip", "rename"])]
         replace: bool,
+        /// 跳过输出目录里已存在的同名文件
+        #[arg(long, conflicts_with = "rename")]
+        skip: bool,
+        /// 同名文件都保留，解出的改名为“名字 (2)”
+        #[arg(long)]
+        rename: bool,
         /// 解出来只有一个压缩包时继续解开它
         #[arg(long)]
         nested: bool,
@@ -158,6 +164,8 @@ fn run(command: Command) -> Result<u8> {
             password,
             verify,
             replace,
+            skip,
+            rename,
             nested,
             keep_free_mb,
         } => {
@@ -175,8 +183,17 @@ fn run(command: Command) -> Result<u8> {
                 password,
                 verify_first: verify,
                 keep_free: keep_free_mb << 20,
-                replace,
+                conflict: if replace {
+                    Conflict::Replace
+                } else if skip {
+                    Conflict::Skip
+                } else if rename {
+                    Conflict::Rename
+                } else {
+                    Conflict::Refuse
+                },
                 nested,
+                connections: 0,
             };
             let (observer, bar) = progress();
             let mut confirm = |c: &Confirm| {

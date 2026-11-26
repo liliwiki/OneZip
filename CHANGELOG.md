@@ -6,7 +6,7 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and
 
 ## [Unreleased]
 
-## [0.1.0] - 2026-11-25
+## [0.1.0] - 2026-11-26
 
 First release.
 
@@ -23,12 +23,20 @@ First release.
 - Progress windows for context menu operations, in the style of 7-Zip; they close when the work is done.
 - Windows 11 first-level context menu through a sparse package and `IExplorerCommand`, with the classic menu on Windows 10.
 - `onezipc.exe` command line.
-- `OneZip-<version>-Setup.exe` installer (per user, choice of install folder, no administrator rights except for protected folders and for trusting the sparse package certificate once on Windows 11; uninstall removes only the files it installed), and a packaging script that builds and signs the sparse package.
+- `OneZip-<version>-Setup.exe` installer that installs by itself, without PowerShell scripts: per user, choice of install folder, no administrator rights except for protected folders and for trusting the sparse package certificate once on Windows 11. The install folder holds only the program, `uninstall.exe`, and `licenses\`; the list of installed files is kept in the registry, so an upgrade removes files the old version left behind and uninstalling removes only what was installed. Uninstalling asks for confirmation and whether to delete the settings too.
+- "Extract, then delete the archive": deletes the archive, every volume of a split archive, only after the whole extraction succeeded, to the Recycle Bin by default. The in-place mode is now called "extract while deleting the archive" and explains its risk in a confirmation window before it starts.
+- Settings window with General, Extract, Compress, Context menu, Updates, and About pages, including light and dark themes and per-item control of the context menu.
+- Automatic and manual update checks against GitHub releases; "Update now" verifies the installer's SHA-256, installs over the current version, and reopens OneZip.
+- Error log in `%LOCALAPPDATA%\OneZip\onezip.log`, and "Report a problem", which opens a prefilled GitHub issue.
+- `packaging/release.ps1`, which checks, packages, and uploads a release from the maintainer's machine.
 - Context menu regression tests driven by UI Automation.
 
 ### Changed
 
 - Modified copy of hatchzip-core: on Windows, extracted files are flushed to disk in parallel per batch. Extracting 30,000 small files went from about 150 s to 26 s.
+- Extraction that keeps the archive hands zip, 7z, and rar to 7z.dll, as fast as 7-Zip.
+- Zip passwords with non-ASCII characters are encoded in the system code page, as 7-Zip does, so 7-Zip opens OneZip's encrypted zips; extraction accepts both that and UTF-8.
+- The GitHub workflow only runs clippy and the tests; releases are built and uploaded locally so the sparse package keeps the same signing certificate.
 - Modified copy of Peel 0.8.0: WinZip AE-2 encrypted zip entries no longer fail the CRC check, and 7z archives with encrypted file names decrypt their header.
 - Modified copy of lzma-rust2 0.23: the multi-threaded encoders report progress and honour cancellation.
 

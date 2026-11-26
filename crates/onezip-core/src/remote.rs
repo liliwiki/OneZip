@@ -21,17 +21,6 @@ use peel::progress::ProgressState;
 use crate::{Confirm, Event, ExtractRequest, Observer, Outcome, Placement};
 
 /// 本地文件里交给 Peel 的格式：hatchzip-core 0.1.10 不支持的那些。
-pub(crate) fn handles_local(path: &Path) -> bool {
-    let name = path
-        .file_name()
-        .map(|n| n.to_string_lossy().to_ascii_lowercase())
-        .unwrap_or_default();
-    // RAR 交给 HatchZip（开了 rar 特性）：它支持密码、加密文件名和分卷，Peel 不支持。
-    [".zst", ".tzst", ".lz4"]
-        .iter()
-        .any(|ext| name.ends_with(ext))
-}
-
 /// 用 Peel 解本地文件。`keep_source` 为假时边解边打洞，完成后删除原文件。
 /// 进度检查点在原文件旁边，同样的请求再调一次即从断点继续。
 pub(crate) fn extract_file(
@@ -52,7 +41,7 @@ pub(crate) fn extract_file(
         .unwrap_or_default();
     let parent = archive.parent().map(Path::to_path_buf).unwrap_or_default();
     let shape = registry.shape_for_name(&name);
-    let stem = strip_archive_extensions(&name).to_string();
+    let stem = onezip_formats::archive_stem(&name);
     let output = match (&req.output, shape) {
         (Some(p), Some(FormatShape::Stream)) => OutputTarget::File(std::path::absolute(p)?),
         (Some(p), _) => OutputTarget::Dir(std::path::absolute(p)?),
@@ -183,6 +172,7 @@ pub(crate) fn extract(
         output,
         config: CoordinatorConfig {
             password_source: password.source(),
+            workers: if req.connections > 0 { req.connections } else { CoordinatorConfig::default().workers },
             ..CoordinatorConfig::default()
         },
         client,
@@ -279,15 +269,14 @@ fn output_target(
     given: Option<&Path>,
     registry: &DecoderRegistry,
 ) -> Result<OutputTarget> {
-    let name = url_file_name(url);
+    let name = crate::source::url_file_name(url);
     let shape = name.as_deref().and_then(|n| registry.shape_for_name(n));
     let path = match given {
         Some(p) => p.to_path_buf(),
         None => {
             let stem = name
                 .as_deref()
-                .map(strip_archive_extensions)
-                .filter(|s| !s.is_empty())
+                .map(onezip_formats::archive_stem)
                 .ok_or_else(|| anyhow!("无法从 URL 推断输出名，请指定输出位置"))?;
             PathBuf::from(stem)
         }
@@ -297,43 +286,4 @@ fn output_target(
         Some(FormatShape::Stream) => OutputTarget::File(path),
         _ => OutputTarget::Dir(path),
     })
-}
-
-fn url_file_name(url: &str) -> Option<String> {
-    let rest = url.split_once("://").map_or(url, |(_, r)| r);
-    let path = rest.split(['?', '#']).next()?;
-    let (_, path) = path.split_once('/')?;
-    let last = path.rsplit('/').next()?;
-    (!last.is_empty()).then(|| last.to_string())
-}
-
-const EXTENSIONS: &[&str] = &[
-    ".tar.zst", ".tar.gz", ".tar.xz", ".tar.bz2", ".tar.lz4", ".tgz", ".txz", ".tbz2", ".tbz",
-    ".tar", ".zip", ".7z", ".rar", ".zst", ".gz", ".xz", ".bz2", ".lz4",
-];
-
-fn strip_archive_extensions(name: &str) -> &str {
-    let lower = name.to_ascii_lowercase();
-    for ext in EXTENSIONS {
-        if lower.ends_with(ext) {
-            return &name[..name.len() - ext.len()];
-        }
-    }
-    name
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn names() {
-        assert_eq!(
-            url_file_name("https://h.example/a/b/data.tar.zst?x=1").as_deref(),
-            Some("data.tar.zst")
-        );
-        assert_eq!(url_file_name("https://h.example/"), None);
-        assert_eq!(strip_archive_extensions("Data.TAR.ZST"), "Data");
-        assert_eq!(strip_archive_extensions("x.zip"), "x");
-    }
 }

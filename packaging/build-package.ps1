@@ -7,12 +7,14 @@
     onezipc.exe             命令行
     onezip_shell.dll        Windows 11 第一层右键菜单
     7z.dll                  7-Zip 的解码库：iso、wim、cab、dmg、vhd、msi、arj、lzh 等格式
-    OneZip-Shell.msix       稀疏包（只含清单和图标，给 DLL 一个应用身份），已签名
-    OneZip-Dev.cer          签名证书的公钥，安装时导入"受信任的人"
-    install.ps1 / uninstall.ps1
-    许可证：LICENSE、THIRD_PARTY_NOTICES.md、7-Zip-License.txt、UnRAR-License.txt
+    licenses\              LICENSE.txt、THIRD_PARTY_NOTICES.md、7-Zip-License.txt、UnRAR-License.txt
+    setup\                 只给安装程序用，不装进安装目录：
+      OneZip-Shell.msix     稀疏包（只含清单和图标，给 DLL 一个应用身份），已签名
+      OneZip-Dev.cer        签名证书的公钥，安装时导入"受信任的人"
+  安装程序自己完成全部安装步骤，并把自己（去掉后面的 zip）存成安装目录里的 uninstall.exe。
 
-  签名用的是自签名证书（CN=OneZip Dev），首次运行时在当前用户的证书库里创建。
+  签名用的是自签名证书（CN=OneZip Dev，有效期 10 年），首次运行时在当前用户的证书库里创建；
+  有好几张时用最晚到期的那张。
   正式发布时换成受信任 CA 签发的代码签名证书，用 -CertThumbprint 指定即可，
   用户就不必再导入证书。
 #>
@@ -62,10 +64,13 @@ New-Item -ItemType Directory -Force $dist | Out-Null
 $rel = Join-Path $root 'target\release'
 Copy-Item "$rel\OneZip.exe", "$rel\onezipc.exe", "$rel\onezip_shell.dll" $dist
 Copy-Item third_party\7zip\7z.dll $dist
-Copy-Item LICENSE, THIRD_PARTY_NOTICES.md, README.md, README.zh-CN.md $dist
-Copy-Item third_party\7zip\License.txt (Join-Path $dist '7-Zip-License.txt')
-Copy-Item third_party\hatchzip-core\LICENSE-UNRAR (Join-Path $dist 'UnRAR-License.txt')
-Copy-Item "$PSScriptRoot\install.ps1", "$PSScriptRoot\uninstall.ps1" $dist
+$licenses = Join-Path $dist 'licenses'
+$setupDir = Join-Path $dist 'setup'
+New-Item -ItemType Directory -Force $licenses, $setupDir | Out-Null
+Copy-Item LICENSE (Join-Path $licenses 'LICENSE.txt')
+Copy-Item THIRD_PARTY_NOTICES.md $licenses
+Copy-Item third_party\7zip\License.txt (Join-Path $licenses '7-Zip-License.txt')
+Copy-Item third_party\hatchzip-core\LICENSE-UNRAR (Join-Path $licenses 'UnRAR-License.txt')
 
 # ---- 稀疏包 ----
 $stage = Join-Path $root 'target\sparse'
@@ -87,7 +92,7 @@ $cfg.Save($priconfig)
 Get-ChildItem $stage -Filter 'resources*.pri' | Remove-Item
 & $makepri new /pr $stage /cf $priconfig /mn "$stage\AppxManifest.xml" /of "$stage\resources.pri" /o | Out-Host
 if ($LASTEXITCODE -ne 0) { throw "makepri new 失败" }
-$msix = Join-Path $dist 'OneZip-Shell.msix'
+$msix = Join-Path $setupDir 'OneZip-Shell.msix'
 & $makeappx pack /d $stage /p $msix /nv /o | Out-Host
 if ($LASTEXITCODE -ne 0) { throw "makeappx 失败" }
 
@@ -95,16 +100,17 @@ if ($LASTEXITCODE -ne 0) { throw "makeappx 失败" }
 if (-not $CertThumbprint) {
     $cert = Get-ChildItem Cert:\CurrentUser\My |
         Where-Object { $_.Subject -eq $Publisher -and $_.NotAfter -gt (Get-Date) } |
-        Select-Object -First 1
+        Sort-Object NotAfter -Descending | Select-Object -First 1
     if (-not $cert) {
         Write-Host "创建自签名证书 $Publisher"
         $cert = New-SelfSignedCertificate -Type Custom -Subject $Publisher `
             -KeyUsage DigitalSignature -FriendlyName "OneZip Dev" `
+            -KeyAlgorithm RSA -KeyLength 3072 -KeyExportPolicy Exportable -NotAfter (Get-Date).AddYears(10) `
             -CertStoreLocation Cert:\CurrentUser\My `
             -TextExtension @("2.5.29.37={text}1.3.6.1.5.5.7.3.3", "2.5.29.19={text}")
     }
     $CertThumbprint = $cert.Thumbprint
-    Export-Certificate -Cert "Cert:\CurrentUser\My\$CertThumbprint" -FilePath (Join-Path $dist 'OneZip-Dev.cer') | Out-Null
+    Export-Certificate -Cert "Cert:\CurrentUser\My\$CertThumbprint" -FilePath (Join-Path $setupDir 'OneZip-Dev.cer') | Out-Null
 }
 & $signtool sign /fd SHA256 /sha1 $CertThumbprint /s My $msix | Out-Host
 if ($LASTEXITCODE -ne 0) { throw "签名失败" }

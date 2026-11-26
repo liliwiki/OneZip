@@ -1,20 +1,18 @@
-# 在 GitHub 上编译、检查、测试、打包。
-# 推送到 main 或提 PR 时只检查能不能打包；推送 v* 标签时把安装包和 SHA-256 发布到 Release。
-# 已经发布过的 Release 不会被覆盖。
-name: Build
+# 在 GitHub 上做代码检查：clippy 和测试。
+# 发布不在这里做：安装包要用开发机上的签名证书，用 packaging/release.ps1 在本机打包并上传。
+name: Check
 
 on:
   workflow_dispatch:
   pull_request:
   push:
     branches: ["main"]
-    tags: ["v*"]
 
 permissions:
-  contents: write
+  contents: read
 
 jobs:
-  build:
+  check:
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@v4
@@ -26,72 +24,8 @@ jobs:
 
       - uses: Swatinem/rust-cache@v2
 
-      - name: Read version
-        id: app
-        shell: powershell
-        run: |
-          $v = (Select-String -Path Cargo.toml -Pattern '^version = "(.+)"').Matches[0].Groups[1].Value
-          "version=$v" >> $env:GITHUB_OUTPUT
-
-      - name: Check the tag matches the version
-        if: startsWith(github.ref, 'refs/tags/v')
-        shell: powershell
-        run: |
-          if ("${{ github.ref_name }}" -ne "v${{ steps.app.outputs.version }}") {
-            throw "Tag ${{ github.ref_name }} does not match version ${{ steps.app.outputs.version }} in Cargo.toml"
-          }
-
       - name: Clippy
         run: cargo clippy --workspace --all-targets -- -D warnings
 
       - name: Test
         run: cargo test --workspace
-
-      - name: Package
-        shell: powershell
-        run: .\packaging\build-package.ps1
-
-      - name: Checksums
-        shell: powershell
-        run: |
-          Get-ChildItem target\dist\*-Setup.exe | Get-FileHash -Algorithm SHA256 |
-            ForEach-Object { "$($_.Hash.ToLower())  $(Split-Path $_.Path -Leaf)" } |
-            Set-Content -Encoding ascii target\dist\SHA256SUMS.txt
-          Get-Content target\dist\SHA256SUMS.txt
-
-      - uses: actions/upload-artifact@v4
-        with:
-          name: OneZip-${{ steps.app.outputs.version }}-x64
-          path: |
-            target/dist/*-Setup.exe
-            target/dist/SHA256SUMS.txt
-
-      - name: Publish release
-        if: startsWith(github.ref, 'refs/tags/v')
-        # pwsh：Windows PowerShell 5.1 会把 gh 写到 stderr 的“release not found”当成错误直接中止。
-        shell: pwsh
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: |
-          $ErrorActionPreference = 'Continue'
-          gh release view "${{ github.ref_name }}" *> $null
-          if ($LASTEXITCODE -eq 0) {
-            Write-Host "Release ${{ github.ref_name }} already exists; its files are left unchanged."
-            exit 0
-          }
-          # 发布说明用 docs/release-notes/<标签>-zh-CN.md（英文版在同一目录，正文里有链接）；
-          # 没写的话只放 CHANGELOG 链接。末尾没有 SHA-256 一节就自动补上。
-          $sums = (Get-Content target\dist\SHA256SUMS.txt | ForEach-Object {
-            $h, $n = $_ -split '\s+', 2; "$($h.ToUpper())  $n"
-          }) -join "`n"
-          $file = "docs/release-notes/${{ github.ref_name }}-zh-CN.md"
-          if (Test-Path $file) {
-            $notes = Get-Content $file -Raw -Encoding utf8
-          } else {
-            $notes = "See [CHANGELOG.md](https://github.com/${{ github.repository }}/blob/${{ github.ref_name }}/CHANGELOG.md).`n"
-          }
-          if ($notes -notmatch '## SHA-256') {
-            $notes = $notes.TrimEnd() + "`n`n## SHA-256`n`n``````text`n$sums`n```````n"
-          }
-          Set-Content -Path release-notes.md -Value $notes -Encoding utf8
-          gh release create "${{ github.ref_name }}" (Get-ChildItem target\dist\*-Setup.exe).FullName target\dist\SHA256SUMS.txt --title "OneZip ${{ steps.app.outputs.version }}" --notes-file release-notes.md

@@ -133,6 +133,8 @@ fn encrypted(format: Format, dir: &Path) -> Vec<u8> {
         level: 1,
         password: Some("pw-123".into()),
         solid: false,
+        encrypt_names: true,
+        threads: 0,
         overwrite: true,
     };
     onezip_core::compress(&req, quiet(), &Arc::new(AtomicBool::new(false))).unwrap();

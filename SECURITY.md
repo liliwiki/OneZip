@@ -1,6 +1,6 @@
 # Security Policy
 
-OneZip reads, writes, and deletes files. "Extract and delete the archive" truncates or punches holes in the archive while extracting, and extracting while downloading releases downloaded data as it is used. It also registers a shell extension that Windows Explorer loads.
+OneZip reads, writes, and deletes files. "Extract while deleting the archive" truncates or punches holes in the archive while extracting, "Extract, then delete the archive" deletes it after a successful extraction, and extracting while downloading releases downloaded data as it is used. It also registers a shell extension that Windows Explorer loads.
 
 ## Reporting a vulnerability
 
@@ -19,7 +19,7 @@ Problems that matter most here:
 
 - Keep a backup of archives you cannot replace before extracting them in place.
 - Treat downloaded archives as untrusted until their source has been checked.
-- Check the SHA-256 published on the Release page before running a downloaded build.
+- Check the SHA-256 published on the Release page (`OneZip-<version>-Setup.exe.sha256`) before running a downloaded build. OneZip's own "Update now" checks it automatically.
 - The development certificate `CN=OneZip Dev` that the installer trusts is used only to sign the sparse package. Remove it from "Trusted People" (`certlm.msc`) if you uninstall OneZip and no longer need it.
 
 The MIT License provides the software without warranty. Users remain responsible for their data and for the archives they open.
