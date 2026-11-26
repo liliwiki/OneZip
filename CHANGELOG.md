@@ -6,6 +6,8 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and
 
 ## [Unreleased]
 
+## [0.3.0] - 2026-11-26
+
 ### Added
 
 - English interface. The main window, settings, dialogs, context menu, file association names, installer, command line, and error messages are all translated. By default OneZip follows the Windows display language: Chinese (Simplified or Traditional) shows Chinese, every other language shows English. Settings → General → Language picks Follow Windows, 简体中文, or English, and the change applies at once.
@@ -60,6 +62,7 @@ First release.
 - Modified copy of Peel 0.8.0: WinZip AE-2 encrypted zip entries no longer fail the CRC check, and 7z archives with encrypted file names decrypt their header.
 - Modified copy of lzma-rust2 0.23: the multi-threaded encoders report progress and honour cancellation.
 
-[Unreleased]: https://github.com/liliwiki/OneZip/compare/v0.2.0...HEAD
+[Unreleased]: https://github.com/liliwiki/OneZip/compare/v0.3.0...HEAD
+[0.3.0]: https://github.com/liliwiki/OneZip/compare/v0.2.0...v0.3.0
 [0.2.0]: https://github.com/liliwiki/OneZip/compare/v0.1.0...v0.2.0
 [0.1.0]: https://github.com/liliwiki/OneZip/releases/tag/v0.1.0

@@ -5,7 +5,7 @@ members = ["crates/onezip-i18n", "crates/onezip-formats", "crates/onezip-menu", 
 exclude = ["third_party"]
 
 [workspace.package]
-version = "0.2.0"
+version = "0.3.0"
 edition = "2024"
 # hatchzip-core needs 1.93.
 rust-version = "1.93"
